@@ -11,6 +11,17 @@ have different compute times, so a rank is only ever compared with ranks that
 run the same layers. Within a group every rank is compared with the
 leave-one-out median of its peers, which stays meaningful for groups as small
 as two ranks.
+
+Two independent signals are checked:
+
+* **self compute** (``fwd + bwd + optim + moe_experts`` GPU time): a rank whose
+  own kernels take longer than its stage peers -> ``slow_device`` /
+  ``data_imbalance`` / ``cpu_bound``.
+* **late arrival** at the DP grad-sync collective: every DP peer's
+  ``dp_grad_sync`` bracket ends when the collective completes, so a rank that
+  shows a much *shorter* bracket than its peers is the one everybody waited
+  for. Its GPU kernels may be perfectly normal; the lost time sits between
+  kernels on the host (data fetch, GIL / GC, launch gaps) -> ``late_arrival``.
 """
 
 from __future__ import annotations
@@ -23,8 +34,10 @@ import numpy as np
 from relax.utils.straggler.stats import FIELD_INDEX, GPU_SEGMENTS, SELF_SEGMENTS, WAIT_SEGMENTS
 
 
-REASONS: tuple[str, ...] = ("none", "slow_device", "data_imbalance", "upstream_wait", "cpu_bound")
+REASONS: tuple[str, ...] = ("none", "slow_device", "data_imbalance", "upstream_wait", "cpu_bound", "late_arrival")
 REASON_CODE: dict[str, int] = {reason: code for code, reason in enumerate(REASONS)}
+# Segment whose per-rank asymmetry inside a DP group exposes late arrival.
+LATE_ARRIVAL_SEGMENT = "dp_grad_sync"
 
 _EPS = 1e-9
 
@@ -54,7 +67,8 @@ class DetectorConfig:
     persist_windows: int = 3
     gc_ratio_threshold: float = 0.05
     cpu_ratio_threshold: float = 1.2
-    # Extra PP waiting must be at least this fraction of the stage's median compute to count.
+    # Extra PP waiting / DP lateness must be at least this fraction of the stage's
+    # median compute to count.
     wait_abs_frac: float = 0.05
 
 
@@ -187,8 +201,34 @@ def analyze_window(
         for name in GPU_SEGMENTS:
             segment_rel[name][idx], _, _ = _relative_and_z(_column(x, name)[idx])
 
+    # Late arrival: within a DP group the grad-sync bracket of the last rank to
+    # arrive is just the transfer; everyone else's bracket also contains the wait
+    # for it. ``late_ms[i]`` = how much earlier than rank i its peers arrived.
+    sync_ms = _column(x, LATE_ARRIVAL_SEGMENT)
+    late_ms = np.zeros(world)
+    rel_late = np.zeros(world)
+    z_late = np.zeros(world)
+    peer_sync = sync_ms.copy()
+    dp_groups: dict[tuple[int, int, int, int], list[int]] = {}
+    for index, rank_meta in enumerate(meta):
+        dp_groups.setdefault((rank_meta.pp, rank_meta.tp, rank_meta.cp, rank_meta.ep), []).append(index)
+    for members in dp_groups.values():
+        idx = np.asarray(members)
+        if idx.shape[0] < 2:
+            continue
+        rel_sync, z_sync, peer_sync[idx] = _relative_and_z(sync_ms[idx])
+        late_ms[idx] = np.maximum(peer_sync[idx] - sync_ms[idx], 0.0)
+        rel_late[idx] = np.maximum(-rel_sync, 0.0)
+        z_late[idx] = np.maximum(-z_sync, 0.0)
+    late_candidates = (
+        (late_ms >= config.wait_abs_frac * stage_self_of)
+        & (rel_late >= config.rel_threshold)
+        & (z_late >= config.z_threshold)
+    )
+
     # Persistence: a rank must be a candidate for ``persist_windows`` windows in a row.
-    candidates = (rel_self >= config.rel_threshold) & (z_self >= config.z_threshold)
+    self_candidates = (rel_self >= config.rel_threshold) & (z_self >= config.z_threshold)
+    candidates = self_candidates | late_candidates
     for index, rank_meta in enumerate(meta):
         if candidates[index]:
             state.consecutive[rank_meta.rank] = state.consecutive.get(rank_meta.rank, 0) + 1
@@ -207,21 +247,33 @@ def analyze_window(
     for index, rank_meta in enumerate(meta):
         reason = "none"
         if state.consecutive.get(rank_meta.rank, 0) >= config.persist_windows:
-            if has_tokens and rel_tok[index] >= config.rel_threshold and rel_ktok[index] < config.rel_threshold:
-                reason = "data_imbalance"
-            elif (self_ms[index] > _EPS and gc_ms[index] / self_ms[index] >= config.gc_ratio_threshold) or (
-                fwd[index] > _EPS and cpu_fwd[index] >= config.cpu_ratio_threshold * fwd[index]
-            ):
-                reason = "cpu_bound"
+            who = f"rank {rank_meta.rank} ({rank_meta.tag}, host={rank_meta.host}, gpu={rank_meta.device})"
+            if self_candidates[index]:
+                if has_tokens and rel_tok[index] >= config.rel_threshold and rel_ktok[index] < config.rel_threshold:
+                    reason = "data_imbalance"
+                elif (self_ms[index] > _EPS and gc_ms[index] / self_ms[index] >= config.gc_ratio_threshold) or (
+                    fwd[index] > _EPS and cpu_fwd[index] >= config.cpu_ratio_threshold * fwd[index]
+                ):
+                    reason = "cpu_bound"
+                else:
+                    reason = "slow_device"
+                message = (
+                    f"{who} self {self_ms[index]:.1f} ms/step = {1 + rel_self[index]:.2f}x peers "
+                    f"(z={z_self[index]:.1f}) for {state.consecutive[rank_meta.rank]} windows; "
+                    f"tokens {1 + rel_tok[index]:.2f}x, ms/ktok {1 + rel_ktok[index]:.2f}x, "
+                    f"gc {gc_ms[index]:.1f} ms -> {reason}"
+                )
             else:
-                reason = "slow_device"
+                reason = "late_arrival"
+                idle_frac = peer_sync[index] / stage_self_of[index] if stage_self_of[index] > _EPS else 0.0
+                message = (
+                    f"{who} reaches the DP grad-sync {late_ms[index]:.1f} ms/step after its DP peers "
+                    f"(peers idle {peer_sync[index]:.1f} ms/step = {idle_frac:.0%} of their compute, "
+                    f"z={z_late[index]:.1f}) for {state.consecutive[rank_meta.rank]} windows; its own GPU compute "
+                    f"is {1 + rel_self[index]:.2f}x peers, gc {gc_ms[index]:.1f} ms, cpu/gpu fwd "
+                    f"{cpu_fwd[index] / fwd[index] if fwd[index] > _EPS else 0.0:.2f}x -> {reason} (host-side stall)"
+                )
             new_active[rank_meta.rank] = reason
-            message = (
-                f"rank {rank_meta.rank} ({rank_meta.tag}, host={rank_meta.host}, gpu={rank_meta.device}) "
-                f"self {self_ms[index]:.1f} ms/step = {1 + rel_self[index]:.2f}x peers (z={z_self[index]:.1f}) "
-                f"for {state.consecutive[rank_meta.rank]} windows; tokens {1 + rel_tok[index]:.2f}x, "
-                f"ms/ktok {1 + rel_ktok[index]:.2f}x, gc {gc_ms[index]:.1f} ms -> {reason}"
-            )
             alerts.append(Alert(rank_meta.rank, reason, message, new=state.active.get(rank_meta.rank) != reason))
         elif (
             not candidates[index]
@@ -251,6 +303,7 @@ def analyze_window(
                 "device": rank_meta.device,
                 "self_ms": float(self_ms[index]),
                 "wait_ms": float(wait_ms[index]),
+                "late_ms": float(late_ms[index]),
                 "tokens": float(tokens[index]),
                 "ms_per_ktok": float(per_ktok[index]),
                 "rel_self": float(rel_self[index]),
@@ -277,6 +330,11 @@ def analyze_window(
         _emit(name, _column(x, name), segment_rel[name])
     _emit("self", self_ms, rel_self)
     _emit("wait", wait_ms, np.zeros(world))
+    # Late arrival: who the DP group waits for and how long the group idles for it.
+    latest = int(np.argmax(late_ms))
+    metrics["straggler/late/max_ms"] = float(late_ms[latest])
+    metrics["straggler/late/max_rank"] = float(meta[latest].rank) if late_ms[latest] > _EPS else -1.0
+    metrics["straggler/late/peer_idle_ms"] = float(peer_sync[latest]) if late_ms[latest] > _EPS else 0.0
     if has_tokens:
         _emit("self_per_ktok", per_ktok, rel_ktok)
         metrics["straggler/tokens/median"] = float(np.median(tokens))

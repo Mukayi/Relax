@@ -29,6 +29,7 @@ _TABLE_COLUMNS: tuple[str, ...] = (
     "device",
     "self_ms",
     "wait_ms",
+    "late_ms",
     "tokens",
     "ms_per_ktok",
     "gc_ms",
@@ -94,12 +95,16 @@ def report_straggler_window(args: Any, rollout_id: int, report: WindowReport) ->
     else:
         logger.info(
             "[straggler] step=%d no straggler; self median %.1f ms max %.1f ms (rank %d, +%.0f%%), "
-            "pp_stage_imbalance %.2f, overhead %.2f ms/step",
+            "latest to grad-sync rank %d by %.1f ms (peers idle %.1f ms), pp_stage_imbalance %.2f, "
+            "overhead %.2f ms/step",
             step,
             metrics.get("straggler/self/median_ms", 0.0),
             metrics.get("straggler/self/max_ms", 0.0),
             int(metrics.get("straggler/self/max_rank", -1)),
             100.0 * metrics.get("straggler/self/spread", 0.0),
+            int(metrics.get("straggler/late/max_rank", -1)),
+            metrics.get("straggler/late/max_ms", 0.0),
+            metrics.get("straggler/late/peer_idle_ms", 0.0),
             metrics.get("straggler/pp_stage_imbalance", 1.0),
             metrics.get("straggler/self_overhead_ms", 0.0),
         )

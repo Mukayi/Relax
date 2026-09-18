@@ -23,8 +23,8 @@ def _meta(world, pp_size=1):
     ]
 
 
-def _healthy_row(steps=10, fwd=100.0, bwd=200.0, optim=20.0, tokens=8000.0, **extra):
-    return _row(steps=steps, fwd=fwd, bwd=bwd, optim=optim, tokens=tokens, dp_grad_sync=5.0, **extra)
+def _healthy_row(steps=10, fwd=100.0, bwd=200.0, optim=20.0, tokens=8000.0, dp_grad_sync=5.0, **extra):
+    return _row(steps=steps, fwd=fwd, bwd=bwd, optim=optim, tokens=tokens, dp_grad_sync=dp_grad_sync, **extra)
 
 
 def test_healthy_window_has_no_flags_and_per_step_normalization():
@@ -131,6 +131,63 @@ def test_wait_below_absolute_guard_is_not_reported():
     assert report.alerts == []
     assert report.metrics["straggler/pp_recv/max_rank"] == 2
     assert report.metrics["straggler/pp_recv/spread"] == 100.0  # capped
+
+
+def test_late_arriver_is_the_rank_with_the_shortest_grad_sync():
+    # Observed on a real 8xA800 SFT run: rank 0's kernels are as fast as everyone
+    # else's, but it reaches the DP reduce-scatter ~1 s late, so the 7 peers show a
+    # ~1 s grad-sync bracket while rank 0's bracket is just the 20 ms transfer.
+    config = DetectorConfig(persist_windows=2)
+    state = DetectorState()
+    table = [_healthy_row(dp_grad_sync=1020.0) for _ in range(8)]
+    table[0] = _healthy_row(dp_grad_sync=20.0)
+    first = analyze_window(table, _meta(8), config, state)
+    assert first.metrics["straggler/flagged/count"] == 0  # persistence
+    assert first.metrics["straggler/late/max_rank"] == 0
+    assert first.metrics["straggler/late/max_ms"] == pytest.approx(1000.0)
+    assert first.metrics["straggler/late/peer_idle_ms"] == pytest.approx(1020.0)
+    assert first.metrics["straggler/self/spread"] == pytest.approx(0.0)  # compute itself is balanced
+    report = analyze_window(table, _meta(8), config, state)
+    assert report.metrics["straggler/flagged/count"] == 1
+    assert report.metrics["straggler/flagged/rank"] == 0
+    assert report.metrics["straggler/flagged/reason"] == REASON_CODE["late_arrival"]
+    assert [(alert.rank, alert.reason, alert.new) for alert in report.alerts] == [(0, "late_arrival", True)]
+    assert "1000.0 ms/step after its DP peers" in report.alerts[0].message
+    assert report.rows[0]["late_ms"] == pytest.approx(1000.0)
+    assert report.rows[1]["late_ms"] == pytest.approx(0.0)
+
+
+def test_late_arrival_is_measured_within_dp_groups_only():
+    # Two PP stages; stage 1 has a longer grad-sync for everyone (bigger layers), which
+    # must not make stage-0 ranks look "late". Only rank 5 is late within its own group.
+    config = DetectorConfig(persist_windows=1)
+    table = [_healthy_row(dp_grad_sync=30.0) for _ in range(4)] + [_healthy_row(dp_grad_sync=400.0) for _ in range(4)]
+    table[5] = _healthy_row(dp_grad_sync=40.0)
+    report = analyze_window(table, _meta(8, pp_size=2), config, DetectorState())
+    assert [(alert.rank, alert.reason) for alert in report.alerts] == [(5, "late_arrival")]
+    assert report.metrics["straggler/late/max_rank"] == 5
+    assert report.metrics["straggler/late/max_ms"] == pytest.approx(360.0)
+
+
+def test_small_or_uniform_grad_sync_is_not_late_arrival():
+    config = DetectorConfig(persist_windows=1, wait_abs_frac=0.05)
+    uniform = [_healthy_row(dp_grad_sync=500.0) for _ in range(8)]  # slow link, nobody late
+    assert analyze_window(uniform, _meta(8), config, DetectorState()).alerts == []
+    tiny = [_healthy_row(dp_grad_sync=12.0) for _ in range(8)]
+    tiny[3] = _healthy_row(dp_grad_sync=4.0)  # 8 ms of a 320 ms step is noise
+    report = analyze_window(tiny, _meta(8), config, DetectorState())
+    assert report.alerts == []
+    assert report.metrics["straggler/late/max_rank"] == 3  # still reported, just not flagged
+    assert report.metrics["straggler/flagged/count"] == 0
+
+
+def test_slow_compute_takes_precedence_over_late_arrival_classification():
+    # A rank whose kernels are slow naturally also arrives late; report the root cause.
+    config = DetectorConfig(persist_windows=1)
+    table = [_healthy_row(dp_grad_sync=200.0) for _ in range(4)]
+    table[1] = _healthy_row(fwd=150.0, bwd=300.0, dp_grad_sync=20.0)
+    report = analyze_window(table, _meta(4), config, DetectorState())
+    assert [(alert.rank, alert.reason) for alert in report.alerts] == [(1, "slow_device")]
 
 
 def test_missing_tokens_disables_token_metrics():
