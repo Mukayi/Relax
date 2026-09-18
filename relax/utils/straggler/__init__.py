@@ -3,29 +3,21 @@
 backend.
 
 See ``relax/utils/straggler/collector.py`` for the data flow. Enabled with the
-``RELAX_STRAGGLER_PROFILER`` environment variable; off by default.
+``RELAX_STRAGGLER_PROFILER`` environment variable; off by default. Only the
+entry points used by the Megatron backend are re-exported here; the detector
+and timer internals live in their own modules.
 """
 
 from relax.utils.straggler.collector import (
     StragglerCollector,
-    get_straggler_collector,
     install_straggler_collector,
     straggler_timers,
 )
-from relax.utils.straggler.detector import DetectorConfig, DetectorState, RankMeta, WindowReport, analyze_window
 from relax.utils.straggler.reporter import report_straggler_window
-from relax.utils.straggler.timers import StragglerTimers
 
 
 __all__ = [
-    "DetectorConfig",
-    "DetectorState",
-    "RankMeta",
     "StragglerCollector",
-    "StragglerTimers",
-    "WindowReport",
-    "analyze_window",
-    "get_straggler_collector",
     "install_straggler_collector",
     "report_straggler_window",
     "straggler_timers",

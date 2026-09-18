@@ -11,10 +11,11 @@ from __future__ import annotations
 from typing import Mapping
 
 
-# GPU time (ms, summed over the window) per coarse segment. The first block is
-# fed by Megatron's own ``config.timers`` call sites (see MEGATRON_TIMER_SEGMENTS),
-# the ``lp_*`` block is the same call sites during ``forward_only`` (log-prob /
-# critic value passes), the last block is reserved for module hooks.
+# Compute-stream time (ms, summed over the window) per coarse segment. The
+# first block is fed by Megatron's own ``config.timers`` call sites (see
+# MEGATRON_TIMER_SEGMENTS); the ``lp_*`` block is the same call sites during
+# ``forward_only`` (log-prob / critic value passes). Adding a segment (e.g. for
+# MoE dispatch hooks) is one entry here plus one mapping below.
 GPU_SEGMENTS: tuple[str, ...] = (
     "fwd",
     "bwd",
@@ -26,12 +27,9 @@ GPU_SEGMENTS: tuple[str, ...] = (
     "lp_fwd",
     "lp_pp_recv",
     "lp_pp_send",
-    "moe_dispatch",
-    "moe_combine",
-    "moe_experts",
-    "attn",
 )
-# CPU wall time (ms) of the same fwd / bwd brackets, and Python GC pauses.
+# CPU wall time (ms) of the same fwd / bwd brackets, and Python GC pauses that
+# happened while a step was in flight.
 CPU_FIELDS: tuple[str, ...] = ("cpu_fwd", "cpu_bwd", "gc")
 # Counters: tokens processed by this rank, number of fwd brackets, number of
 # steps in the window, event pairs dropped because the pending queue was full,
@@ -44,8 +42,10 @@ NUM_FIELDS: int = len(FIELDS)
 
 # Segments whose sum is "time this rank spent computing on its own" versus
 # "time this rank spent waiting for a peer". Used by the detector.
-SELF_SEGMENTS: tuple[str, ...] = ("fwd", "bwd", "optim", "moe_experts")
+SELF_SEGMENTS: tuple[str, ...] = ("fwd", "bwd", "optim")
 WAIT_SEGMENTS: tuple[str, ...] = ("pp_recv", "dp_grad_sync", "dp_param_gather")
+# Segment whose per-rank asymmetry inside a grad-sync group exposes late arrival.
+LATE_ARRIVAL_SEGMENT = "dp_grad_sync"
 
 # Megatron timer name -> segment, for the training phase. Names come from
 # megatron/core/pipeline_parallel/schedules.py, p2p_communication.py,
@@ -87,7 +87,11 @@ FORWARD_ONLY_TIMER_SEGMENTS: Mapping[str, str] = {
 
 
 class WindowStats:
-    """Mutable accumulator with the ``FIELDS`` layout."""
+    """Mutable accumulator with the ``FIELDS`` layout.
+
+    ``add`` resolves the field name; hot paths that run per event use
+    ``add_index`` with an index looked up once at import time.
+    """
 
     __slots__ = ("values",)
 
@@ -104,8 +108,7 @@ class WindowStats:
         return self.values[FIELD_INDEX[field]]
 
     def reset(self) -> None:
-        for index in range(NUM_FIELDS):
-            self.values[index] = 0.0
+        self.values = [0.0] * NUM_FIELDS
 
     def as_list(self) -> list[float]:
         return list(self.values)

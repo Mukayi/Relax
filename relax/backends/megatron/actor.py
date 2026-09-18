@@ -385,8 +385,9 @@ class MegatronTrainRayActor(TrainRayActor):
 
         self.prof = TrainProfiler(args)
         # Must precede initialize_model_and_optimizer: the optimizer config picks
-        # up its ``timers`` from the collector when it is built.
-        self.straggler = install_straggler_collector(args)
+        # up its ``timers`` from the collector when it is built. Only the actor
+        # role drives ``_straggler_end_step``; other roles get ``None``.
+        self.straggler = install_straggler_collector(args, role)
 
         # read config and tokenizer serialized to prevent concurrent writing bug.
         for i in range(args.num_gpus_per_node):

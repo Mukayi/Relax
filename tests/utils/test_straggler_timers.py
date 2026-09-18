@@ -5,38 +5,26 @@ import pytest
 
 from relax.utils.straggler.stats import FIELD_INDEX, FORWARD_ONLY_TIMER_SEGMENTS, MEGATRON_TIMER_SEGMENTS
 from relax.utils.straggler.timers import EventPool, StragglerTimers, _NullTimer, _SegmentTimer
-
-
-class FakeEvent:
-    """Stands in for ``torch.cuda.Event``; ``record`` stamps a global
-    counter."""
-
-    clock = 0.0
-
-    def __init__(self):
-        self.stamp = None
-        self.done = True
-
-    def record(self):
-        FakeEvent.clock += 1.0
-        self.stamp = FakeEvent.clock
-
-    def query(self):
-        return self.done
-
-    def elapsed_time(self, other):
-        return other.stamp - self.stamp
+from tests.utils.straggler_helpers import FakeEvent
 
 
 class RecordingSink:
-    def __init__(self):
+    def __init__(self, capturing=False):
         self.pool = EventPool(4, FakeEvent)
         self.pushed = []
+        self.discarded = []
+        self.capturing = capturing
 
     def record_event(self):
+        if self.capturing:
+            return None
         event = self.pool.acquire()
         event.record()
         return event
+
+    def discard_event(self, event):
+        self.discarded.append(event)
+        self.pool.release(event)
 
     def push(self, segment_index, start_event, end_event, cpu_ms):
         self.pushed.append((segment_index, start_event, end_event, cpu_ms))
@@ -84,6 +72,25 @@ def test_segment_timer_tolerates_double_start_and_stop_without_start():
     assert timer.active
     timer.stop()
     assert len(sink.pushed) == 1
+    assert not timer.active
+
+
+def test_segment_timer_skips_bracket_when_sink_cannot_record():
+    # Sink returns None (stream under CUDA-graph capture): nothing is pushed and
+    # no event leaks, whether capture starts before ``start`` or between the two.
+    sink = RecordingSink(capturing=True)
+    timer = StragglerTimers(sink, MEGATRON_TIMER_SEGMENTS)("forward-compute")
+    timer.start()
+    assert not timer.active
+    timer.stop()
+    assert sink.pushed == [] and sink.discarded == []
+
+    sink.capturing = False
+    timer.start()
+    sink.capturing = True
+    timer.stop()
+    assert sink.pushed == []
+    assert len(sink.discarded) == 1 and len(sink.pool) == 4
     assert not timer.active
 
 

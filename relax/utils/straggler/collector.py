@@ -35,9 +35,22 @@ _BWD_INDEX = FIELD_INDEX["bwd"]
 _CPU_FWD_INDEX = FIELD_INDEX["cpu_fwd"]
 _CPU_BWD_INDEX = FIELD_INDEX["cpu_bwd"]
 _NUM_FWD_INDEX = FIELD_INDEX["num_fwd"]
+_GC_INDEX = FIELD_INDEX["gc"]
+_DROPPED_INDEX = FIELD_INDEX["dropped"]
+
+# Only the role that runs the training step (and therefore calls ``end_step``)
+# gets a collector; critic / reference / actor_fwd actors would only fill the
+# pending queue and never drain it.
+PROFILED_ROLES: frozenset[str] = frozenset({"actor"})
 
 GatherFn = Callable[[list[float]], list[list[float]]]
 GatherObjectsFn = Callable[[Any], list[Any]]
+
+
+def _is_stream_capturing() -> bool:
+    import torch
+
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
 
 
 def gloo_all_gather(values: list[float]) -> list[list[float]]:
@@ -72,8 +85,11 @@ def local_rank_meta() -> RankMeta:
     import torch.distributed as dist
     from megatron.core import mpu
 
+    from relax.utils.distributed_utils import get_gloo_group
+
     return RankMeta(
-        rank=dist.get_rank(),
+        # Rank within the Gloo group == global rank; it indexes the gathered table.
+        rank=dist.get_rank(get_gloo_group()),
         dp=mpu.get_data_parallel_rank(with_context_parallel=True),
         tp=mpu.get_tensor_model_parallel_rank(),
         pp=mpu.get_pipeline_model_parallel_rank(),
@@ -101,6 +117,7 @@ class StragglerCollector:
         gather_objects: GatherObjectsFn = gloo_all_gather_objects,
         clock: Callable[[], float] = perf_counter,
         register_gc_callback: bool = True,
+        is_capturing: Callable[[], bool] = _is_stream_capturing,
     ) -> None:
         if report_interval < 1:
             raise ValueError("report_interval must be >= 1")
@@ -118,7 +135,12 @@ class StragglerCollector:
         self._gather = gather
         self._gather_objects = gather_objects
         self._clock = clock
+        self._is_capturing = is_capturing
         self._all_meta: list[RankMeta] | None = None
+        # True from the first bracket of a step until ``end_step``; GC pauses are
+        # only attributed to the step while it is set (not during train_wait,
+        # offload / clear_memory, etc.).
+        self._step_open = False
         self._gc_start: float | None = None
         self._gc_registered = False
         if register_gc_callback:
@@ -132,16 +154,24 @@ class StragglerCollector:
     # ---- hot path -----------------------------------------------------------------------------------------------
 
     def record_event(self) -> Any:
+        # Events recorded into a CUDA graph capture have no meaningful
+        # elapsed_time on replay; skip the bracket instead.
+        if self._is_capturing():
+            return None
+        self._step_open = True
         event = self._pool.acquire()
         event.record()
         return event
+
+    def discard_event(self, event: Any) -> None:
+        self._pool.release(event)
 
     def push(self, segment_index: int, start_event: Any, end_event: Any, cpu_ms: float) -> None:
         if len(self._pending) >= self._max_pending:
             _, old_start, old_end, _ = self._pending.popleft()
             self._pool.release(old_start)
             self._pool.release(old_end)
-            self._window.add("dropped", 1.0)
+            self._window.add_index(_DROPPED_INDEX, 1.0)
         self._pending.append((segment_index, start_event, end_event, cpu_ms))
 
     def add_tokens(self, tokens: int) -> None:
@@ -149,9 +179,9 @@ class StragglerCollector:
 
     def _on_gc(self, phase: str, info: dict[str, Any]) -> None:
         if phase == "start":
-            self._gc_start = self._clock()
+            self._gc_start = self._clock() if self._step_open else None
         elif self._gc_start is not None:
-            self._window.add("gc", (self._clock() - self._gc_start) * 1e3)
+            self._window.add_index(_GC_INDEX, (self._clock() - self._gc_start) * 1e3)
             self._gc_start = None
 
     # ---- cold path ----------------------------------------------------------------------------------------------
@@ -165,29 +195,32 @@ class StragglerCollector:
         return self._window
 
     def drain(self) -> int:
-        """Fold every completed event pair into the window; keep the rest.
+        """Fold completed event pairs from the front of the queue into the
+        window; stop at the first pair that is still in flight.
 
-        Returns the number of pairs folded.
+        Pairs are queued in stream order, so an incomplete pair implies every
+        later pair is incomplete too. Each pair is popped only after it has
+        been folded, so an exception leaves the queue consistent and no event
+        is released twice. Returns the number of pairs folded.
         """
         started = self._clock()
         folded = 0
-        remaining: deque[tuple[int, Any, Any, float]] = deque()
+        pending = self._pending
         window = self._window
-        for item in self._pending:
-            segment_index, start_event, end_event, cpu_ms = item
-            if not end_event.query():
-                remaining.append(item)
-                continue
+        while pending:
+            segment_index, start_event, end_event, cpu_ms = pending[0]
+            if not (end_event.query() and start_event.query()):
+                break
             window.add_index(segment_index, start_event.elapsed_time(end_event))
             if segment_index == _FWD_INDEX:
                 window.add_index(_CPU_FWD_INDEX, cpu_ms)
                 window.add_index(_NUM_FWD_INDEX, 1.0)
             elif segment_index == _BWD_INDEX:
                 window.add_index(_CPU_BWD_INDEX, cpu_ms)
+            pending.popleft()
             self._pool.release(start_event)
             self._pool.release(end_event)
             folded += 1
-        self._pending = remaining
         window.add("overhead", (self._clock() - started) * 1e3)
         return folded
 
@@ -200,6 +233,7 @@ class StragglerCollector:
         closes, ``None`` otherwise.
         """
         self.drain()
+        self._step_open = False
         self._window.add("num_steps", 1.0)
         self._steps_in_window += 1
         if self._steps_in_window < self.report_interval:
@@ -213,7 +247,6 @@ class StragglerCollector:
             report = analyze_window(table, self._all_meta, self.detector_config, self.detector_state)
             report.metrics["straggler/gather_ms"] = (self._clock() - started) * 1e3
             report.window_start_wall = self.window_start_wall
-            report.window_end_wall = time()
         self._window.reset()
         self._steps_in_window = 0
         self.window_start_wall = time()
@@ -237,8 +270,9 @@ class StragglerCollector:
 _COLLECTOR: StragglerCollector | None = None
 
 
-def install_straggler_collector(args: Any) -> StragglerCollector | None:
-    """Create the process-wide collector if the profiler is enabled.
+def install_straggler_collector(args: Any, role: str) -> StragglerCollector | None:
+    """Create the process-wide collector if the profiler is enabled and this
+    actor's ``role`` runs training steps.
 
     Must run after Megatron parallel state and Relax's Gloo group exist (i.e.
     from ``MegatronTrainRayActor.init``). Returns ``None`` when disabled so the
@@ -247,7 +281,7 @@ def install_straggler_collector(args: Any) -> StragglerCollector | None:
     global _COLLECTOR
     from relax.utils.env import Envs
 
-    if not Envs.RELAX_STRAGGLER_PROFILER:
+    if not Envs.RELAX_STRAGGLER_PROFILER or role not in PROFILED_ROLES:
         return None
     if _COLLECTOR is not None:
         return _COLLECTOR
@@ -274,10 +308,6 @@ def install_straggler_collector(args: Any) -> StragglerCollector | None:
         is_primary,
         _COLLECTOR.rank_meta,
     )
-    return _COLLECTOR
-
-
-def get_straggler_collector() -> StragglerCollector | None:
     return _COLLECTOR
 
 

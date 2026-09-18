@@ -14,14 +14,17 @@ as two ranks.
 
 Two independent signals are checked:
 
-* **self compute** (``fwd + bwd + optim + moe_experts`` GPU time): a rank whose
-  own kernels take longer than its stage peers -> ``slow_device`` /
+* **self compute** (``fwd + bwd + optim`` compute-stream time): a rank whose
+  own step takes longer than its stage peers -> ``slow_device`` /
   ``data_imbalance`` / ``cpu_bound``.
-* **late arrival** at the DP grad-sync collective: every DP peer's
+* **late arrival** at the DP grad-sync collective: every peer's
   ``dp_grad_sync`` bracket ends when the collective completes, so a rank that
   shows a much *shorter* bracket than its peers is the one everybody waited
   for. Its GPU kernels may be perfectly normal; the lost time sits between
-  kernels on the host (data fetch, GIL / GC, launch gaps) -> ``late_arrival``.
+  kernels on the host (data fetch, GIL / GC, blocking I/O) -> ``late_arrival``.
+
+Segment times come from events on the compute stream, so they include host
+launch gaps inside the bracket; "GPU time" below is shorthand for that.
 """
 
 from __future__ import annotations
@@ -31,13 +34,18 @@ from typing import Sequence
 
 import numpy as np
 
-from relax.utils.straggler.stats import FIELD_INDEX, GPU_SEGMENTS, SELF_SEGMENTS, WAIT_SEGMENTS
+from relax.utils.straggler.stats import (
+    FIELD_INDEX,
+    GPU_SEGMENTS,
+    LATE_ARRIVAL_SEGMENT,
+    SELF_SEGMENTS,
+    WAIT_SEGMENTS,
+)
 
 
+# Order is part of the metric contract (``straggler/flagged/reason`` logs the code).
 REASONS: tuple[str, ...] = ("none", "slow_device", "data_imbalance", "upstream_wait", "cpu_bound", "late_arrival")
 REASON_CODE: dict[str, int] = {reason: code for code, reason in enumerate(REASONS)}
-# Segment whose per-rank asymmetry inside a DP group exposes late arrival.
-LATE_ARRIVAL_SEGMENT = "dp_grad_sync"
 
 _EPS = 1e-9
 
@@ -65,8 +73,8 @@ class DetectorConfig:
     z_threshold: float = 3.0
     rel_threshold: float = 0.10
     persist_windows: int = 3
+    # A slow rank whose GC pauses are at least this fraction of its compute is ``cpu_bound``.
     gc_ratio_threshold: float = 0.05
-    cpu_ratio_threshold: float = 1.2
     # Extra PP waiting / DP lateness must be at least this fraction of the stage's
     # median compute to count.
     wait_abs_frac: float = 0.05
@@ -93,19 +101,31 @@ class WindowReport:
     metrics: dict[str, float]
     alerts: list[Alert]
     rows: list[dict[str, float | int | str]]
-    # Wall-clock span of the window; filled in by the collector for the timeline.
+    # Wall-clock start of the window; filled in by the collector for the timeline.
     window_start_wall: float = 0.0
-    window_end_wall: float = 0.0
 
 
 def _leave_one_out_median(values: np.ndarray) -> np.ndarray:
-    """``out[i]`` is the median of ``values`` without element ``i``."""
+    """``out[i]`` is the median of ``values`` without element ``i``.
+
+    One sort: removing the element at sorted position ``p`` shifts the peers'
+    middle index by one when ``p`` lies at or below it.
+    """
     n = values.shape[0]
     if n < 2:
         return values.copy()
+    order = np.argsort(values, kind="stable")
+    s = values[order]
+    p = np.arange(n)
+    m = n - 1  # number of peers
+    if m % 2 == 1:
+        mid = m // 2
+        med_sorted = s[np.where(p <= mid, mid + 1, mid)]
+    else:
+        lo, hi = m // 2 - 1, m // 2
+        med_sorted = 0.5 * (s[np.where(p <= lo, lo + 1, lo)] + s[np.where(p <= hi, hi + 1, hi)])
     out = np.empty_like(values)
-    for i in range(n):
-        out[i] = np.median(np.delete(values, i))
+    out[order] = med_sorted
     return out
 
 
@@ -122,27 +142,29 @@ def _relative_and_z(values: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndar
     peers are (near) zero the relative excess is capped at ``_REL_CAP`` and z
     is computed against 1% of the value itself so a lone non-zero rank still
     registers; callers add an absolute-significance guard where that matters.
+
+    Vectorized: an ``n x n`` deviation matrix with the diagonal masked, so the
+    cost is one ``nanmedian`` per call rather than ``n`` Python iterations.
     """
     n = values.shape[0]
     rel = np.zeros(n)
     z = np.zeros(n)
-    peer_med = values.copy()
     if n < 2:
-        return rel, z, peer_med
-    for i in range(n):
-        peers = np.delete(values, i)
-        med = float(np.median(peers))
-        mad = float(np.median(np.abs(peers - med)))
-        peer_med[i] = med
-        if med > _EPS:
-            rel[i] = min(values[i] / med - 1.0, _REL_CAP)
-        else:
-            rel[i] = _REL_CAP if values[i] > _EPS else 0.0
-        scale = 1.4826 * mad
-        if scale < _EPS:
-            scale = max(_EPS, 0.01 * abs(med), 0.01 * abs(values[i]))
-        z[i] = (values[i] - med) / scale
-    return rel, z, peer_med
+        return rel, z, values.copy()
+    med = _leave_one_out_median(values)
+    dev = np.abs(values[None, :] - med[:, None])
+    np.fill_diagonal(dev, np.nan)
+    mad = np.nanmedian(dev, axis=1)
+
+    positive = med > _EPS
+    rel[positive] = np.minimum(values[positive] / med[positive] - 1.0, _REL_CAP)
+    rel[~positive & (values > _EPS)] = _REL_CAP
+
+    scale = 1.4826 * mad
+    fallback = np.maximum(np.maximum(0.01 * np.abs(med), 0.01 * np.abs(values)), _EPS)
+    scale = np.where(scale < _EPS, fallback, scale)
+    z[:] = (values - med) / scale
+    return rel, z, med
 
 
 def _column(table: np.ndarray, name: str) -> np.ndarray:
@@ -182,6 +204,7 @@ def analyze_window(
     rel_recv = np.zeros(world)
     z_recv = np.zeros(world)
     peer_recv = np.zeros(world)
+    rel_wait = np.zeros(world)
     stage_self_of = np.zeros(world)
     segment_rel = {name: np.zeros(world) for name in GPU_SEGMENTS}
     stage_median_self: dict[int, float] = {}
@@ -198,20 +221,23 @@ def analyze_window(
         rel_tok[idx], _, _ = _relative_and_z(tokens[idx])
         rel_ktok[idx], z_ktok[idx], _ = _relative_and_z(per_ktok[idx])
         rel_recv[idx], z_recv[idx], peer_recv[idx] = _relative_and_z(_column(x, "pp_recv")[idx])
+        rel_wait[idx], _, _ = _relative_and_z(wait_ms[idx])
         for name in GPU_SEGMENTS:
             segment_rel[name][idx], _, _ = _relative_and_z(_column(x, name)[idx])
 
-    # Late arrival: within a DP group the grad-sync bracket of the last rank to
+    # Late arrival: within a grad-sync group the bracket of the last rank to
     # arrive is just the transfer; everyone else's bracket also contains the wait
     # for it. ``late_ms[i]`` = how much earlier than rank i its peers arrived.
+    # Megatron reduce-scatters dense grads over the DP x CP group (and EP ranks
+    # share the dense parameters), so peers are the ranks with the same (pp, tp).
     sync_ms = _column(x, LATE_ARRIVAL_SEGMENT)
     late_ms = np.zeros(world)
     rel_late = np.zeros(world)
     z_late = np.zeros(world)
     peer_sync = sync_ms.copy()
-    dp_groups: dict[tuple[int, int, int, int], list[int]] = {}
+    dp_groups: dict[tuple[int, int], list[int]] = {}
     for index, rank_meta in enumerate(meta):
-        dp_groups.setdefault((rank_meta.pp, rank_meta.tp, rank_meta.cp, rank_meta.ep), []).append(index)
+        dp_groups.setdefault((rank_meta.pp, rank_meta.tp), []).append(index)
     for members in dp_groups.values():
         idx = np.asarray(members)
         if idx.shape[0] < 2:
@@ -251,9 +277,7 @@ def analyze_window(
             if self_candidates[index]:
                 if has_tokens and rel_tok[index] >= config.rel_threshold and rel_ktok[index] < config.rel_threshold:
                     reason = "data_imbalance"
-                elif (self_ms[index] > _EPS and gc_ms[index] / self_ms[index] >= config.gc_ratio_threshold) or (
-                    fwd[index] > _EPS and cpu_fwd[index] >= config.cpu_ratio_threshold * fwd[index]
-                ):
+                elif self_ms[index] > _EPS and gc_ms[index] / self_ms[index] >= config.gc_ratio_threshold:
                     reason = "cpu_bound"
                 else:
                     reason = "slow_device"
@@ -306,8 +330,6 @@ def analyze_window(
                 "late_ms": float(late_ms[index]),
                 "tokens": float(tokens[index]),
                 "ms_per_ktok": float(per_ktok[index]),
-                "rel_self": float(rel_self[index]),
-                "z_self": float(z_self[index]),
                 "gc_ms": float(gc_ms[index]),
                 "reason": reason,
                 **{name: float(_column(x, name)[index]) for name in GPU_SEGMENTS},
@@ -318,6 +340,9 @@ def analyze_window(
     metrics: dict[str, float] = {}
 
     def _emit(prefix: str, values: np.ndarray, rel: np.ndarray) -> None:
+        """``max_ms`` is the global maximum; ``max_rank`` / ``spread`` describe
+        the rank with the largest excess over *its stage peers* (so a slower PP
+        stage does not always win)."""
         if not np.any(values > _EPS):
             return
         worst = int(np.argmax(rel))
@@ -329,7 +354,7 @@ def analyze_window(
     for name in GPU_SEGMENTS:
         _emit(name, _column(x, name), segment_rel[name])
     _emit("self", self_ms, rel_self)
-    _emit("wait", wait_ms, np.zeros(world))
+    _emit("wait", wait_ms, rel_wait)
     # Late arrival: who the DP group waits for and how long the group idles for it.
     latest = int(np.argmax(late_ms))
     metrics["straggler/late/max_ms"] = float(late_ms[latest])

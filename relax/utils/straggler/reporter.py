@@ -21,7 +21,9 @@ from relax.utils.timer import TimelineEvent, Timer
 
 logger = get_logger(__name__)
 
-TIMELINE_PID_BASE = 100000
+# Above any real pid (kernel.pid_max <= 2**22) so the straggler rows never merge
+# with a live process's track in Perfetto.
+TIMELINE_PID_BASE = 1 << 30
 _TABLE_COLUMNS: tuple[str, ...] = (
     "rank",
     "tag",
@@ -36,7 +38,7 @@ _TABLE_COLUMNS: tuple[str, ...] = (
 )
 
 
-def _timeline_events(report: WindowReport, step: int) -> list[TimelineEvent]:
+def _timeline_events(report: WindowReport) -> list[TimelineEvent]:
     """Lay each rank's per-step segment averages out as consecutive bars.
 
     The bars start at the window's wall-clock start so they line up with the
@@ -57,7 +59,6 @@ def _timeline_events(report: WindowReport, step: int) -> list[TimelineEvent]:
                     end_ts=cursor + ms / 1e3,
                     pid=pid,
                     tid=tid,
-                    step=step,
                 )
             )
             cursor += ms / 1e3
@@ -85,7 +86,7 @@ def report_straggler_window(args: Any, rollout_id: int, report: WindowReport) ->
     tracking_utils.log(args, metrics, step_key="rollout/step")
 
     if getattr(args, "timeline_dump_dir", None):
-        Timer().records.extend(_timeline_events(report, step))
+        Timer().records.extend(_timeline_events(report))  # step is stamped by Timer.log_record_and_clear
 
     for alert in report.alerts:
         if alert.new:

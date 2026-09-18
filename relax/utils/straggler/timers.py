@@ -22,10 +22,15 @@ class EventSink(Protocol):
     """What a timer needs from its owner."""
 
     def record_event(self) -> Any:
-        """Return a timing event already recorded on the current stream."""
+        """Return a timing event already recorded on the current stream, or
+        ``None`` when recording is not possible right now (e.g. the stream is
+        being captured into a CUDA graph)."""
 
     def push(self, segment_index: int, start_event: Any, end_event: Any, cpu_ms: float) -> None:
         """Hand over one completed bracket for later, lazy readout."""
+
+    def discard_event(self, event: Any) -> None:
+        """Return an event whose bracket could not be completed."""
 
 
 def cuda_timing_event() -> Any:
@@ -91,7 +96,7 @@ class _SegmentTimer:
     def start(self, barrier: bool = False) -> None:
         if self._start_event is not None:
             return
-        self._start_event = self._sink.record_event()
+        self._start_event = self._sink.record_event()  # None while capturing -> bracket is skipped
         self._start_cpu = perf_counter()
 
     def stop(self, barrier: bool = False) -> None:
@@ -100,6 +105,9 @@ class _SegmentTimer:
             return
         self._start_event = None
         end_event = self._sink.record_event()
+        if end_event is None:
+            self._sink.discard_event(start_event)
+            return
         self._sink.push(self._segment_index, start_event, end_event, (perf_counter() - self._start_cpu) * 1e3)
 
     @property

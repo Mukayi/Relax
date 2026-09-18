@@ -5,16 +5,8 @@ from argparse import Namespace
 
 from relax.utils.straggler import reporter
 from relax.utils.straggler.detector import DetectorConfig, DetectorState, RankMeta, analyze_window
-from relax.utils.straggler.stats import FIELD_INDEX, NUM_FIELDS
 from relax.utils.timer import Timer
-
-
-def _row(**fields):
-    values = [0.0] * NUM_FIELDS
-    values[FIELD_INDEX["num_steps"]] = 1.0
-    for name, value in fields.items():
-        values[FIELD_INDEX[name]] = value
-    return values
+from tests.utils.straggler_helpers import row as _row
 
 
 def _report(flag_rank=None):
@@ -24,7 +16,6 @@ def _report(flag_rank=None):
     meta = [RankMeta(rank=r, dp=r, tp=0, pp=0, host="h0", device=r) for r in range(4)]
     report = analyze_window(table, meta, DetectorConfig(persist_windows=1), DetectorState())
     report.window_start_wall = 1000.0
-    report.window_end_wall = 1010.0
     return report
 
 
@@ -57,7 +48,8 @@ def test_timeline_events_one_row_per_rank_when_enabled(monkeypatch):
     rank0 = sorted((event for event in events if event.pid == reporter.TIMELINE_PID_BASE), key=lambda e: e.start_ts)
     assert rank0[0].name.startswith("straggler/fwd") and rank0[0].start_ts == 1000.0
     assert rank0[0].end_ts == 1000.1 and rank0[1].start_ts == 1000.1
-    assert all(event.step == 3 for event in events)
+    # Rows must never collide with a real process's track.
+    assert reporter.TIMELINE_PID_BASE > 2**22  # Linux upper bound for kernel.pid_max
 
 
 def test_no_timeline_events_when_disabled(monkeypatch):

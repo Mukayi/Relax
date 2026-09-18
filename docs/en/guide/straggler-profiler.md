@@ -1,6 +1,6 @@
 # Straggler Analysis
 
-The Megatron backend ships an always-on, low-overhead straggler profiler. Every training rank brackets its own forward / backward / optimizer / gradient-sync / parameter all-gather segments with CUDA events, and every K steps all ranks Gloo-all-gather one fixed-length statistics vector to the primary rank, which decides whether a rank is holding the group back, why, and writes the verdict to metrics, the timeline and the log.
+The Megatron backend ships an always-on, low-overhead straggler profiler. Every training rank brackets its own forward / backward / optimizer / gradient-sync / parameter all-gather segments with CUDA events on the compute stream (so "GPU time" below includes any host launch gaps inside the bracket), and every K steps all ranks Gloo-all-gather one fixed-length statistics vector to the primary rank, which decides whether a rank is holding the group back, why, and writes the verdict to metrics, the timeline and the log.
 
 This is not `torch.profiler`: no kernel tracing, no `cuda.synchronize()`, no change to compute/communication overlap. It is meant to stay enabled in production runs.
 
@@ -23,7 +23,7 @@ env_vars:
 | `RELAX_STRAGGLER_REL_THRESHOLD` | float | 0.10 | Minimum relative excess over the peer median. |
 | `RELAX_STRAGGLER_PERSIST_WINDOWS` | int | 3 | Consecutive windows a rank must qualify before it is flagged; filters one-off spikes (checkpointing, GC). |
 
-Each actor logs `Straggler profiler enabled: report_interval=… primary=… meta=RankMeta(rank=…, dp=…, tp=…, pp=…, host=…, device=…)` at start-up.
+Each actor-role process logs `Straggler profiler enabled: report_interval=… primary=… meta=RankMeta(rank=…, dp=…, tp=…, pp=…, host=…, device=…)` at start-up. Critic / reference / `actor_fwd` actors never run training steps and are not profiled.
 
 ## What you get
 
@@ -52,8 +52,8 @@ its own GPU compute is 0.99x peers, gc 1.8 ms, cpu/gpu fwd 1.26x -> late_arrival
 
 | Metric | Meaning |
 |--------|---------|
-| `straggler/{fwd,bwd,optim,pp_recv,pp_send,dp_grad_sync,dp_param_gather,…}/{median_ms,max_ms,max_rank,spread}` | Per-segment GPU time (ms/step): peer-group median, max, global rank of the max, `max/median − 1`. |
-| `straggler/self/*`, `straggler/self_per_ktok/*` | Own compute time (`fwd + bwd + optim + moe_experts`) and its per-token normalisation. |
+| `straggler/{fwd,bwd,optim,pp_recv,pp_send,dp_grad_sync,dp_param_gather,lp_fwd,lp_pp_recv,lp_pp_send}/{median_ms,max_ms,max_rank,spread}` | Per-segment GPU time (ms/step): median and global max across ranks; `max_rank` / `spread` are the rank with the largest excess over *its PP-stage peers* and that excess (`value/peer_median − 1`). `lp_*` are the same segments during log-prob / forward-only passes. `dp_param_gather` is only populated when `--overlap-param-gather` is off (Megatron does not time the overlapped path). |
+| `straggler/self/*`, `straggler/self_per_ktok/*` | Own compute time (`fwd + bwd + optim`) and its per-token normalisation. |
 | `straggler/wait/median_ms`, `straggler/wait/max_ms` | Time spent waiting for peers (`pp_recv + dp_grad_sync + dp_param_gather`). |
 | `straggler/late/max_ms`, `straggler/late/max_rank`, `straggler/late/peer_idle_ms` | The rank that reaches the DP gradient sync last, by how much, and how long its peers idle for it per step. |
 | `straggler/tokens/{median,max,spread}` | Token-count imbalance across ranks. |
@@ -65,7 +65,7 @@ its own GPU compute is 0.99x peers, gc 1.8 ms, cpu/gpu fwd 1.26x -> late_arrival
 
 ### Timeline
 
-With `--timeline-dump-dir` set, every window appends one `straggler/<seg> rank{g}_dp{d}_tp{t}_pp{p}` event per rank per segment (`pid` = 100000 + global rank, `tid` = segment index). In Perfetto that is one row per rank, so a longer `bwd` bar or a shorter `dp_grad_sync` bar is visible at a glance.
+With `--timeline-dump-dir` set (the timeline is flushed through the metrics-service adapter, so `--use-metrics-service` must be on as well), every window appends one `straggler/<seg> rank{g}_dp{d}_tp{t}_pp{p}` event per rank per segment (`pid` = 2³⁰ + global rank, above any real pid; `tid` = segment index). In Perfetto that is one row per rank, so a longer `bwd` bar or a shorter `dp_grad_sync` bar is visible at a glance.
 
 ## Reading the reason
 
@@ -73,7 +73,7 @@ With `--timeline-dump-dir` set, every window appends one `straggler/<seg> rank{g
 |--------|------|---------------|
 | `slow_device` | Own GPU time well above the other ranks of the same PP stage, token count normal | `nvidia-smi -q -d CLOCK,PERFORMANCE,TEMPERATURE`, ECC, neighbours on the node, NVLink topology |
 | `data_imbalance` | Own time high but normal per token; token count clearly higher | `--balance-data`, dynamic batch splitting, oversize samples |
-| `cpu_bound` | GC pauses ≥ 5 % of own time, or forward CPU wall time ≥ 1.2× its GPU time | `gc.freeze()`, data threads contending for the GIL, per-token Python loops |
+| `cpu_bound` | Own time high *and* Python GC pauses during the step ≥ 5 % of it | `gc.freeze()`, data threads contending for the GIL, per-token Python loops |
 | `upstream_wait` | Own time normal but `pp_recv` well above the same-stage peers | The flagged rank on the upstream stage, or `pp_stage_imbalance` (uneven layer split) |
 | `late_arrival` | Own GPU time normal, but its `dp_grad_sync` bracket is much *shorter* than its DP peers' — a collective finishes for everyone at once, so the last rank to arrive has the shortest bracket and everyone else's bracket contains the wait for it | Host-side gaps between kernels: data fetch, synchronous I/O / HTTP, GIL, launch gaps. `py-spy dump --pid <pid>` on that rank is the quickest confirmation |
 
@@ -83,7 +83,7 @@ With `--timeline-dump-dir` set, every window appends one `straggler/<seg> rank{g
 
 - One pair of non-blocking `cudaEventRecord` per Megatron timer call site (events are pooled): one pair per micro-batch for forward and for backward, plus roughly ten pairs per step for gradient sync, parameter all-gather and the optimizer phases.
 - At the end of each step completed events are read lazily with `event.query()` and accumulated into the window vector: `straggler/self_overhead_ms` measures 0.10–0.15 ms/step.
-- One Gloo `all_gather` (21 float64 per rank) every `REPORT_INTERVAL` steps: about 9 ms per window, i.e. < 1 ms/step amortised.
+- One Gloo `all_gather` (18 float64 per rank) every `REPORT_INTERVAL` steps: about 9 ms per window, i.e. < 1 ms/step amortised.
 - End to end: 8×A800, Qwen3-0.6B SFT (DP8, step ≈ 0.95 s — a small-model, launch-sensitive worst case), profiler off/on alternated 3× for 60 steps each with step-by-step paired comparison (deterministic data order, identical per-step token counts on both sides): `perf/step_time` differs by −0.28 % / +0.32 % / +0.20 % in the three pairs, +0.11 % ± 0.31 % pooled (95 % CI, n = 150 steps), the same order as run-to-run jitter.
 
 ## Where it lives

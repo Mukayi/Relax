@@ -1,30 +1,46 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """CPU tests for the straggler window analysis (pure numpy)."""
 
+import numpy as np
 import pytest
 
-from relax.utils.straggler.detector import REASON_CODE, DetectorConfig, DetectorState, RankMeta, analyze_window
-from relax.utils.straggler.stats import FIELD_INDEX, NUM_FIELDS
-
-
-def _row(steps=1, **fields):
-    values = [0.0] * NUM_FIELDS
-    values[FIELD_INDEX["num_steps"]] = steps
-    for name, value in fields.items():
-        values[FIELD_INDEX[name]] = value * steps
-    return values
-
-
-def _meta(world, pp_size=1):
-    ranks_per_stage = world // pp_size
-    return [
-        RankMeta(rank=r, dp=r % ranks_per_stage, tp=0, pp=r // ranks_per_stage, host=f"h{r // 8}", device=r % 8)
-        for r in range(world)
-    ]
+from relax.utils.straggler.detector import (
+    REASON_CODE,
+    DetectorConfig,
+    DetectorState,
+    RankMeta,
+    _leave_one_out_median,
+    _relative_and_z,
+    analyze_window,
+)
+from tests.utils.straggler_helpers import meta as _meta
+from tests.utils.straggler_helpers import row as _row
 
 
 def _healthy_row(steps=10, fwd=100.0, bwd=200.0, optim=20.0, tokens=8000.0, dp_grad_sync=5.0, **extra):
     return _row(steps=steps, fwd=fwd, bwd=bwd, optim=optim, tokens=tokens, dp_grad_sync=dp_grad_sync, **extra)
+
+
+@pytest.mark.parametrize("n", [2, 3, 4, 5, 8, 9])
+def test_leave_one_out_median_matches_brute_force(n):
+    rng = np.random.default_rng(n)
+    for values in (rng.random(n) * 100.0, np.repeat(7.0, n), np.arange(n, dtype=float)):
+        expected = np.array([np.median(np.delete(values, i)) for i in range(n)])
+        assert _leave_one_out_median(values) == pytest.approx(expected)
+
+
+def test_relative_and_z_matches_brute_force_definition():
+    values = np.array([100.0, 101.0, 99.0, 130.0, 100.5, 0.0])
+    rel, z, med = _relative_and_z(values)
+    for i, value in enumerate(values):
+        peers = np.delete(values, i)
+        peer_med = np.median(peers)
+        mad = np.median(np.abs(peers - peer_med))
+        assert med[i] == pytest.approx(peer_med)
+        assert rel[i] == pytest.approx(min(value / peer_med - 1.0, 100.0))
+        assert z[i] == pytest.approx((value - peer_med) / (1.4826 * mad))
+    rel, z, med = _relative_and_z(np.array([5.0]))
+    assert rel.tolist() == [0.0] and z.tolist() == [0.0] and med.tolist() == [5.0]
 
 
 def test_healthy_window_has_no_flags_and_per_step_normalization():
@@ -112,6 +128,10 @@ def test_downstream_stage_waiting_on_slow_upstream_is_not_flagged_as_slow():
     assert report.metrics["straggler/flagged/count"] == 0
     assert report.metrics["straggler/waiting/count"] == 1
     assert [(alert.rank, alert.reason) for alert in report.alerts] == [(6, "upstream_wait")]
+    # wait/* points at the rank with the largest excess waiting over its stage peers.
+    assert report.metrics["straggler/wait/max_rank"] == 6
+    assert report.metrics["straggler/wait/max_ms"] == pytest.approx(85.0)
+    assert report.metrics["straggler/wait/spread"] == pytest.approx(85.0 / 5.0 - 1.0)
 
 
 def test_two_rank_group_uses_leave_one_out_reference():
@@ -157,7 +177,7 @@ def test_late_arriver_is_the_rank_with_the_shortest_grad_sync():
     assert report.rows[1]["late_ms"] == pytest.approx(0.0)
 
 
-def test_late_arrival_is_measured_within_dp_groups_only():
+def test_late_arrival_is_measured_within_grad_sync_groups_only():
     # Two PP stages; stage 1 has a longer grad-sync for everyone (bigger layers), which
     # must not make stage-0 ranks look "late". Only rank 5 is late within its own group.
     config = DetectorConfig(persist_windows=1)
@@ -167,6 +187,24 @@ def test_late_arrival_is_measured_within_dp_groups_only():
     assert [(alert.rank, alert.reason) for alert in report.alerts] == [(5, "late_arrival")]
     assert report.metrics["straggler/late/max_rank"] == 5
     assert report.metrics["straggler/late/max_ms"] == pytest.approx(360.0)
+
+
+def test_late_arrival_groups_split_by_tp_but_not_by_cp():
+    # TP=2, DP=4: each TP rank reduce-scatters with the 3 other ranks of the same TP index.
+    config = DetectorConfig(persist_windows=1)
+    table = [_healthy_row(dp_grad_sync=300.0) for _ in range(8)]
+    table[2] = _healthy_row(dp_grad_sync=20.0)  # tp=0 group: ranks 0,2,4,6
+    report = analyze_window(table, _meta(8, tp_size=2), config, DetectorState())
+    assert [(alert.rank, alert.reason) for alert in report.alerts] == [(2, "late_arrival")]
+    assert report.rows[3]["late_ms"] == 0.0  # tp=1 ranks are not in that collective
+
+    # CP ranks are inside the DP x CP grad-sync collective, so a late rank in one
+    # CP slice is still detected against peers from the other slice.
+    cp_meta = [RankMeta(rank=r, dp=r // 2, tp=0, pp=0, cp=r % 2) for r in range(8)]
+    table = [_healthy_row(dp_grad_sync=300.0) for _ in range(8)]
+    table[3] = _healthy_row(dp_grad_sync=20.0)
+    report = analyze_window(table, cp_meta, config, DetectorState())
+    assert [(alert.rank, alert.reason) for alert in report.alerts] == [(3, "late_arrival")]
 
 
 def test_small_or_uniform_grad_sync_is_not_late_arrival():
