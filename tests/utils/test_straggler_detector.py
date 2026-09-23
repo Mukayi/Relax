@@ -9,6 +9,7 @@ from relax.utils.straggler.detector import (
     DetectorConfig,
     DetectorState,
     RankMeta,
+    _leave_one_out_mad,
     _leave_one_out_median,
     _relative_and_z,
     analyze_window,
@@ -36,6 +37,16 @@ def test_leave_one_out_median_matches_brute_force(n):
     for values in (rng.random(n) * 100.0, np.repeat(7.0, n), np.arange(n, dtype=float)):
         expected = np.array([np.median(np.delete(values, i)) for i in range(n)])
         assert _leave_one_out_median(values) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("n", [2, 3, 4, 5, 8, 9, 64])
+def test_leave_one_out_mad_matches_brute_force(n):
+    rng = np.random.default_rng(n)
+    ties = rng.integers(0, 3, n).astype(float)
+    for values in (rng.random(n) * 100.0, ties, np.repeat(7.0, n), np.eye(1, n).ravel()):
+        med = _leave_one_out_median(values)
+        expected = [np.median(np.abs(np.delete(values, i) - med[i])) for i in range(n)]
+        assert _leave_one_out_mad(values, med) == pytest.approx(expected)
 
 
 def test_relative_and_z_matches_brute_force_definition():
@@ -137,6 +148,22 @@ def test_downstream_stage_waiting_on_slow_upstream_is_not_flagged_as_slow():
     assert report.metrics["straggler/wait/max_rank"] == 6
     assert report.metrics["straggler/wait/max_ms"] == pytest.approx(85.0)
     assert report.metrics["straggler/wait/spread"] == pytest.approx(85.0 / 5.0 - 1.0)
+
+
+def test_upstream_wait_needs_persist_windows_and_never_feeds_the_culprit_streak():
+    config = DetectorConfig(persist_windows=3)
+    state = DetectorState()
+    table = [_healthy_row() for _ in range(4)] + [_healthy_row(fwd=150.0, bwd=300.0, optim=30.0) for _ in range(4)]
+    table[6] = _healthy_row(fwd=150.0, bwd=300.0, optim=30.0, pp_recv=80.0)
+    for window in range(3):
+        report = analyze_window(table, _meta(8, pp_size=2), config, state)
+        if window < 2:
+            assert report.alerts == [], "a single noisy window must not raise upstream_wait"
+            assert report.metrics["straggler/waiting/count"] == 0
+    assert _reasons(report) == [(6, "upstream_wait")]
+    assert "for 3 windows" in report.alerts[0].message
+    assert report.metrics["straggler/flagged/count"] == 0
+    assert state.consecutive == {}, "victim windows must not count towards flagging a culprit"
 
 
 def test_two_rank_group_uses_leave_one_out_reference():

@@ -254,8 +254,10 @@ class StragglerCollector:
         table = self._gather(self._window.as_list())
         report = None
         if self.is_primary:
+            gathered = self._clock()
             report = analyze_window(table, self._all_meta, self.detector_config, self.detector_state)
-            report.metrics["straggler/gather_ms"] = (self._clock() - started) * 1e3
+            report.metrics["straggler/gather_ms"] = (gathered - started) * 1e3
+            report.metrics["straggler/analyze_ms"] = (self._clock() - gathered) * 1e3
             report.window_start_wall = self.window_start_wall
         self._window.reset()
         self.window_start_wall = time()

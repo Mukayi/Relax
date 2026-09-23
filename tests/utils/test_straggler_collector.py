@@ -6,6 +6,7 @@ import gc
 
 import pytest
 
+from relax.utils.straggler import collector as collector_module
 from relax.utils.straggler.collector import StragglerCollector, install_straggler_collector
 from relax.utils.straggler.detector import DetectorConfig, RankMeta
 from relax.utils.straggler.stats import FIELD_INDEX
@@ -163,6 +164,26 @@ def test_end_step_reports_every_interval_and_resets_window():
     assert collector.window.get("fwd") == 0.0 and collector.window.get("num_steps") == 0.0
     assert len(collector.gather_calls) == 2
     assert len(collector.meta_calls) == 1, "rank metadata is static and must be gathered only once"
+
+
+def test_gather_and_analysis_are_timed_separately(monkeypatch):
+    now = [0.0]
+    real_analyze = collector_module.analyze_window
+
+    def slow_gather(values):
+        now[0] += 0.005
+        return [values, values]
+
+    def slow_analyze(*args):
+        now[0] += 0.007
+        return real_analyze(*args)
+
+    monkeypatch.setattr(collector_module, "analyze_window", slow_analyze)
+    collector = _collector(world=2, interval=1, gather=slow_gather, clock=lambda: now[0])
+    _one_bracket(collector)
+    report = collector.end_step()
+    assert report.metrics["straggler/gather_ms"] == pytest.approx(5.0), "gather_ms must stop before the analysis"
+    assert report.metrics["straggler/analyze_ms"] == pytest.approx(7.0)
 
 
 def test_non_primary_rank_participates_but_returns_no_report():

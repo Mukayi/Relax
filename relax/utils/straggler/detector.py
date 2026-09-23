@@ -89,6 +89,9 @@ class DetectorState:
 
     consecutive: dict[int, int] = field(default_factory=dict)
     active: dict[int, str] = field(default_factory=dict)
+    # ``upstream_wait`` streaks are kept apart from ``consecutive`` so windows
+    # spent as a victim never count towards flagging the same rank as a culprit.
+    waiting: dict[int, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -137,6 +140,21 @@ def _leave_one_out_median(values: np.ndarray) -> np.ndarray:
     return out
 
 
+def _leave_one_out_mad(values: np.ndarray, med: np.ndarray) -> np.ndarray:
+    """``out[i]`` is the median of ``|values[j] - med[i]|`` over ``j != i``.
+
+    ``med`` comes from ``_leave_one_out_median``, which takes at most three
+    distinct values (the removed element only shifts the middle index), so this
+    is one leave-one-out median of the deviations per distinct centre: O(n log
+    n) instead of an ``n x n`` deviation matrix.
+    """
+    out = np.empty_like(values)
+    for centre in np.unique(med):
+        rows = med == centre
+        out[rows] = _leave_one_out_median(np.abs(values - centre))[rows]
+    return out
+
+
 _REL_CAP = 100.0
 
 
@@ -150,9 +168,6 @@ def _relative_and_z(values: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndar
     peers are (near) zero the relative excess is capped at ``_REL_CAP`` and z
     is computed against 1% of the value itself so a lone non-zero rank still
     registers; callers add an absolute-significance guard where that matters.
-
-    The MAD uses an ``n x n`` deviation matrix with the diagonal masked, so
-    time and memory are O(n^2) in the group size.
     """
     n = values.shape[0]
     rel = np.zeros(n)
@@ -160,9 +175,7 @@ def _relative_and_z(values: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndar
     if n < 2:
         return rel, z, values.copy()
     med = _leave_one_out_median(values)
-    dev = np.abs(values[None, :] - med[:, None])
-    np.fill_diagonal(dev, np.nan)
-    mad = np.nanmedian(dev, axis=1)
+    mad = _leave_one_out_mad(values, med)
 
     positive = med > _EPS
     rel[positive] = np.minimum(values[positive] / med[positive] - 1.0, _REL_CAP)
@@ -264,11 +277,20 @@ def analyze_window(
 
     self_candidates = (rel_self >= config.rel_threshold) & (z_self >= config.z_threshold)
     candidates = self_candidates | late_candidates
+    pp_recv = _column(x, "pp_recv")
+    wait_candidates = (
+        ~candidates
+        & (pp_recv > _EPS)
+        & (rel_recv >= config.rel_threshold)
+        & (z_recv >= config.z_threshold)
+        & (pp_recv - peer_recv >= config.wait_abs_frac * stage_self_of)
+    )
     for index, rank_meta in enumerate(meta):
-        if candidates[index]:
-            state.consecutive[rank_meta.rank] = state.consecutive.get(rank_meta.rank, 0) + 1
-        else:
-            state.consecutive.pop(rank_meta.rank, None)
+        for streaks, hit in ((state.consecutive, candidates[index]), (state.waiting, wait_candidates[index])):
+            if hit:
+                streaks[rank_meta.rank] = streaks.get(rank_meta.rank, 0) + 1
+            else:
+                streaks.pop(rank_meta.rank, None)
 
     alerts: list[Alert] = []
     rows: list[dict[str, float | int | str]] = []
@@ -276,7 +298,6 @@ def analyze_window(
     fwd = _column(x, "fwd")
     cpu_fwd = _column(x, "cpu_fwd")
     gc_ms = _column(x, "gc")
-    pp_recv = _column(x, "pp_recv")
 
     for index, rank_meta in enumerate(meta):
         reason, message = "none", ""
@@ -305,17 +326,12 @@ def analyze_window(
                     f"is {1 + rel_self[index]:.2f}x peers, gc {gc_ms[index]:.1f} ms, cpu/gpu fwd "
                     f"{cpu_fwd[index] / fwd[index] if fwd[index] > _EPS else 0.0:.2f}x -> {reason} (host-side stall)"
                 )
-        elif (
-            not candidates[index]
-            and pp_recv[index] > _EPS
-            and rel_recv[index] >= config.rel_threshold
-            and z_recv[index] >= config.z_threshold
-            and pp_recv[index] - peer_recv[index] >= config.wait_abs_frac * stage_self_of[index]
-        ):
+        elif state.waiting.get(rank_meta.rank, 0) >= config.persist_windows:
             reason = "upstream_wait"
             message = (
                 f"rank {rank_meta.rank} ({rank_meta.tag}) waits on PP peers {pp_recv[index]:.1f} ms/step = "
-                f"{1 + rel_recv[index]:.2f}x its stage; its own compute is normal"
+                f"{1 + rel_recv[index]:.2f}x its stage for {state.waiting[rank_meta.rank]} windows; "
+                "its own compute is normal"
             )
         if reason != "none":
             new_active[rank_meta.rank] = reason
