@@ -77,14 +77,15 @@ With `--timeline-dump-dir` set (the timeline is flushed through the metrics-serv
 | `upstream_wait` | Own time normal but `pp_recv` well above the same-stage peers, by at least 5 % of the stage's median own time | The flagged rank on the upstream stage, or `pp_stage_imbalance` (uneven layer split) |
 | `late_arrival` | Own GPU time normal, but its `dp_grad_sync` bracket is much *shorter* than its DP peers' — a collective finishes for everyone at once, so the last rank to arrive has the shortest bracket and everyone else's bracket contains the wait for it | Host-side gaps between kernels: data fetch, synchronous I/O / HTTP, GIL, launch gaps. `py-spy dump --pid <pid>` on that rank is the quickest confirmation |
 
-`late_arrival` is the most common class and the easiest to miss: any rule that only looks at GPU time cannot see it. It showed up in the very first real job the prototype ran on — rank 0's GPU time matched its peers, yet it reached every gradient sync 0.4–1.5 s late because the primary rank was posting logging metrics over synchronous HTTP on the training thread.
+`late_arrival` is easy to miss: any rule that only looks at GPU time cannot see it. It showed up in the very first real job the prototype ran on — rank 0's GPU time matched its peers, yet it reached every gradient sync 0.4–1.5 s late because the primary rank was posting logging metrics over synchronous HTTP on the training thread.
 
 ## Overhead
 
 - One pair of non-blocking `cudaEventRecord` per Megatron timer call site (events are pooled): one pair per micro-batch for forward and for backward, plus roughly ten pairs per step for gradient sync, parameter all-gather and the optimizer phases.
-- At the end of each step completed events are read lazily with `event.query()` and accumulated into the window vector: `straggler/self_overhead_ms` measures 0.10–0.15 ms/step.
+- At the end of each step completed events are read lazily with `event.query()` and accumulated into the window vector: `straggler/self_overhead_ms` measures 0.12–0.15 ms/step on 8×A100.
 - One Gloo `all_gather` (18 float64 per rank) plus the analysis on the primary rank every `REPORT_INTERVAL` steps, reported as `gather_ms` and `analyze_ms`: < 1 ms/step amortised. The analysis is O(n log n) in the stage size: a single-machine CPU micro-benchmark gives 2.4 ms per window at 8 ranks, 10 ms at 512 and 35 ms at 2048. The other ranks wait for the primary at the next collective.
-- End to end: 8×A800, Qwen3-0.6B SFT (DP8, step ≈ 0.95 s — a small-model, launch-sensitive worst case), profiler off/on alternated 3× for 60 steps each with step-by-step paired comparison (deterministic data order, identical per-step token counts on both sides): `perf/step_time` differs by −0.28 % / +0.32 % / +0.20 % in the three pairs, +0.11 % ± 0.31 % pooled (95 % CI, n = 150 steps), the same order as run-to-run jitter.
+- These self-reported costs add up to about 0.6 ms/step (0.05% of a 1.15 s step) and exclude the `event.record()` calls made at every timer start / stop.
+- End to end: 8×A100, Qwen3-0.6B SFT (DP8, step ≈ 1.15 s — a small model, the case most sensitive to timing overhead), profiler off/on alternated 3× for 60 steps each, comparing steps 10–59 (deterministic data order): mean `perf/step_time` differs by −1.69 % / −0.54 % / +0.46 % in the three pairs, while the three profiler-off runs alone differ by 1.2 % — the same order, so no slowdown from the profiler was detected. The run-level 95 % CI is −3.3 % to +2.1 % (n = 3), which is not enough to show the overhead is below 0.5 %.
 
 ## Where it lives
 

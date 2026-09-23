@@ -77,14 +77,15 @@ its own GPU compute is 0.99x peers, gc 1.8 ms, cpu/gpu fwd 1.26x -> late_arrival
 | `upstream_wait` | 自身正常，但 `pp_recv` 显著高于同 stage 其他 rank，且超出量 ≥ 该 stage 中位自身时间的 5% | 看上游 stage 被 flag 的 rank，或 `pp_stage_imbalance`（层划分不均） |
 | `late_arrival` | 自身 GPU 时间正常，但它的 `dp_grad_sync` 区间显著**短于**同 DP 组其他 rank——一次集合通信对所有人同时结束，最后到的那个 rank 区间最短，其他人的区间里都含着等它的时间 | GPU 之间的 host 侧空隙：数据取用、同步 I/O / HTTP、GIL、launch gap；对该 rank `py-spy dump --pid <pid>` 最直接 |
 
-`late_arrival` 是最常见也最容易被漏掉的一类：只看 GPU 时间的规则抓不到它。它在原型的第一个真实作业里就出现了——rank 0 的 GPU 时间和大家一样，却每步晚 0.4–1.5 s 到梯度同步，原因是 primary rank 在训练线程上同步发送日志指标的 HTTP 请求。
+`late_arrival` 容易被漏掉：只看 GPU 时间的规则抓不到它。它在原型的第一个真实作业里就出现了——rank 0 的 GPU 时间和大家一样，却每步晚 0.4–1.5 s 到梯度同步，原因是 primary rank 在训练线程上同步发送日志指标的 HTTP 请求。
 
 ## 开销
 
 - 每个 Megatron 计时点一对 `cudaEventRecord`（非阻塞，事件从池里复用）：每个 micro-batch 的 forward / backward 各一对，每步的梯度同步、参数 all-gather、optimizer 各阶段共约十对。
-- 每步末尾 `event.query()` 惰性读取已完成的事件并累加到窗口向量：`straggler/self_overhead_ms` 实测 0.10–0.15 ms/step。
+- 每步末尾 `event.query()` 惰性读取已完成的事件并累加到窗口向量：`straggler/self_overhead_ms` 在 8×A100 上实测 0.12–0.15 ms/step。
 - 每 `REPORT_INTERVAL` 步一次 Gloo `all_gather`（每 rank 18 个 float64）加 primary 上的判定，分别记在 `gather_ms` 和 `analyze_ms`，摊到每步 < 1 ms。判定是 O(n log n)（n = 同 stage rank 数），单机 CPU 微基准每窗口 8 rank 2.4 ms、512 rank 10 ms、2048 rank 35 ms；其余 rank 会在下一次集合通信处等 primary。
-- 端到端：8×A800、Qwen3-0.6B SFT（DP8，step ≈ 0.95 s，对 launch 开销最敏感的小模型场景）开关交替各 3 次 60 step、逐 step 配对比较（数据顺序确定，两侧每步 token 数完全相同），`perf/step_time` 三对分别差 −0.28% / +0.32% / +0.20%，合并 +0.11% ± 0.31%（95% 置信区间，n = 150 step），与 run-to-run 抖动同量级。
+- 以上自身统计合计约 0.6 ms/step（step 约 1.15 s 时为 0.05%），不含每次计时调用 `event.record()` 的开销。
+- 端到端：8×A100、Qwen3-0.6B SFT（DP8，step ≈ 1.15 s，对计时开销最敏感的小模型场景），开启 / 关闭 profiler 交替各 3 次、每次 60 步，比较 step 10–59（数据顺序确定）：三对 `perf/step_time` 平均差 −1.69% / −0.54% / +0.46%，而三次关闭 profiler 的运行之间本身就相差 1.2%，与之同一量级，没有测出开启后变慢。以每次运行为单位的 95% 置信区间为 −3.3% ~ +2.1%（n = 3），这组对比还不足以证明开销 < 0.5%。
 
 ## 实现位置
 
