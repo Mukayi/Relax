@@ -21,7 +21,7 @@ env_vars:
 | `RELAX_STRAGGLER_REPORT_INTERVAL` | int | 10 | Training steps per cross-rank gather + analysis (one "window"). |
 | `RELAX_STRAGGLER_Z_THRESHOLD` | float | 3.0 | Robust z-score (median / MAD within the peer group) a candidate must exceed. |
 | `RELAX_STRAGGLER_REL_THRESHOLD` | float | 0.10 | Minimum relative excess over the peer median. |
-| `RELAX_STRAGGLER_PERSIST_WINDOWS` | int | 3 | Consecutive windows a rank must qualify before it is flagged (except `upstream_wait`); filters one-off spikes (checkpointing, GC). |
+| `RELAX_STRAGGLER_PERSIST_WINDOWS` | int | 3 | Consecutive windows a rank must qualify before it is flagged (applies to every reason); filters one-off spikes (checkpointing, GC). |
 
 Each actor-role process logs `Straggler profiler enabled: report_interval=… primary=… meta=RankMeta(rank=…, dp=…, tp=…, pp=…, cp=…, ep=…, host=…, device=…)` at start-up. Critic / reference / `actor_fwd` actors never run training steps and are not profiled.
 
@@ -36,7 +36,7 @@ One INFO line per window without alerts:
 latest to grad-sync rank 0 by 13.4 ms (peers idle 45.9 ms), pp_stage_imbalance 1.00, overhead 0.10 ms/step
 ```
 
-When there are alerts, the window in which a rank's reason changes logs one WARNING, and every window that still has alerts logs an INFO per-rank table. Self / late reasons need `PERSIST_WINDOWS` consecutive windows; `upstream_wait` holds from a single window:
+When there are alerts, the window in which a rank's reason changes logs one WARNING, and every window that still has alerts logs an INFO per-rank table. Every reason needs `PERSIST_WINDOWS` consecutive windows:
 
 ```text
 [straggler] step=14 rank 0 (rank0_dp0_tp0_pp0, host=…, gpu=0) reaches the DP grad-sync 433.0 ms/step
@@ -60,8 +60,8 @@ its own GPU compute is 0.99x peers, gc 1.8 ms, cpu/gpu fwd 1.26x -> late_arrival
 | `straggler/pp_stage_imbalance` | `max/min` of per-stage median compute time; independent of any slow device. |
 | `straggler/gc/{median_ms,max_ms}` | Python GC pauses. |
 | `straggler/flagged/count`, `straggler/flagged/rank` (−1 if none), `straggler/flagged/reason` | Alert state. Reason codes: 0 none, 1 slow_device, 2 data_imbalance, 3 upstream_wait, 4 cpu_bound, 5 late_arrival. |
-| `straggler/waiting/count` | Ranks waiting on a slow upstream PP stage in this window (victims, not culprits; single-window verdict, not counted in `flagged`). |
-| `straggler/self_overhead_ms`, `straggler/gather_ms`, `straggler/dropped_events` | The tool's own cost: CPU time per step spent draining events; total gather + analysis time per window on the primary rank (the first window also includes one metadata gather); event pairs dropped because the queue was full (normally 0). |
+| `straggler/waiting/count` | Ranks waiting on a slow upstream PP stage in this window (victims, not culprits; not counted in `flagged`). |
+| `straggler/self_overhead_ms`, `straggler/gather_ms`, `straggler/analyze_ms`, `straggler/dropped_events` | The tool's own cost: CPU time per step spent draining events; gather time per window on the primary rank (the first window also includes one metadata gather); analysis time per window on the primary rank; event pairs dropped because the queue was full (normally 0). |
 
 ### Timeline
 
@@ -74,7 +74,7 @@ With `--timeline-dump-dir` set (the timeline is flushed through the metrics-serv
 | `slow_device` | Own GPU time well above the other ranks of the same PP stage, token count normal | `nvidia-smi -q -d CLOCK,PERFORMANCE,TEMPERATURE`, ECC, neighbours on the node, NVLink topology |
 | `data_imbalance` | Own time high but normal per token; token count clearly higher | `--balance-data`, dynamic batch splitting, oversize samples |
 | `cpu_bound` | Own time high *and* Python GC pauses during the step ≥ 5 % of it | `gc.freeze()`, data threads contending for the GIL, per-token Python loops |
-| `upstream_wait` | Own time normal but `pp_recv` well above the same-stage peers, by at least 5 % of the stage's median own time; single-window verdict | The flagged rank on the upstream stage, or `pp_stage_imbalance` (uneven layer split) |
+| `upstream_wait` | Own time normal but `pp_recv` well above the same-stage peers, by at least 5 % of the stage's median own time | The flagged rank on the upstream stage, or `pp_stage_imbalance` (uneven layer split) |
 | `late_arrival` | Own GPU time normal, but its `dp_grad_sync` bracket is much *shorter* than its DP peers' — a collective finishes for everyone at once, so the last rank to arrive has the shortest bracket and everyone else's bracket contains the wait for it | Host-side gaps between kernels: data fetch, synchronous I/O / HTTP, GIL, launch gaps. `py-spy dump --pid <pid>` on that rank is the quickest confirmation |
 
 `late_arrival` is the most common class and the easiest to miss: any rule that only looks at GPU time cannot see it. It showed up in the very first real job the prototype ran on — rank 0's GPU time matched its peers, yet it reached every gradient sync 0.4–1.5 s late because the primary rank was posting logging metrics over synchronous HTTP on the training thread.
@@ -83,7 +83,7 @@ With `--timeline-dump-dir` set (the timeline is flushed through the metrics-serv
 
 - One pair of non-blocking `cudaEventRecord` per Megatron timer call site (events are pooled): one pair per micro-batch for forward and for backward, plus roughly ten pairs per step for gradient sync, parameter all-gather and the optimizer phases.
 - At the end of each step completed events are read lazily with `event.query()` and accumulated into the window vector: `straggler/self_overhead_ms` measures 0.10–0.15 ms/step.
-- One Gloo `all_gather` (18 float64 per rank) plus the analysis on the primary rank every `REPORT_INTERVAL` steps: `gather_ms` measures about 9 ms per window (about 6.6 ms of it is analysis), i.e. < 1 ms/step amortised. The MAD step is O(n²) in the stage size: a single-machine micro-benchmark gives 160–215 ms per window at 512 ranks, and the other ranks wait for the primary at the next collective.
+- One Gloo `all_gather` (18 float64 per rank) plus the analysis on the primary rank every `REPORT_INTERVAL` steps: together about 9 ms per window on 8 GPUs (measured before the analysis was optimised), i.e. < 1 ms/step amortised, reported as `gather_ms` and `analyze_ms`. The analysis is O(n log n) in the stage size: a single-machine CPU micro-benchmark gives 2.4 ms per window at 8 ranks, 10 ms at 512 and 35 ms at 2048. The other ranks wait for the primary at the next collective.
 - End to end: 8×A800, Qwen3-0.6B SFT (DP8, step ≈ 0.95 s — a small-model, launch-sensitive worst case), profiler off/on alternated 3× for 60 steps each with step-by-step paired comparison (deterministic data order, identical per-step token counts on both sides): `perf/step_time` differs by −0.28 % / +0.32 % / +0.20 % in the three pairs, +0.11 % ± 0.31 % pooled (95 % CI, n = 150 steps), the same order as run-to-run jitter.
 
 ## Where it lives
