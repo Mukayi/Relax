@@ -83,12 +83,12 @@ its own GPU compute is 0.99x peers, gc 1.8 ms, cpu/gpu fwd 1.26x -> late_arrival
 
 - 每个 Megatron 计时点一对 `cudaEventRecord`（非阻塞，事件从池里复用）：每个 micro-batch 的 forward / backward 各一对，每步的梯度同步、参数 all-gather、optimizer 各阶段共约十对。
 - 每步末尾 `event.query()` 惰性读取已完成的事件并累加到窗口向量：`straggler/self_overhead_ms` 实测 0.10–0.15 ms/step。
-- 每 `REPORT_INTERVAL` 步一次 Gloo `all_gather`（每 rank 18 个 float64）加 primary 上的判定：8 卡实测二者合计约 9 ms / 窗口（判定优化前），即 <1 ms/step 摊销，分别记在 `gather_ms` 和 `analyze_ms`。判定是 O(n log n)（n = 同 stage rank 数），单机 CPU 微基准每窗口 8 rank 2.4 ms、512 rank 10 ms、2048 rank 35 ms；其余 rank 会在下一次集合通信处等 primary。
+- 每 `REPORT_INTERVAL` 步一次 Gloo `all_gather`（每 rank 18 个 float64）加 primary 上的判定，分别记在 `gather_ms` 和 `analyze_ms`，摊到每步 < 1 ms。判定是 O(n log n)（n = 同 stage rank 数），单机 CPU 微基准每窗口 8 rank 2.4 ms、512 rank 10 ms、2048 rank 35 ms；其余 rank 会在下一次集合通信处等 primary。
 - 端到端：8×A800、Qwen3-0.6B SFT（DP8，step ≈ 0.95 s，对 launch 开销最敏感的小模型场景）开关交替各 3 次 60 step、逐 step 配对比较（数据顺序确定，两侧每步 token 数完全相同），`perf/step_time` 三对分别差 −0.28% / +0.32% / +0.20%，合并 +0.11% ± 0.31%（95% 置信区间，n = 150 step），与 run-to-run 抖动同量级。
 
 ## 实现位置
 
-- `relax/utils/straggler/timers.py`：替代 Megatron `config.timers` 的非阻塞计时器（Megatron 自带的 `Timer.start/stop` 会 `cuda.synchronize()`，所以 Relax 原本把它设为 `None`）。
+- `relax/utils/straggler/timers.py`：替代 Megatron `config.timers` 的非阻塞计时器（Megatron 自带的 `Timer.start/stop` 会 `cuda.synchronize()`，所以不开 profiler 时 Relax 把它设为 `None`）。
 - `relax/utils/straggler/stats.py`：统计向量布局、Megatron timer 名 → 段的映射。
 - `relax/utils/straggler/collector.py`：每 rank 一个，事件池、惰性读取、GC 回调、Gloo 汇聚。
 - `relax/utils/straggler/detector.py`：纯 numpy 的窗口分析与判定，可在无 GPU 环境单测。

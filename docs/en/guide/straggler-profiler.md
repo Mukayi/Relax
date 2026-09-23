@@ -83,12 +83,12 @@ With `--timeline-dump-dir` set (the timeline is flushed through the metrics-serv
 
 - One pair of non-blocking `cudaEventRecord` per Megatron timer call site (events are pooled): one pair per micro-batch for forward and for backward, plus roughly ten pairs per step for gradient sync, parameter all-gather and the optimizer phases.
 - At the end of each step completed events are read lazily with `event.query()` and accumulated into the window vector: `straggler/self_overhead_ms` measures 0.10–0.15 ms/step.
-- One Gloo `all_gather` (18 float64 per rank) plus the analysis on the primary rank every `REPORT_INTERVAL` steps: together about 9 ms per window on 8 GPUs (measured before the analysis was optimised), i.e. < 1 ms/step amortised, reported as `gather_ms` and `analyze_ms`. The analysis is O(n log n) in the stage size: a single-machine CPU micro-benchmark gives 2.4 ms per window at 8 ranks, 10 ms at 512 and 35 ms at 2048. The other ranks wait for the primary at the next collective.
+- One Gloo `all_gather` (18 float64 per rank) plus the analysis on the primary rank every `REPORT_INTERVAL` steps, reported as `gather_ms` and `analyze_ms`: < 1 ms/step amortised. The analysis is O(n log n) in the stage size: a single-machine CPU micro-benchmark gives 2.4 ms per window at 8 ranks, 10 ms at 512 and 35 ms at 2048. The other ranks wait for the primary at the next collective.
 - End to end: 8×A800, Qwen3-0.6B SFT (DP8, step ≈ 0.95 s — a small-model, launch-sensitive worst case), profiler off/on alternated 3× for 60 steps each with step-by-step paired comparison (deterministic data order, identical per-step token counts on both sides): `perf/step_time` differs by −0.28 % / +0.32 % / +0.20 % in the three pairs, +0.11 % ± 0.31 % pooled (95 % CI, n = 150 steps), the same order as run-to-run jitter.
 
 ## Where it lives
 
-- `relax/utils/straggler/timers.py`: the non-blocking drop-in for Megatron's `config.timers` (Megatron's own `Timer.start/stop` call `cuda.synchronize()`, which is why Relax used to set it to `None`).
+- `relax/utils/straggler/timers.py`: the non-blocking drop-in for Megatron's `config.timers` (Megatron's own `Timer.start/stop` call `cuda.synchronize()`, which is why Relax sets it to `None` when the profiler is off).
 - `relax/utils/straggler/stats.py`: the statistics vector layout and the Megatron timer name → segment map.
 - `relax/utils/straggler/collector.py`: per-rank event pool, lazy read-out, GC callbacks, Gloo gather.
 - `relax/utils/straggler/detector.py`: pure-numpy window analysis, unit-testable without a GPU.
