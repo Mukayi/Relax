@@ -70,6 +70,9 @@ class RankMeta:
 
 @dataclass(frozen=True)
 class DetectorConfig:
+    """Thresholds for ``analyze_window``; the first three come from the
+    ``RELAX_STRAGGLER_*`` environment variables in production."""
+
     z_threshold: float = 3.0
     rel_threshold: float = 0.10
     persist_windows: int = 3
@@ -82,7 +85,7 @@ class DetectorConfig:
 
 @dataclass
 class DetectorState:
-    """Carried across windows for the persistence rule."""
+    """Carry per-rank candidate streaks and active reasons across windows."""
 
     consecutive: dict[int, int] = field(default_factory=dict)
     active: dict[int, str] = field(default_factory=dict)
@@ -90,6 +93,9 @@ class DetectorState:
 
 @dataclass(frozen=True)
 class Alert:
+    """Verdict for one rank; ``new`` is True when its reason changed since the
+    previous window (only those are logged as WARNING)."""
+
     rank: int
     reason: str
     message: str
@@ -98,6 +104,8 @@ class Alert:
 
 @dataclass
 class WindowReport:
+    """Scalars, alerts and per-rank rows produced by one ``analyze_window``."""
+
     metrics: dict[str, float]
     alerts: list[Alert]
     rows: list[dict[str, float | int | str]]
@@ -143,8 +151,8 @@ def _relative_and_z(values: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndar
     is computed against 1% of the value itself so a lone non-zero rank still
     registers; callers add an absolute-significance guard where that matters.
 
-    Vectorized: an ``n x n`` deviation matrix with the diagonal masked, so the
-    cost is one ``nanmedian`` per call rather than ``n`` Python iterations.
+    The MAD uses an ``n x n`` deviation matrix with the diagonal masked, so
+    time and memory are O(n^2) in the group size.
     """
     n = values.shape[0]
     rel = np.zeros(n)
@@ -184,7 +192,10 @@ def analyze_window(
     x = np.asarray(table, dtype=np.float64)
     world = x.shape[0]
     if world != len(meta):
-        raise ValueError(f"table has {world} rows but {len(meta)} rank metas")
+        raise ValueError(
+            f"straggler table has {world} rows but {len(meta)} rank metas; the value and metadata gathers must "
+            "run over the same process group so row i describes rank i."
+        )
 
     # Everything below is per step so numbers stay comparable across intervals.
     steps = np.maximum(_column(x, "num_steps"), 1.0)[:, None]
@@ -200,7 +211,6 @@ def analyze_window(
     z_self = np.zeros(world)
     rel_tok = np.zeros(world)
     rel_ktok = np.zeros(world)
-    z_ktok = np.zeros(world)
     rel_recv = np.zeros(world)
     z_recv = np.zeros(world)
     peer_recv = np.zeros(world)
@@ -219,7 +229,7 @@ def analyze_window(
         stage_self_of[idx] = stage_median_self[pp]
         rel_self[idx], z_self[idx], _ = _relative_and_z(self_ms[idx])
         rel_tok[idx], _, _ = _relative_and_z(tokens[idx])
-        rel_ktok[idx], z_ktok[idx], _ = _relative_and_z(per_ktok[idx])
+        rel_ktok[idx], _, _ = _relative_and_z(per_ktok[idx])
         rel_recv[idx], z_recv[idx], peer_recv[idx] = _relative_and_z(_column(x, "pp_recv")[idx])
         rel_wait[idx], _, _ = _relative_and_z(wait_ms[idx])
         for name in GPU_SEGMENTS:
@@ -252,7 +262,6 @@ def analyze_window(
         & (z_late >= config.z_threshold)
     )
 
-    # Persistence: a rank must be a candidate for ``persist_windows`` windows in a row.
     self_candidates = (rel_self >= config.rel_threshold) & (z_self >= config.z_threshold)
     candidates = self_candidates | late_candidates
     for index, rank_meta in enumerate(meta):
@@ -268,10 +277,9 @@ def analyze_window(
     cpu_fwd = _column(x, "cpu_fwd")
     gc_ms = _column(x, "gc")
     pp_recv = _column(x, "pp_recv")
-    waiting_count = 0
 
     for index, rank_meta in enumerate(meta):
-        reason = "none"
+        reason, message = "none", ""
         if state.consecutive.get(rank_meta.rank, 0) >= config.persist_windows:
             who = f"rank {rank_meta.rank} ({rank_meta.tag}, host={rank_meta.host}, gpu={rank_meta.device})"
             if self_candidates[index]:
@@ -297,28 +305,21 @@ def analyze_window(
                     f"is {1 + rel_self[index]:.2f}x peers, gc {gc_ms[index]:.1f} ms, cpu/gpu fwd "
                     f"{cpu_fwd[index] / fwd[index] if fwd[index] > _EPS else 0.0:.2f}x -> {reason} (host-side stall)"
                 )
-            new_active[rank_meta.rank] = reason
-            alerts.append(Alert(rank_meta.rank, reason, message, new=state.active.get(rank_meta.rank) != reason))
         elif (
             not candidates[index]
             and pp_recv[index] > _EPS
             and rel_recv[index] >= config.rel_threshold
             and z_recv[index] >= config.z_threshold
-            # Absolute guard: the extra waiting must matter relative to the stage's compute.
             and pp_recv[index] - peer_recv[index] >= config.wait_abs_frac * stage_self_of[index]
         ):
             reason = "upstream_wait"
-            waiting_count += 1
-            alerts.append(
-                Alert(
-                    rank_meta.rank,
-                    reason,
-                    f"rank {rank_meta.rank} ({rank_meta.tag}) waits on PP peers {pp_recv[index]:.1f} ms/step = "
-                    f"{1 + rel_recv[index]:.2f}x its stage; its own compute is normal",
-                    new=state.active.get(rank_meta.rank) != reason,
-                )
+            message = (
+                f"rank {rank_meta.rank} ({rank_meta.tag}) waits on PP peers {pp_recv[index]:.1f} ms/step = "
+                f"{1 + rel_recv[index]:.2f}x its stage; its own compute is normal"
             )
+        if reason != "none":
             new_active[rank_meta.rank] = reason
+            alerts.append(Alert(rank_meta.rank, reason, message, new=state.active.get(rank_meta.rank) != reason))
         rows.append(
             {
                 "rank": rank_meta.rank,
@@ -355,7 +356,6 @@ def analyze_window(
         _emit(name, _column(x, name), segment_rel[name])
     _emit("self", self_ms, rel_self)
     _emit("wait", wait_ms, rel_wait)
-    # Late arrival: who the DP group waits for and how long the group idles for it.
     latest = int(np.argmax(late_ms))
     metrics["straggler/late/max_ms"] = float(late_ms[latest])
     metrics["straggler/late/max_rank"] = float(meta[latest].rank) if late_ms[latest] > _EPS else -1.0
@@ -372,7 +372,7 @@ def analyze_window(
     metrics["straggler/flagged/count"] = float(len(flagged))
     metrics["straggler/flagged/rank"] = float(flagged[0][0]) if flagged else -1.0
     metrics["straggler/flagged/reason"] = float(REASON_CODE[flagged[0][1]]) if flagged else 0.0
-    metrics["straggler/waiting/count"] = float(waiting_count)
+    metrics["straggler/waiting/count"] = float(sum(reason == "upstream_wait" for reason in new_active.values()))
     stage_values = [value for value in stage_median_self.values() if value > _EPS]
     metrics["straggler/pp_stage_imbalance"] = (
         float(max(stage_values) / min(stage_values)) if len(stage_values) > 1 else 1.0

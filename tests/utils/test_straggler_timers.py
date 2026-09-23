@@ -8,7 +8,7 @@ from relax.utils.straggler.timers import EventPool, StragglerTimers, _NullTimer,
 from tests.utils.straggler_helpers import FakeEvent
 
 
-class RecordingSink:
+class _FakeSink:
     def __init__(self, capturing=False):
         self.pool = EventPool(4, FakeEvent)
         self.pushed = []
@@ -30,7 +30,7 @@ class RecordingSink:
         self.pushed.append((segment_index, start_event, end_event, cpu_ms))
 
 
-def test_event_pool_reuses_and_grows():
+def test_event_pool_reuses_released_events_and_grows_when_empty():
     pool = EventPool(2, FakeEvent)
     first, second = pool.acquire(), pool.acquire()
     assert len(pool) == 0 and pool.created == 2
@@ -42,7 +42,7 @@ def test_event_pool_reuses_and_grows():
 
 
 def test_straggler_timers_maps_known_names_and_ignores_unknown():
-    sink = RecordingSink()
+    sink = _FakeSink()
     timers = StragglerTimers(sink, MEGATRON_TIMER_SEGMENTS)
     assert isinstance(timers("forward-compute", log_level=2), _SegmentTimer)
     assert isinstance(timers("forward-backward", log_level=1), _NullTimer)
@@ -50,7 +50,7 @@ def test_straggler_timers_maps_known_names_and_ignores_unknown():
 
 
 def test_segment_timer_start_stop_pushes_pair_with_segment_index():
-    sink = RecordingSink()
+    sink = _FakeSink()
     timers = StragglerTimers(sink, MEGATRON_TIMER_SEGMENTS)
     timers("backward-compute").start(barrier=True)
     timers("backward-compute").stop(barrier=True)
@@ -62,7 +62,7 @@ def test_segment_timer_start_stop_pushes_pair_with_segment_index():
 
 
 def test_segment_timer_tolerates_double_start_and_stop_without_start():
-    sink = RecordingSink()
+    sink = _FakeSink()
     timers = StragglerTimers(sink, MEGATRON_TIMER_SEGMENTS)
     timer = timers("optimizer-inner-step")
     timer.stop()
@@ -78,7 +78,7 @@ def test_segment_timer_tolerates_double_start_and_stop_without_start():
 def test_segment_timer_skips_bracket_when_sink_cannot_record():
     # Sink returns None (stream under CUDA-graph capture): nothing is pushed and
     # no event leaks, whether capture starts before ``start`` or between the two.
-    sink = RecordingSink(capturing=True)
+    sink = _FakeSink(capturing=True)
     timer = StragglerTimers(sink, MEGATRON_TIMER_SEGMENTS)("forward-compute")
     timer.start()
     assert not timer.active
@@ -111,7 +111,7 @@ def test_forward_only_names_land_in_lp_buckets():
 
 
 def test_timers_log_and_write_are_explicitly_unsupported():
-    timers = StragglerTimers(RecordingSink(), MEGATRON_TIMER_SEGMENTS)
+    timers = StragglerTimers(_FakeSink(), MEGATRON_TIMER_SEGMENTS)
     with pytest.raises(NotImplementedError):
         timers.log(["forward-compute"])
     with pytest.raises(NotImplementedError):

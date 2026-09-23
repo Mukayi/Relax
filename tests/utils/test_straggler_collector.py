@@ -12,7 +12,7 @@ from relax.utils.straggler.stats import FIELD_INDEX
 from tests.utils.straggler_helpers import FakeEvent
 
 
-class Capture:
+class _FakeCapture:
     """Toggle standing in for ``torch.cuda.is_current_stream_capturing``."""
 
     def __init__(self):
@@ -22,27 +22,32 @@ class Capture:
         return self.active
 
 
-def _collector(world, rank=0, interval=2, is_primary=True, register_gc=False, gather=None, **kwargs):
-    calls = []
+def _collector(world, interval=2, is_primary=True, register_gc=False, gather=None, is_capturing=None, **kwargs):
+    gather_calls, meta_calls = [], []
 
     def counting_gather(values):
-        calls.append(list(values))
+        gather_calls.append(list(values))
         return gather(values) if gather is not None else [values] * world
 
+    def counting_gather_objects(obj):
+        meta_calls.append(obj)
+        return [RankMeta(rank=r, dp=r, tp=0, pp=0) for r in range(world)]
+
     collector = StragglerCollector(
-        rank_meta=RankMeta(rank=rank, dp=rank, tp=0, pp=0),
+        rank_meta=RankMeta(rank=0, dp=0, tp=0, pp=0),
         is_primary=is_primary,
         report_interval=interval,
         detector_config=DetectorConfig(persist_windows=1),
         event_factory=FakeEvent,
         pool_size=4,
         gather=counting_gather,
-        gather_objects=lambda obj: [RankMeta(rank=r, dp=r, tp=0, pp=0) for r in range(world)],
+        gather_objects=counting_gather_objects,
         register_gc_callback=register_gc,
-        is_capturing=kwargs.pop("is_capturing", Capture()),
+        is_capturing=is_capturing or _FakeCapture(),
         **kwargs,
     )
-    collector.gather_calls = calls
+    collector.gather_calls = gather_calls
+    collector.meta_calls = meta_calls
     return collector
 
 
@@ -125,7 +130,7 @@ def test_pending_queue_is_bounded_and_counts_drops():
 
 
 def test_no_events_are_recorded_while_the_stream_is_being_captured():
-    capture = Capture()
+    capture = _FakeCapture()
     collector = _collector(world=1, is_capturing=capture)
     capture.active = True
     _one_bracket(collector)
@@ -144,10 +149,10 @@ def test_no_events_are_recorded_while_the_stream_is_being_captured():
 def test_end_step_reports_every_interval_and_resets_window():
     collector = _collector(world=2, interval=3)
     reports = []
-    for step in range(6):
+    for _ in range(6):
         _one_bracket(collector)
         collector.add_tokens(1000)
-        reports.append(collector.end_step(step))
+        reports.append(collector.end_step())
     assert [report is not None for report in reports] == [False, False, True, False, False, True]
     report = reports[2]
     assert report.metrics["straggler/fwd/median_ms"] == pytest.approx(1.0)  # per step
@@ -156,14 +161,14 @@ def test_end_step_reports_every_interval_and_resets_window():
     assert "straggler/gather_ms" in report.metrics
     assert report.window_start_wall > 0.0
     assert collector.window.get("fwd") == 0.0 and collector.window.get("num_steps") == 0.0
-    assert collector.all_meta is not None and len(collector.all_meta) == 2
     assert len(collector.gather_calls) == 2
+    assert len(collector.meta_calls) == 1, "rank metadata is static and must be gathered only once"
 
 
 def test_non_primary_rank_participates_but_returns_no_report():
     collector = _collector(world=2, interval=1, is_primary=False)
     _one_bracket(collector)
-    assert collector.end_step(0) is None
+    assert collector.end_step() is None
     assert len(collector.gather_calls) == 1
     assert collector.gather_calls[0][FIELD_INDEX["fwd"]] == 1.0
     assert collector.window.get("fwd") == 0.0
@@ -181,7 +186,7 @@ def test_gather_table_from_other_ranks_drives_detection():
     _one_bracket(collector)
     _one_bracket(collector, "backward-compute")
     collector.add_tokens(500)
-    report = collector.end_step(0)
+    report = collector.end_step()
     assert report.metrics["straggler/flagged/rank"] == 1
     assert report.alerts and report.alerts[0].reason == "slow_device"
 
@@ -195,8 +200,8 @@ def test_gc_is_attributed_only_while_a_step_is_open():
         _one_bracket(collector)
         gc.collect()
         assert collector.window.get("gc") > 0.0
-        collector.end_step(0)
-        collector.end_step(1)  # closes the window
+        collector.end_step()
+        collector.end_step()  # closes the window
         gc.collect()  # between steps (train_wait)
         assert collector.window.get("gc") == 0.0
     finally:
@@ -221,9 +226,9 @@ def test_report_interval_must_be_positive():
 
 def test_install_is_a_no_op_when_disabled_or_for_non_training_roles(monkeypatch):
     monkeypatch.setenv("RELAX_STRAGGLER_PROFILER", "0")
-    assert install_straggler_collector(None, "actor") is None
+    assert install_straggler_collector("actor") is None
     monkeypatch.setenv("RELAX_STRAGGLER_PROFILER", "1")
     # These roles never call end_step, so they must not get a collector
     # (checked before any Megatron parallel state is touched).
     for role in ("critic", "reference", "actor_fwd"):
-        assert install_straggler_collector(None, role) is None
+        assert install_straggler_collector(role) is None

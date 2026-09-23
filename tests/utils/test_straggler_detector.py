@@ -21,6 +21,15 @@ def _healthy_row(steps=10, fwd=100.0, bwd=200.0, optim=20.0, tokens=8000.0, dp_g
     return _row(steps=steps, fwd=fwd, bwd=bwd, optim=optim, tokens=tokens, dp_grad_sync=dp_grad_sync, **extra)
 
 
+def _analyze_once(table, meta, **config):
+    """Analyze one window with a fresh state, flagging on the first window."""
+    return analyze_window(table, meta, DetectorConfig(**{"persist_windows": 1, **config}), DetectorState())
+
+
+def _reasons(report):
+    return [(alert.rank, alert.reason) for alert in report.alerts]
+
+
 @pytest.mark.parametrize("n", [2, 3, 4, 5, 8, 9])
 def test_leave_one_out_median_matches_brute_force(n):
     rng = np.random.default_rng(n)
@@ -43,7 +52,7 @@ def test_relative_and_z_matches_brute_force_definition():
     assert rel.tolist() == [0.0] and z.tolist() == [0.0] and med.tolist() == [5.0]
 
 
-def test_healthy_window_has_no_flags_and_per_step_normalization():
+def test_healthy_window_raises_no_flag_and_reports_per_step_values():
     table = [_healthy_row() for _ in range(8)]
     report = analyze_window(table, _meta(8), DetectorConfig(), DetectorState())
     assert report.metrics["straggler/flagged/count"] == 0
@@ -90,11 +99,10 @@ def test_flag_clears_when_rank_recovers():
 
 
 def test_token_heavy_rank_is_data_imbalance_not_slow_device():
-    config = DetectorConfig(persist_windows=1)
     table = [_healthy_row() for _ in range(8)]
     # 40% more tokens and proportionally more compute: ms/ktok unchanged.
     table[1] = _healthy_row(fwd=140.0, bwd=280.0, optim=20.0, tokens=11200.0)
-    report = analyze_window(table, _meta(8), config, DetectorState())
+    report = _analyze_once(table, _meta(8))
     assert report.metrics["straggler/flagged/rank"] == 1
     assert report.metrics["straggler/flagged/reason"] == REASON_CODE["data_imbalance"]
     assert report.metrics["straggler/tokens/spread"] == pytest.approx(0.4, abs=1e-6)
@@ -102,32 +110,29 @@ def test_token_heavy_rank_is_data_imbalance_not_slow_device():
 
 
 def test_gc_heavy_rank_is_cpu_bound():
-    config = DetectorConfig(persist_windows=1)
     table = [_healthy_row() for _ in range(4)]
     table[3] = _healthy_row(fwd=130.0, bwd=260.0, gc=40.0)
-    report = analyze_window(table, _meta(4), config, DetectorState())
+    report = _analyze_once(table, _meta(4))
     assert report.metrics["straggler/flagged/reason"] == REASON_CODE["cpu_bound"]
     assert report.metrics["straggler/gc/max_ms"] == pytest.approx(40.0)
 
 
 def test_pp_groups_are_compared_separately_and_stage_imbalance_reported():
-    config = DetectorConfig(persist_windows=1)
     # PP=2, 4 ranks per stage; stage 1 is uniformly 50% heavier (uneven split),
     # which must not flag anyone.
     table = [_healthy_row() for _ in range(4)] + [_healthy_row(fwd=150.0, bwd=300.0, optim=30.0) for _ in range(4)]
-    report = analyze_window(table, _meta(8, pp_size=2), config, DetectorState())
+    report = _analyze_once(table, _meta(8, pp_size=2))
     assert report.metrics["straggler/flagged/count"] == 0
     assert report.metrics["straggler/pp_stage_imbalance"] == pytest.approx(1.5)
 
 
 def test_downstream_stage_waiting_on_slow_upstream_is_not_flagged_as_slow():
-    config = DetectorConfig(persist_windows=1)
     table = [_healthy_row() for _ in range(4)] + [_healthy_row(fwd=150.0, bwd=300.0, optim=30.0) for _ in range(4)]
     table[6] = _healthy_row(fwd=150.0, bwd=300.0, optim=30.0, pp_recv=80.0)  # waits much more than its stage peers
-    report = analyze_window(table, _meta(8, pp_size=2), config, DetectorState())
+    report = _analyze_once(table, _meta(8, pp_size=2))
     assert report.metrics["straggler/flagged/count"] == 0
     assert report.metrics["straggler/waiting/count"] == 1
-    assert [(alert.rank, alert.reason) for alert in report.alerts] == [(6, "upstream_wait")]
+    assert _reasons(report) == [(6, "upstream_wait")]
     # wait/* points at the rank with the largest excess waiting over its stage peers.
     assert report.metrics["straggler/wait/max_rank"] == 6
     assert report.metrics["straggler/wait/max_ms"] == pytest.approx(85.0)
@@ -135,18 +140,16 @@ def test_downstream_stage_waiting_on_slow_upstream_is_not_flagged_as_slow():
 
 
 def test_two_rank_group_uses_leave_one_out_reference():
-    config = DetectorConfig(persist_windows=1, rel_threshold=0.10)
     table = [_healthy_row(), _healthy_row(fwd=115.0, bwd=230.0)]  # self 365 vs 320 = 14% slower than its only peer
-    report = analyze_window(table, _meta(2), config, DetectorState())
+    report = _analyze_once(table, _meta(2), rel_threshold=0.10)
     assert report.metrics["straggler/flagged/rank"] == 1
     assert report.metrics["straggler/self/spread"] == pytest.approx(365.0 / 320.0 - 1.0, abs=1e-6)
 
 
 def test_wait_below_absolute_guard_is_not_reported():
-    config = DetectorConfig(persist_windows=1, wait_abs_frac=0.05)
     table = [_healthy_row() for _ in range(4)]
     table[2] = _healthy_row(pp_recv=2.0)  # peers 0 -> relative excess is huge, but 2 ms of 320 ms is noise
-    report = analyze_window(table, _meta(4), config, DetectorState())
+    report = _analyze_once(table, _meta(4), wait_abs_frac=0.05)
     assert report.metrics["straggler/waiting/count"] == 0
     assert report.alerts == []
     assert report.metrics["straggler/pp_recv/max_rank"] == 2
@@ -180,22 +183,20 @@ def test_late_arriver_is_the_rank_with_the_shortest_grad_sync():
 def test_late_arrival_is_measured_within_grad_sync_groups_only():
     # Two PP stages; stage 1 has a longer grad-sync for everyone (bigger layers), which
     # must not make stage-0 ranks look "late". Only rank 5 is late within its own group.
-    config = DetectorConfig(persist_windows=1)
     table = [_healthy_row(dp_grad_sync=30.0) for _ in range(4)] + [_healthy_row(dp_grad_sync=400.0) for _ in range(4)]
     table[5] = _healthy_row(dp_grad_sync=40.0)
-    report = analyze_window(table, _meta(8, pp_size=2), config, DetectorState())
-    assert [(alert.rank, alert.reason) for alert in report.alerts] == [(5, "late_arrival")]
+    report = _analyze_once(table, _meta(8, pp_size=2))
+    assert _reasons(report) == [(5, "late_arrival")]
     assert report.metrics["straggler/late/max_rank"] == 5
     assert report.metrics["straggler/late/max_ms"] == pytest.approx(360.0)
 
 
 def test_late_arrival_groups_split_by_tp_but_not_by_cp():
     # TP=2, DP=4: each TP rank reduce-scatters with the 3 other ranks of the same TP index.
-    config = DetectorConfig(persist_windows=1)
     table = [_healthy_row(dp_grad_sync=300.0) for _ in range(8)]
     table[2] = _healthy_row(dp_grad_sync=20.0)  # tp=0 group: ranks 0,2,4,6
-    report = analyze_window(table, _meta(8, tp_size=2), config, DetectorState())
-    assert [(alert.rank, alert.reason) for alert in report.alerts] == [(2, "late_arrival")]
+    report = _analyze_once(table, _meta(8, tp_size=2))
+    assert _reasons(report) == [(2, "late_arrival")]
     assert report.rows[3]["late_ms"] == 0.0  # tp=1 ranks are not in that collective
 
     # CP ranks are inside the DP x CP grad-sync collective, so a late rank in one
@@ -203,17 +204,15 @@ def test_late_arrival_groups_split_by_tp_but_not_by_cp():
     cp_meta = [RankMeta(rank=r, dp=r // 2, tp=0, pp=0, cp=r % 2) for r in range(8)]
     table = [_healthy_row(dp_grad_sync=300.0) for _ in range(8)]
     table[3] = _healthy_row(dp_grad_sync=20.0)
-    report = analyze_window(table, cp_meta, config, DetectorState())
-    assert [(alert.rank, alert.reason) for alert in report.alerts] == [(3, "late_arrival")]
+    assert _reasons(_analyze_once(table, cp_meta)) == [(3, "late_arrival")]
 
 
 def test_small_or_uniform_grad_sync_is_not_late_arrival():
-    config = DetectorConfig(persist_windows=1, wait_abs_frac=0.05)
     uniform = [_healthy_row(dp_grad_sync=500.0) for _ in range(8)]  # slow link, nobody late
-    assert analyze_window(uniform, _meta(8), config, DetectorState()).alerts == []
+    assert _analyze_once(uniform, _meta(8), wait_abs_frac=0.05).alerts == []
     tiny = [_healthy_row(dp_grad_sync=12.0) for _ in range(8)]
     tiny[3] = _healthy_row(dp_grad_sync=4.0)  # 8 ms of a 320 ms step is noise
-    report = analyze_window(tiny, _meta(8), config, DetectorState())
+    report = _analyze_once(tiny, _meta(8), wait_abs_frac=0.05)
     assert report.alerts == []
     assert report.metrics["straggler/late/max_rank"] == 3  # still reported, just not flagged
     assert report.metrics["straggler/flagged/count"] == 0
@@ -221,11 +220,9 @@ def test_small_or_uniform_grad_sync_is_not_late_arrival():
 
 def test_slow_compute_takes_precedence_over_late_arrival_classification():
     # A rank whose kernels are slow naturally also arrives late; report the root cause.
-    config = DetectorConfig(persist_windows=1)
     table = [_healthy_row(dp_grad_sync=200.0) for _ in range(4)]
     table[1] = _healthy_row(fwd=150.0, bwd=300.0, dp_grad_sync=20.0)
-    report = analyze_window(table, _meta(4), config, DetectorState())
-    assert [(alert.rank, alert.reason) for alert in report.alerts] == [(1, "slow_device")]
+    assert _reasons(_analyze_once(table, _meta(4))) == [(1, "slow_device")]
 
 
 def test_missing_tokens_disables_token_metrics():
@@ -236,7 +233,7 @@ def test_missing_tokens_disables_token_metrics():
     assert report.metrics["straggler/self/median_ms"] == pytest.approx(30.0)
 
 
-def test_overhead_and_dropped_are_aggregated():
+def test_overhead_is_averaged_per_step_and_dropped_events_are_totalled():
     table = [_row(steps=4, fwd=1.0, overhead=0.5, dropped=2.0) for _ in range(3)]
     report = analyze_window(table, _meta(3), DetectorConfig(), DetectorState())
     assert report.metrics["straggler/self_overhead_ms"] == pytest.approx(0.5)

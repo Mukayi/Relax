@@ -19,7 +19,7 @@ from relax.utils.straggler.stats import FIELD_INDEX
 
 
 class EventSink(Protocol):
-    """What a timer needs from its owner."""
+    """Describe the owner a ``_SegmentTimer`` reports to (the collector)."""
 
     def record_event(self) -> Any:
         """Return a timing event already recorded on the current stream, or
@@ -34,14 +34,18 @@ class EventSink(Protocol):
 
 
 def cuda_timing_event() -> Any:
-    """Default event factory: a CUDA event that supports ``elapsed_time``."""
+    """Create a CUDA event that supports ``elapsed_time`` (default factory)."""
     import torch
 
     return torch.cuda.Event(enable_timing=True)
 
 
 class EventPool:
-    """Reuse timing-event objects so the hot path never allocates."""
+    """Reuse timing-event objects so the hot path never allocates.
+
+    An empty pool grows by one event per ``acquire`` and never shrinks;
+    ``created`` counts every event ever built.
+    """
 
     __slots__ = ("_free", "_factory", "created")
 
@@ -116,8 +120,8 @@ class _SegmentTimer:
 
 
 class StragglerTimers:
-    """Drop-in object for ``ModelParallelConfig.timers`` /
-    ``OptimizerConfig.timers``.
+    """Stand in for Megatron's ``Timers`` on ``ModelParallelConfig`` /
+    ``OptimizerConfig``.
 
     Only the subset of the ``megatron.core.timers.Timers`` protocol that
     megatron.core itself uses is implemented (``__call__`` returning an object
@@ -132,6 +136,8 @@ class StragglerTimers:
         self._null = _NullTimer()
 
     def __call__(self, name: str, log_level: int | None = None) -> _SegmentTimer | _NullTimer:
+        """Return the timer bound to ``name``; untracked names share a no-op
+        timer and ``log_level`` is ignored."""
         timer = self._timers.get(name)
         if timer is None:
             segment = self._name_to_segment.get(name)
@@ -140,11 +146,17 @@ class StragglerTimers:
         return timer
 
     def log(self, *args: Any, **kwargs: Any) -> None:
-        raise NotImplementedError(
-            "StragglerTimers only records events; use the straggler metrics instead of Timers.log"
-        )
+        """Refuse: per-name totals are never aggregated here."""
+        raise NotImplementedError(_unsupported("log"))
 
     def write(self, *args: Any, **kwargs: Any) -> None:
-        raise NotImplementedError(
-            "StragglerTimers only records events; use the straggler metrics instead of Timers.write"
-        )
+        """Refuse: per-name totals are never aggregated here."""
+        raise NotImplementedError(_unsupported("write"))
+
+
+def _unsupported(method: str) -> str:
+    return (
+        f"StragglerTimers.{method} is not supported: it only records CUDA events for the straggler profiler and "
+        f"keeps no per-name totals, so a Timers.{method} caller would silently get nothing. Read the straggler/* "
+        "metrics instead, or set RELAX_STRAGGLER_PROFILER=0 to get config.timers=None back."
+    )

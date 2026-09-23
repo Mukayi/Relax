@@ -3,10 +3,32 @@
 
 from argparse import Namespace
 
+import pytest
+
 from relax.utils.straggler import reporter
 from relax.utils.straggler.detector import DetectorConfig, DetectorState, RankMeta, analyze_window
 from relax.utils.timer import Timer
 from tests.utils.straggler_helpers import row as _row
+
+
+@pytest.fixture(autouse=True)
+def logged(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        reporter.tracking_utils, "log", lambda args, metrics, step_key: calls.append((metrics, step_key))
+    )
+    return calls
+
+
+@pytest.fixture(autouse=True)
+def records():
+    Timer().records.clear()
+    yield Timer().records
+    Timer().records.clear()
+
+
+def _args(timeline_dump_dir=None):
+    return Namespace(wandb_always_use_train_step=False, timeline_dump_dir=timeline_dump_dir)
 
 
 def _report(flag_rank=None):
@@ -19,13 +41,8 @@ def _report(flag_rank=None):
     return report
 
 
-def test_report_logs_metrics_with_rollout_step_key(monkeypatch):
-    logged = []
-    monkeypatch.setattr(
-        reporter.tracking_utils, "log", lambda args, metrics, step_key: logged.append((metrics, step_key))
-    )
-    args = Namespace(wandb_always_use_train_step=False, timeline_dump_dir=None)
-    reporter.report_straggler_window(args, rollout_id=7, report=_report())
+def test_report_logs_metrics_with_rollout_step_key(logged):
+    reporter.report_straggler_window(_args(), rollout_id=7, report=_report())
     assert len(logged) == 1
     metrics, step_key = logged[0]
     assert step_key == "rollout/step" and metrics["rollout/step"] == 7
@@ -33,14 +50,9 @@ def test_report_logs_metrics_with_rollout_step_key(monkeypatch):
     assert metrics["straggler/fwd/median_ms"] == 100.0
 
 
-def test_timeline_events_one_row_per_rank_when_enabled(monkeypatch):
-    monkeypatch.setattr(reporter.tracking_utils, "log", lambda *a, **k: True)
-    timer = Timer()
-    timer.records.clear()
-    args = Namespace(wandb_always_use_train_step=False, timeline_dump_dir="/tmp/tl")
-    reporter.report_straggler_window(args, rollout_id=3, report=_report())
-    events = list(timer.records)
-    timer.records.clear()
+def test_timeline_events_one_row_per_rank_when_enabled(records):
+    reporter.report_straggler_window(_args(timeline_dump_dir="/tmp/tl"), rollout_id=3, report=_report())
+    events = list(records)
     # 4 ranks x 2 non-zero segments (fwd, bwd)
     assert len(events) == 8
     pids = {event.pid for event in events}
@@ -52,21 +64,15 @@ def test_timeline_events_one_row_per_rank_when_enabled(monkeypatch):
     assert reporter.TIMELINE_PID_BASE > 2**22  # Linux upper bound for kernel.pid_max
 
 
-def test_no_timeline_events_when_disabled(monkeypatch):
-    monkeypatch.setattr(reporter.tracking_utils, "log", lambda *a, **k: True)
-    timer = Timer()
-    timer.records.clear()
-    args = Namespace(wandb_always_use_train_step=False, timeline_dump_dir=None)
-    reporter.report_straggler_window(args, rollout_id=3, report=_report())
-    assert timer.records == []
+def test_no_timeline_events_when_disabled(records):
+    reporter.report_straggler_window(_args(), rollout_id=3, report=_report())
+    assert records == []
 
 
 def test_alert_is_logged_as_warning_with_table(monkeypatch):
-    monkeypatch.setattr(reporter.tracking_utils, "log", lambda *a, **k: True)
     warnings, infos = [], []
     monkeypatch.setattr(reporter.logger, "warning", lambda msg, *a: warnings.append(msg % a))
     monkeypatch.setattr(reporter.logger, "info", lambda msg, *a: infos.append(msg % a))
-    args = Namespace(wandb_always_use_train_step=False, timeline_dump_dir=None)
-    reporter.report_straggler_window(args, rollout_id=5, report=_report(flag_rank=2))
+    reporter.report_straggler_window(_args(), rollout_id=5, report=_report(flag_rank=2))
     assert len(warnings) == 1 and "rank 2" in warnings[0] and "slow_device" in warnings[0]
     assert len(infos) == 1 and "per-rank window" in infos[0] and "slow_device" in infos[0]

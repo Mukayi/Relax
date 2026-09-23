@@ -14,8 +14,8 @@ from typing import Mapping
 # Compute-stream time (ms, summed over the window) per coarse segment. The
 # first block is fed by Megatron's own ``config.timers`` call sites (see
 # MEGATRON_TIMER_SEGMENTS); the ``lp_*`` block is the same call sites during
-# ``forward_only`` (log-prob / critic value passes). Adding a segment (e.g. for
-# MoE dispatch hooks) is one entry here plus one mapping below.
+# ``forward_only`` (log-prob passes). Adding a segment (e.g. for MoE dispatch
+# hooks) is one entry here plus one mapping below.
 GPU_SEGMENTS: tuple[str, ...] = (
     "fwd",
     "bwd",
@@ -87,7 +87,7 @@ FORWARD_ONLY_TIMER_SEGMENTS: Mapping[str, str] = {
 
 
 class WindowStats:
-    """Mutable accumulator with the ``FIELDS`` layout.
+    """Accumulate one rank's window in the ``FIELDS`` layout.
 
     ``add`` resolves the field name; hot paths that run per event use
     ``add_index`` with an index looked up once at import time.

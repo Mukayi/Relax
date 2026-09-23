@@ -21,22 +21,22 @@ env_vars:
 | `RELAX_STRAGGLER_REPORT_INTERVAL` | int | 10 | 每多少个训练 step 做一次跨 rank 汇聚与判定（一个"窗口"）。 |
 | `RELAX_STRAGGLER_Z_THRESHOLD` | float | 3.0 | 候选 rank 的 robust z 分数（基于组内中位数 / MAD）门限。 |
 | `RELAX_STRAGGLER_REL_THRESHOLD` | float | 0.10 | 候选 rank 相对组内中位数的最小超出比例。 |
-| `RELAX_STRAGGLER_PERSIST_WINDOWS` | int | 3 | 连续多少个窗口满足条件才告警，用来过滤 checkpoint、GC 峰等一次性抖动。 |
+| `RELAX_STRAGGLER_PERSIST_WINDOWS` | int | 3 | 连续多少个窗口满足条件才告警（`upstream_wait` 除外），用来过滤 checkpoint、GC 峰等一次性抖动。 |
 
-开启后每个 actor 角色的进程启动时打一行 `Straggler profiler enabled: report_interval=… primary=… meta=RankMeta(rank=…, dp=…, tp=…, pp=…, host=…, device=…)`；critic / reference / `actor_fwd` 不跑训练步，不会被采样。
+开启后每个 actor 角色的进程启动时打一行 `Straggler profiler enabled: report_interval=… primary=… meta=RankMeta(rank=…, dp=…, tp=…, pp=…, cp=…, ep=…, host=…, device=…)`；critic / reference / `actor_fwd` 不跑训练步，不会被采样。
 
 ## 看什么
 
 ### 日志（primary rank）
 
-每个窗口一行 INFO：
+没有告警的窗口打一行 INFO：
 
 ```text
 [straggler] step=29 no straggler; self median 734.6 ms max 745.6 ms (rank 0, +2%),
 latest to grad-sync rank 0 by 13.4 ms (peers idle 45.9 ms), pp_stage_imbalance 1.00, overhead 0.10 ms/step
 ```
 
-判定成立时（连续 `PERSIST_WINDOWS` 个窗口）改为一条 WARNING 加一张 per-rank 表：
+有告警时，某 rank 的 reason 变化的那个窗口打一条 WARNING，之后每个仍有告警的窗口打一张 INFO per-rank 表。self / late 类要连续 `PERSIST_WINDOWS` 个窗口才成立，`upstream_wait` 单窗口即成立：
 
 ```text
 [straggler] step=14 rank 0 (rank0_dp0_tp0_pp0, host=…, gpu=0) reaches the DP grad-sync 433.0 ms/step
@@ -54,18 +54,18 @@ its own GPU compute is 0.99x peers, gc 1.8 ms, cpu/gpu fwd 1.26x -> late_arrival
 |------|------|
 | `straggler/{fwd,bwd,optim,pp_recv,pp_send,dp_grad_sync,dp_param_gather,lp_fwd,lp_pp_recv,lp_pp_send}/{median_ms,max_ms,max_rank,spread}` | 每段 GPU 时间（ms/step）的全局中位数、最大值；`max_rank` / `spread` 是相对**同 PP stage 其他 rank** 超出最多的那个 rank 及其超出比例（`value/peer_median − 1`）。`lp_*` 是 log-prob / forward-only 阶段的同一组段。`dp_param_gather` 只在关闭 `--overlap-param-gather` 时有值（Megatron 不给 overlap 路径计时）。 |
 | `straggler/self/*`、`straggler/self_per_ktok/*` | 自身计算时间（`fwd + bwd + optim`）及其按 token 归一化后的版本。 |
-| `straggler/wait/median_ms`、`straggler/wait/max_ms` | 等待别人的时间（`pp_recv + dp_grad_sync + dp_param_gather`）。 |
+| `straggler/wait/{median_ms,max_ms,max_rank,spread}` | 等待别人的时间（`pp_recv + dp_grad_sync + dp_param_gather`）。 |
 | `straggler/late/max_ms`、`straggler/late/max_rank`、`straggler/late/peer_idle_ms` | 最晚到达 DP 梯度同步的 rank、晚了多少、同组其他 rank 因此每步空转多久。 |
-| `straggler/tokens/{median,max,spread}` | 各 rank 每步 token 数的不均程度。 |
+| `straggler/tokens/{median,max,spread}` | 各 rank 每步 token 数的不均程度：`median` / `max` 为全局值，`spread` 为同 stage 内最大超出；任一 rank token 数为 0 时不输出。 |
 | `straggler/pp_stage_imbalance` | 各 PP stage 计算时间中位数的 `max/min`，与是否有慢卡无关。 |
 | `straggler/gc/{median_ms,max_ms}` | Python GC 停顿。 |
 | `straggler/flagged/count`、`straggler/flagged/rank`（无则 −1）、`straggler/flagged/reason` | 告警状态。reason 编码：0 none、1 slow_device、2 data_imbalance、3 upstream_wait、4 cpu_bound、5 late_arrival。 |
-| `straggler/waiting/count` | 因上游 PP stage 慢而在等的 rank 数（受害者，不是慢卡）。 |
-| `straggler/self_overhead_ms`、`straggler/gather_ms`、`straggler/dropped_events` | 工具自身开销：每步读事件的 CPU 时间、每窗口一次 Gloo gather 的耗时、因队列满被丢弃的事件对数（正常为 0）。 |
+| `straggler/waiting/count` | 本窗口因上游 PP stage 慢而在等的 rank 数（受害者，不是慢卡；单窗口判定，不计入 `flagged`）。 |
+| `straggler/self_overhead_ms`、`straggler/gather_ms`、`straggler/dropped_events` | 工具自身开销：每步 drain 读事件的 CPU 时间；primary 上每窗口 gather + 判定的总耗时（首个窗口另含一次元数据 gather）；因队列满被丢弃的事件对数（正常为 0）。 |
 
 ### Timeline
 
-已开 `--timeline-dump-dir` 时（timeline 经 metrics-service adapter 落盘，所以还需要 `--use-metrics-service`），每个窗口会给每个 rank 的每个段追加一条 `straggler/<seg> rank{g}_dp{d}_tp{t}_pp{p}` 事件（`pid` = 2³⁰ + 全局 rank，高于任何真实 pid；`tid` = 段序号），在 Perfetto 里一行一个 rank，肉眼就能看出谁的 `bwd` 条更长、谁的 `dp_grad_sync` 条最短。
+已开 `--timeline-dump-dir` 时（timeline 经 metrics-service adapter 落盘，所以还需要 `--use-metrics-service`），每个窗口会给每个 rank 的每个非零段追加一条 `straggler/<seg> rank{g}_dp{d}_tp{t}_pp{p}` 事件（`pid` = 2³⁰ + 全局 rank，高于任何真实 pid；`tid` = 段序号），在 Perfetto 里一行一个 rank，肉眼就能看出谁的 `bwd` 条更长、谁的 `dp_grad_sync` 条最短。
 
 ## reason 怎么读
 
@@ -74,7 +74,7 @@ its own GPU compute is 0.99x peers, gc 1.8 ms, cpu/gpu fwd 1.26x -> late_arrival
 | `slow_device` | 自身 GPU 时间显著高于同 PP stage 的其他 rank，token 数正常 | `nvidia-smi -q -d CLOCK,PERFORMANCE,TEMPERATURE`、ECC、同机邻居、NVLink 拓扑 |
 | `data_imbalance` | 自身时间高，但按 token 归一化后正常，token 数明显偏多 | `--balance-data`、动态 batch 切分、超长样本 |
 | `cpu_bound` | 自身时间偏高，**且**训练步内的 Python GC 停顿占自身时间 ≥ 5% | `gc.freeze()`、数据处理线程与训练线程抢 GIL、Python 侧 per-token 循环 |
-| `upstream_wait` | 自身正常，但 `pp_recv` 显著高于同 stage 其他 rank | 看上游 stage 被 flag 的 rank，或 `pp_stage_imbalance`（层划分不均） |
+| `upstream_wait` | 自身正常，但 `pp_recv` 显著高于同 stage 其他 rank，且超出量 ≥ 该 stage 中位自身时间的 5%；单窗口判定 | 看上游 stage 被 flag 的 rank，或 `pp_stage_imbalance`（层划分不均） |
 | `late_arrival` | 自身 GPU 时间正常，但它的 `dp_grad_sync` 区间显著**短于**同 DP 组其他 rank——一次集合通信对所有人同时结束，最后到的那个 rank 区间最短，其他人的区间里都含着等它的时间 | GPU 之间的 host 侧空隙：数据取用、同步 I/O / HTTP、GIL、launch gap；对该 rank `py-spy dump --pid <pid>` 最直接 |
 
 `late_arrival` 是最常见也最容易被漏掉的一类：只看 GPU 时间的规则抓不到它。它在原型的第一个真实作业里就出现了——rank 0 的 GPU 时间和大家一样，却每步晚 0.4–1.5 s 到梯度同步，原因是 primary rank 在训练线程上同步发送日志指标的 HTTP 请求。
@@ -83,7 +83,7 @@ its own GPU compute is 0.99x peers, gc 1.8 ms, cpu/gpu fwd 1.26x -> late_arrival
 
 - 每个 Megatron 计时点一对 `cudaEventRecord`（非阻塞，事件从池里复用）：每个 micro-batch 的 forward / backward 各一对，每步的梯度同步、参数 all-gather、optimizer 各阶段共约十对。
 - 每步末尾 `event.query()` 惰性读取已完成的事件并累加到窗口向量：`straggler/self_overhead_ms` 实测 0.10–0.15 ms/step。
-- 每 `REPORT_INTERVAL` 步一次 Gloo `all_gather`（每 rank 18 个 float64）：实测约 9 ms / 窗口，即 <1 ms/step 摊销。
+- 每 `REPORT_INTERVAL` 步一次 Gloo `all_gather`（每 rank 18 个 float64）加 primary 上的判定：`gather_ms` 实测约 9 ms / 窗口（其中判定约 6.6 ms），即 <1 ms/step 摊销。判定的 MAD 是 O(n²)（n = 同 stage rank 数），单机微基准 512 rank 时每窗口 160–215 ms；其余 rank 会在下一次集合通信处等 primary。
 - 端到端：8×A800、Qwen3-0.6B SFT（DP8，step ≈ 0.95 s，对 launch 开销最敏感的小模型场景）开关交替各 3 次 60 step、逐 step 配对比较（数据顺序确定，两侧每步 token 数完全相同），`perf/step_time` 三对分别差 −0.28% / +0.32% / +0.20%，合并 +0.11% ± 0.31%（95% 置信区间，n = 150 step），与 run-to-run 抖动同量级。
 
 ## 实现位置

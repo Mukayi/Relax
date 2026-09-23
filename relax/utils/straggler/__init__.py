@@ -8,16 +8,11 @@ entry points used by the Megatron backend are re-exported here; the detector
 and timer internals live in their own modules.
 """
 
-from relax.utils.straggler.collector import (
-    StragglerCollector,
-    install_straggler_collector,
-    straggler_timers,
-)
+from relax.utils.straggler.collector import install_straggler_collector, straggler_timers
 from relax.utils.straggler.reporter import report_straggler_window
 
 
 __all__ = [
-    "StragglerCollector",
     "install_straggler_collector",
     "report_straggler_window",
     "straggler_timers",

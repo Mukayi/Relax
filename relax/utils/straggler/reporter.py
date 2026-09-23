@@ -86,7 +86,10 @@ def report_straggler_window(args: Any, rollout_id: int, report: WindowReport) ->
     tracking_utils.log(args, metrics, step_key="rollout/step")
 
     if getattr(args, "timeline_dump_dir", None):
-        Timer().records.extend(_timeline_events(report))  # step is stamped by Timer.log_record_and_clear
+        # Appended after the log above, so these ride out (and get their step
+        # stamped) with the next ``tracking_utils.log`` on this rank; the actor
+        # calls ``log_perf_data`` for the same step right after this function.
+        Timer().records.extend(_timeline_events(report))
 
     for alert in report.alerts:
         if alert.new:
