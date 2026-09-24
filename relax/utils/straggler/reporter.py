@@ -1,7 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Push one analyzed straggler window to the existing reporting outlets.
 
-* scalars -> ``tracking_utils.log`` (MetricsService / TensorBoard / WandB / ClearML)
+* scalars -> returned to the actor, which logs them in the same ``tracking_utils.log`` call as
+  the step's ``perf/*`` metrics (MetricsService / TensorBoard / WandB / ClearML)
 * per-rank segment bars -> ``Timer().records`` so they ride along with the
   existing timeline trace (one Perfetto row per rank, ``pid = TIMELINE_PID_BASE + rank``)
 * alerts -> logger (WARNING on state change, INFO table while any alert is active)
@@ -11,7 +12,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from relax.utils import tracking_utils
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.straggler.detector import WindowReport
@@ -77,18 +77,21 @@ def _format_table(report: WindowReport) -> str:
     return "\n".join(lines)
 
 
-def report_straggler_window(args: Any, rollout_id: int, report: WindowReport) -> None:
-    """Emit metrics, timeline events and log lines for one window (primary rank
-    only)."""
+def report_straggler_window(args: Any, rollout_id: int, report: WindowReport) -> dict[str, float]:
+    """Emit timeline events and log lines for one window (primary rank only)
+    and return its scalars.
+
+    The scalars are not logged here: with ``--use-metrics-service`` every
+    ``tracking_utils.log`` is a synchronous HTTP request on the training
+    thread, so the actor hands them to ``log_perf_data`` for the same step
+    instead of paying for a second request.
+    """
     step = compute_rollout_step(args, rollout_id)
     metrics = dict(report.metrics)
-    metrics["rollout/step"] = step
-    tracking_utils.log(args, metrics, step_key="rollout/step")
 
     if getattr(args, "timeline_dump_dir", None):
-        # Appended after the log above, so these ride out (and get their step
-        # stamped) with the next ``tracking_utils.log`` on this rank; the actor
-        # calls ``log_perf_data`` for the same step right after this function.
+        # These ride out (and get their step stamped) with the ``log_perf_data``
+        # call the actor makes for the same step right after this function.
         Timer().records.extend(_timeline_events(report))
 
     for alert in report.alerts:
@@ -112,3 +115,4 @@ def report_straggler_window(args: Any, rollout_id: int, report: WindowReport) ->
             metrics.get("straggler/pp_stage_imbalance", 1.0),
             metrics.get("straggler/self_overhead_ms", 0.0),
         )
+    return metrics

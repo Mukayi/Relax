@@ -18,7 +18,7 @@ env_vars:
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `RELAX_STRAGGLER_PROFILER` | bool | false | Master switch. |
-| `RELAX_STRAGGLER_REPORT_INTERVAL` | int | 10 | Training steps per cross-rank gather + analysis (one "window"). |
+| `RELAX_STRAGGLER_REPORT_INTERVAL` | int | 10 | Rollouts per cross-rank gather + analysis (one "window"). A rollout may contain multiple optimizer steps; reported ms/step values are per rollout. |
 | `RELAX_STRAGGLER_Z_THRESHOLD` | float | 3.0 | Robust z-score (median / MAD within the peer group) a candidate must exceed. |
 | `RELAX_STRAGGLER_REL_THRESHOLD` | float | 0.10 | Minimum relative excess over the peer median. |
 | `RELAX_STRAGGLER_PERSIST_WINDOWS` | int | 3 | Consecutive windows a rank must qualify before it is flagged (applies to every reason); filters one-off spikes (checkpointing, GC). |
@@ -49,6 +49,8 @@ its own GPU compute is 0.99x peers, gc 1.8 ms, cpu/gpu fwd 1.26x -> late_arrival
 ```
 
 ### Metrics (same step key as `perf/*`; TensorBoard / WandB / ClearML)
+
+These scalars go out in the same `tracking_utils.log` call as the step's `perf/*` metrics, never in a request of their own: with `--use-metrics-service` every log call is a synchronous HTTP request on the training thread.
 
 | Metric | Meaning |
 |--------|---------|
@@ -83,7 +85,7 @@ With `--timeline-dump-dir` set (the timeline is flushed through the metrics-serv
 
 - One pair of non-blocking `cudaEventRecord` per Megatron timer call site (events are pooled): one pair per micro-batch for forward and for backward, plus roughly ten pairs per step for gradient sync, parameter all-gather and the optimizer phases.
 - At the end of each step completed events are read lazily with `event.query()` and accumulated into the window vector: `straggler/self_overhead_ms` measures 0.12–0.15 ms/step on 8×A100.
-- One Gloo `all_gather` (18 float64 per rank) plus the analysis on the primary rank every `REPORT_INTERVAL` steps, reported as `gather_ms` and `analyze_ms`: < 1 ms/step amortised. The analysis is O(n log n) in the stage size: a single-machine CPU micro-benchmark gives 2.4 ms per window at 8 ranks, 10 ms at 512 and 35 ms at 2048. The other ranks wait for the primary at the next collective.
+- One Gloo `all_gather` (18 float64 per rank) plus the analysis on the primary rank every `REPORT_INTERVAL` rollouts, reported as `gather_ms` and `analyze_ms`: < 1 ms/step amortised. The analysis is O(n log n) in the stage size: a single-machine CPU micro-benchmark gives 2.4 ms per window at 8 ranks, 10 ms at 512 and 35 ms at 2048. The other ranks wait for the primary at the next collective.
 - Each timer call (start / stop plus two `event.record()`) costs about 30 µs. On an idle GPU of the A100 test machine, replaying Megatron's call sequence with the worst case of 17 timers per step (3 micro-batches): in a kernel-launch-bound loop the timer calls plus the end-of-step readout add 0.80 ms/step of wall time (max 0.97 ms); in a compute-bound loop they add only 0.09 ms.
 - Adding everything up and assuming all of it sits on the critical path gives about 1.2 ms/step typical and 1.9 ms/step worst case, i.e. 0.10 % and 0.17 % of a 1.15 s step. This is a summed upper-bound estimate.
 - End to end: 8×A100, Qwen3-0.6B SFT (DP8, step ≈ 1.15 s — a small model, the case most sensitive to timing overhead). Comparing separate profiler-on and profiler-off runs is limited by ~1 % run-to-run variation, so the profiler is instead toggled every 10 steps within a run, with a second run in the opposite phase, so each 10-step block is measured once on and once off on identical data. One pair of 300-step runs, 27 blocks: overhead −0.05 % ± 0.37 % (95 % CI −0.42 % to +0.32 %), upper bound below 0.5 %.

@@ -5,6 +5,7 @@ from argparse import Namespace
 
 import pytest
 
+from relax.utils import tracking_utils
 from relax.utils.straggler import reporter
 from relax.utils.straggler.detector import DetectorConfig, DetectorState, RankMeta, analyze_window
 from relax.utils.timer import Timer
@@ -14,9 +15,7 @@ from tests.utils.straggler_helpers import row as _row
 @pytest.fixture(autouse=True)
 def logged(monkeypatch):
     calls = []
-    monkeypatch.setattr(
-        reporter.tracking_utils, "log", lambda args, metrics, step_key: calls.append((metrics, step_key))
-    )
+    monkeypatch.setattr(tracking_utils, "log", lambda args, metrics, step_key: calls.append((metrics, step_key)))
     return calls
 
 
@@ -41,13 +40,14 @@ def _report(flag_rank=None):
     return report
 
 
-def test_report_logs_metrics_with_rollout_step_key(logged):
-    reporter.report_straggler_window(_args(), rollout_id=7, report=_report())
-    assert len(logged) == 1
-    metrics, step_key = logged[0]
-    assert step_key == "rollout/step" and metrics["rollout/step"] == 7
+def test_report_returns_scalars_instead_of_logging_them(logged):
+    # With --use-metrics-service each tracking_utils.log is a synchronous HTTP request, so the
+    # scalars go back to the actor and ride along with log_perf_data for the same step.
+    metrics = reporter.report_straggler_window(_args(), rollout_id=7, report=_report())
+    assert logged == []
     assert metrics["straggler/flagged/count"] == 0
     assert metrics["straggler/fwd/median_ms"] == 100.0
+    assert "rollout/step" not in metrics
 
 
 def test_timeline_events_one_row_per_rank_when_enabled(records):
