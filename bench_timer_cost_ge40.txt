@@ -1,0 +1,15 @@
+{
+  "host": "aiplatform-wlf2-ge40-11.idchb2az2.hb2.kwaidc.com",
+  "gpu": "NVIDIA A100-SXM4-80GB",
+  "tracked_brackets_per_step": 17,
+  "cpu_timer_calls_ms_per_step_median": 0.5129662752151489,
+  "cpu_timer_calls_ms_per_step_max": 0.5297386944293976,
+  "cpu_us_per_bracket": 30.1744867773617,
+  "launch_bound_step_ms_off_median": 0.16592960432171822,
+  "launch_bound_delta_ms_per_step_median": 0.7964159399271011,
+  "launch_bound_delta_ms_per_step_max": 0.9743409007787703,
+  "compute_bound_step_ms_off_median": 10.194827541708946,
+  "compute_bound_delta_ms_per_step_median": 0.09280912578105929,
+  "compute_bound_delta_ms_per_step_max": 0.10892122983932433,
+  "pool_created": 4096
+}
