@@ -1,0 +1,101 @@
+From dff8c5455ffa00979b8000ac33f29454bd3cfc1d Mon Sep 17 00:00:00 2001
+From: Mukayi <1515982581@qq.com>
+Date: Wed, 23 Sep 2026 23:36:41 +0800
+Subject: [PATCH] EXPERIMENT ONLY: in-run on/off A/B toggle for straggler
+ overhead (do not merge)
+
+---
+ relax/backends/megatron/actor.py   | 12 ++++++++----
+ relax/backends/megatron/model.py   |  3 +++
+ relax/utils/straggler/collector.py | 24 +++++++++++++++++++++++-
+ 3 files changed, 34 insertions(+), 5 deletions(-)
+
+diff --git a/relax/backends/megatron/actor.py b/relax/backends/megatron/actor.py
+index 4889d20..494e6d4 100644
+--- a/relax/backends/megatron/actor.py
++++ b/relax/backends/megatron/actor.py
+@@ -2388,10 +2388,14 @@ class MegatronTrainRayActor(TrainRayActor):
+         rank."""
+         if self.straggler is None:
+             return
+-        self.straggler.add_tokens(int(sum(total_lengths)))
+-        report = self.straggler.end_step()
+-        if report is not None:
+-            report_straggler_window(self.args, rollout_id, report)
++        from ...utils.straggler.collector import straggler_ab_active, straggler_ab_set_step
++
++        if straggler_ab_active():
++            self.straggler.add_tokens(int(sum(total_lengths)))
++            report = self.straggler.end_step()
++            if report is not None:
++                report_straggler_window(self.args, rollout_id, report)
++        straggler_ab_set_step(rollout_id + 1)
+ 
+     @timer
+     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
+diff --git a/relax/backends/megatron/model.py b/relax/backends/megatron/model.py
+index ec1a21f..f079904 100644
+--- a/relax/backends/megatron/model.py
++++ b/relax/backends/megatron/model.py
+@@ -1450,6 +1450,9 @@ def train(
+     config = get_model_config(model[0])
+     config.grad_scale_func = optimizer.scale_loss
+     config.timers = straggler_timers("train")
++    # EXPERIMENT ONLY (exp/task11-interleave): the optimizer's config is set once at setup; follow the A/B toggle.
++    if getattr(optimizer, "config", None) is not None:
++        optimizer.config.timers = config.timers
+     # train() is invoked once per rollout in Relax (vs. once per run upstream),
+     # so guard the sync-func setup to be idempotent — re-assigning would trip
+     # Megatron's "no_sync_func must be None" assert on rollout 1+.
+diff --git a/relax/utils/straggler/collector.py b/relax/utils/straggler/collector.py
+index 4c41e1c..67a72c7 100644
+--- a/relax/utils/straggler/collector.py
++++ b/relax/utils/straggler/collector.py
+@@ -12,6 +12,7 @@ per rank over the Gloo group and runs the detector on the primary rank.
+ from __future__ import annotations
+ 
+ import gc
++import os
+ import socket
+ from collections import deque
+ from time import perf_counter, time
+@@ -273,6 +274,27 @@ class StragglerCollector:
+ 
+ _COLLECTOR: StragglerCollector | None = None
+ 
++# EXPERIMENT ONLY (branch exp/task11-interleave, not for the PR): in-run on/off A/B.
++# STRAGGLER_AB_PERIOD=N toggles recording every N steps; STRAGGLER_AB_PHASE=0|1 picks
++# whether block 0 is on. Off steps get config.timers=None and skip end_step, i.e. the
++# exact code path of a run without the profiler.
++_AB_PERIOD = int(os.environ.get("STRAGGLER_AB_PERIOD", "0"))
++_AB_PHASE = int(os.environ.get("STRAGGLER_AB_PHASE", "0"))
++_AB_ON = _AB_PERIOD <= 0 or _AB_PHASE % 2 == 0
++
++
++def straggler_ab_on(step: int) -> bool:
++    return _AB_PERIOD <= 0 or ((step // _AB_PERIOD) + _AB_PHASE) % 2 == 0
++
++
++def straggler_ab_set_step(step: int) -> None:
++    global _AB_ON
++    _AB_ON = straggler_ab_on(step)
++
++
++def straggler_ab_active() -> bool:
++    return _AB_ON
++
+ 
+ def install_straggler_collector(role: str) -> StragglerCollector | None:
+     """Create the process-wide collector if the profiler is enabled and this
+@@ -319,7 +341,7 @@ def straggler_timers(phase: str) -> StragglerTimers | None:
+     """Return the ``config.timers`` value for ``phase``: the phase-specific
+     timers, or ``None`` when no collector is installed (which is exactly what
+     Relax assigns without the profiler)."""
+-    if _COLLECTOR is None:
++    if _COLLECTOR is None or not _AB_ON:
+         return None
+     if phase == "train":
+         return _COLLECTOR.train_timers
+-- 
+2.43.0
+
