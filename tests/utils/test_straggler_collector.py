@@ -10,7 +10,7 @@ from relax.utils.straggler import collector as collector_module
 from relax.utils.straggler.collector import StragglerCollector, install_straggler_collector
 from relax.utils.straggler.detector import DetectorConfig, RankMeta
 from relax.utils.straggler.stats import FIELD_INDEX
-from tests.utils.straggler_helpers import FakeEvent
+from tests.utils.straggler_helpers import FakeEvent, meta
 
 
 class _FakeCapture:
@@ -32,7 +32,7 @@ def _collector(world, interval=2, is_primary=True, register_gc=False, gather=Non
 
     def counting_gather_objects(obj):
         meta_calls.append(obj)
-        return [RankMeta(rank=r, dp=r, tp=0, pp=0) for r in range(world)]
+        return meta(world)
 
     collector = StragglerCollector(
         rank_meta=RankMeta(rank=0, dp=0, tp=0, pp=0),

@@ -170,22 +170,20 @@ def _relative_and_z(values: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndar
     registers; callers add an absolute-significance guard where that matters.
     """
     n = values.shape[0]
-    rel = np.zeros(n)
-    z = np.zeros(n)
     if n < 2:
-        return rel, z, values.copy()
+        return np.zeros(n), np.zeros(n), values.copy()
     med = _leave_one_out_median(values)
     mad = _leave_one_out_mad(values, med)
 
+    rel = np.zeros(n)
     positive = med > _EPS
     rel[positive] = np.minimum(values[positive] / med[positive] - 1.0, _REL_CAP)
     rel[~positive & (values > _EPS)] = _REL_CAP
 
     scale = 1.4826 * mad
-    fallback = np.maximum(np.maximum(0.01 * np.abs(med), 0.01 * np.abs(values)), _EPS)
+    fallback = np.maximum(0.01 * np.maximum(np.abs(med), np.abs(values)), _EPS)
     scale = np.where(scale < _EPS, fallback, scale)
-    z[:] = (values - med) / scale
-    return rel, z, med
+    return rel, (values - med) / scale, med
 
 
 def _column(table: np.ndarray, name: str) -> np.ndarray:
@@ -216,6 +214,7 @@ def analyze_window(
 
     self_ms = sum(_column(x, name) for name in SELF_SEGMENTS)
     wait_ms = sum(_column(x, name) for name in WAIT_SEGMENTS)
+    pp_recv = _column(x, "pp_recv")
     tokens = _column(x, "tokens")
     has_tokens = bool(np.all(tokens > 0))
     per_ktok = self_ms / np.maximum(tokens, 1.0) * 1e3
@@ -243,7 +242,7 @@ def analyze_window(
         rel_self[idx], z_self[idx], _ = _relative_and_z(self_ms[idx])
         rel_tok[idx], _, _ = _relative_and_z(tokens[idx])
         rel_ktok[idx], _, _ = _relative_and_z(per_ktok[idx])
-        rel_recv[idx], z_recv[idx], peer_recv[idx] = _relative_and_z(_column(x, "pp_recv")[idx])
+        rel_recv[idx], z_recv[idx], peer_recv[idx] = _relative_and_z(pp_recv[idx])
         rel_wait[idx], _, _ = _relative_and_z(wait_ms[idx])
         for name in GPU_SEGMENTS:
             segment_rel[name][idx], _, _ = _relative_and_z(_column(x, name)[idx])
@@ -277,7 +276,6 @@ def analyze_window(
 
     self_candidates = (rel_self >= config.rel_threshold) & (z_self >= config.z_threshold)
     candidates = self_candidates | late_candidates
-    pp_recv = _column(x, "pp_recv")
     wait_candidates = (
         ~candidates
         & (pp_recv > _EPS)

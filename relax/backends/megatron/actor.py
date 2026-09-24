@@ -2383,9 +2383,9 @@ class MegatronTrainRayActor(TrainRayActor):
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
 
     def _straggler_end_step(self, rollout_id: int, total_lengths: Sequence[int]) -> dict[str, float] | None:
-        """Close the straggler window for this step (all ranks; contains a Gloo
-        collective every ``report_interval`` steps) and, on the primary rank
-        when a window closes, return its scalars for ``log_perf_data``."""
+        """Close this step in the straggler collector (all ranks; contains a
+        Gloo collective every ``report_interval`` steps) and, on the primary
+        rank when a window closes, return its scalars for ``log_perf_data``."""
         if self.straggler is None:
             return None
         self.straggler.add_tokens(int(sum(total_lengths)))

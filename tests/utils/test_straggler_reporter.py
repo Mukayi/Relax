@@ -7,8 +7,9 @@ import pytest
 
 from relax.utils import tracking_utils
 from relax.utils.straggler import reporter
-from relax.utils.straggler.detector import DetectorConfig, DetectorState, RankMeta, analyze_window
+from relax.utils.straggler.detector import DetectorConfig, DetectorState, analyze_window
 from relax.utils.timer import Timer
+from tests.utils.straggler_helpers import meta as _meta
 from tests.utils.straggler_helpers import row as _row
 
 
@@ -34,8 +35,7 @@ def _report(flag_rank=None):
     table = [_row(fwd=100.0, bwd=200.0, tokens=1000.0) for _ in range(4)]
     if flag_rank is not None:
         table[flag_rank] = _row(fwd=150.0, bwd=300.0, tokens=1000.0)
-    meta = [RankMeta(rank=r, dp=r, tp=0, pp=0, host="h0", device=r) for r in range(4)]
-    report = analyze_window(table, meta, DetectorConfig(persist_windows=1), DetectorState())
+    report = analyze_window(table, _meta(4), DetectorConfig(persist_windows=1), DetectorState())
     report.window_start_wall = 1000.0
     return report
 

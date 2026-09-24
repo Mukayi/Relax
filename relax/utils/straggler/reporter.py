@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Push one analyzed straggler window to the existing reporting outlets.
+"""Turn one analyzed straggler window into scalars, timeline events and log
+lines.
 
 * scalars -> returned to the actor, which logs them in the same ``tracking_utils.log`` call as
   the step's ``perf/*`` metrics (MetricsService / TensorBoard / WandB / ClearML)
@@ -87,7 +88,7 @@ def report_straggler_window(args: Any, rollout_id: int, report: WindowReport) ->
     instead of paying for a second request.
     """
     step = compute_rollout_step(args, rollout_id)
-    metrics = dict(report.metrics)
+    metrics = report.metrics
 
     if getattr(args, "timeline_dump_dir", None):
         # These ride out (and get their step stamped) with the ``log_perf_data``

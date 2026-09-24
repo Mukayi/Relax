@@ -7,6 +7,9 @@ current stream. Cold path (once per training step, from the actor):
 ``end_step`` reads back completed event pairs with ``event.query()`` -- never
 ``synchronize`` -- and every ``report_interval`` steps gathers one small vector
 per rank over the Gloo group and runs the detector on the primary rank.
+
+A "step" throughout this package is one ``end_step`` call, i.e. one rollout,
+which may contain several optimizer steps.
 """
 
 from __future__ import annotations
@@ -123,7 +126,7 @@ class StragglerCollector:
         if report_interval < 1:
             raise ValueError(
                 f"straggler report_interval must be >= 1, got {report_interval}: a window closes every "
-                "report_interval training steps. Set RELAX_STRAGGLER_REPORT_INTERVAL to a positive integer."
+                "report_interval rollouts. Set RELAX_STRAGGLER_REPORT_INTERVAL to a positive integer."
             )
         self.rank_meta = rank_meta
         self.is_primary = is_primary
@@ -291,6 +294,8 @@ def install_straggler_collector(role: str) -> StragglerCollector | None:
         return _COLLECTOR
     from megatron.core import mpu
 
+    # Must match ``log_perf_data``'s primary rank: the window scalars are logged
+    # through it, which drops them on every other rank.
     is_primary = (
         mpu.get_tensor_model_parallel_rank() == 0
         and mpu.is_pipeline_last_stage()
