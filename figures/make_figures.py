@@ -724,8 +724,14 @@ def fig_overhead(expil: Path) -> None:
         c.text(bk.max() + 0.6, 0.52, "±0.5% target", ha="right", va="bottom", fontsize=9, color=GREEN_TXT,
                bbox=white, zorder=5)
         ci_txt = f" ± {ch:.2f}%" if not math.isnan(ch) else ""
-        c.set_title("In-run crossover: each 10-rollout block measured once on, once off (1 pair, no A/A control, metrics service off)", loc="left")
-        c.text(0.995, 0.03, f"mean {pct(cm)}{ci_txt} (95% CI, n = {len(d)} blocks)", transform=c.transAxes,
+        n_pairs = len(pair_ids)
+        c.set_title(
+            f"In-run crossover: each 10-rollout block measured once on, once off "
+            f"({n_pairs} pairs, metrics service off; A/A on 3 hosts in table, not plotted)",
+            loc="left",
+        )
+        c.text(0.995, 0.03, f"pooled mean {pct(cm)}{ci_txt} (95% CI, n = {len(d)} blocks; pair-level CI wider)",
+               transform=c.transAxes,
                ha="right", va="bottom", fontsize=9.8, color=BLUE_TXT, fontweight="bold",
                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#CCCCCC", lw=0.8), zorder=6)
         c.set_xlabel("10-rollout block")
