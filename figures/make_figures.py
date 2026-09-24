@@ -40,11 +40,11 @@ RED, RED_FILL, RED_TXT = "#C0392B", "#F8DCD8", "#8E2A20"
 GRAY, GRAY_FILL, GRAY_TXT = "#7A7A7A", "#ECECEC", "#3A3A3A"
 TEXT, MUTED = "#1B1B1B", "#555555"
 OFF_C, ON_C = "#8C8C8C", BLUE
-STRIP_COLORS = ("#E58A3A", "#F2B77E", "#F8D9B8")  # GPU segments, CPU fields, counters
+STRIP_COLORS = ("#3C78C3", "#8FB3E2", "#C9DBF2")  # GPU segments, CPU fields, counters
 
 KIND = {
-    "hot": (BLUE_FILL, BLUE, BLUE_TXT),
-    "cold": (ORANGE_FILL, ORANGE, ORANGE_TXT),
+    "hot": (ORANGE_FILL, ORANGE, ORANGE_TXT),
+    "cold": (BLUE_FILL, BLUE, BLUE_TXT),
     "out": (GREEN_FILL, GREEN, GREEN_TXT),
     "alert": (RED_FILL, RED, RED_TXT),
     "up": (GRAY_FILL, GRAY, GRAY_TXT),
@@ -215,34 +215,34 @@ def fig_mechanism() -> None:
 
     # ---- left: one rank, hot path | cold path
     rbox(ax, 0.1, 0.55, 5.05, 5.12, "none", "#9C9C9C", lw=1.1, r=0.1, z=1)
-    rbox(ax, 0.2, 0.65, 2.42, 4.92, BLUE_BAND, "none", r=0.08, z=1)
-    rbox(ax, 2.74, 0.65, 2.31, 4.92, ORANGE_BAND, "none", r=0.08, z=1)
-    ax.text(1.41, 5.36, "HOT PATH", ha="center", fontsize=10.5, fontweight="bold", color=BLUE)
-    ax.text(1.41, 5.13, "every timer start / stop", ha="center", fontsize=9.5, color=BLUE)
-    ax.text(3.895, 5.36, "COLD PATH", ha="center", fontsize=10.5, fontweight="bold", color=ORANGE)
-    ax.text(3.895, 5.13, "once per step end", ha="center", fontsize=9.5, color=ORANGE)
+    rbox(ax, 0.2, 0.65, 2.42, 4.92, ORANGE_BAND, "none", r=0.08, z=1)
+    rbox(ax, 2.74, 0.65, 2.31, 4.92, BLUE_BAND, "none", r=0.08, z=1)
+    ax.text(1.41, 5.36, "HOT PATH", ha="center", fontsize=10.5, fontweight="bold", color=ORANGE)
+    ax.text(1.41, 5.13, "every timer start / stop", ha="center", fontsize=9.5, color=ORANGE)
+    ax.text(3.895, 5.36, "COLD PATH", ha="center", fontsize=10.5, fontweight="bold", color=BLUE)
+    ax.text(3.895, 5.13, "once per step end", ha="center", fontsize=9.5, color=BLUE)
 
     hx, hw = 0.32, 2.18
     hcx = hx + hw / 2
     node(ax, hx, 4.1, hw, 0.66, "up", "Megatron call sites", ["22 timers · unchanged"])
-    arrow(ax, (hcx, 4.1), (hcx, 3.64), BLUE)
-    ax.text(hcx + 0.1, 3.87, "start() / stop()", ha="left", va="center", fontsize=9, color=BLUE_TXT, style="italic")
+    arrow(ax, (hcx, 4.1), (hcx, 3.64), ORANGE)
+    ax.text(hcx + 0.1, 3.87, "start() / stop()", ha="left", va="center", fontsize=9, color=ORANGE_TXT, style="italic")
     node(ax, hx, 2.78, hw, 0.86, "hot", "StragglerTimers",
          ["drop-in config.timers", ("no cudaSynchronize", RED, "bold")], lw=1.6)
-    arrow(ax, (hcx, 2.78), (hcx, 2.44), BLUE)
+    arrow(ax, (hcx, 2.78), (hcx, 2.44), ORANGE)
     node(ax, hx, 1.8, hw, 0.64, "hot", "CUDA event pair", ["+ perf_counter · pool 4096"])
-    arrow(ax, (hcx, 1.8), (hcx, 1.56), BLUE)
-    ax.text(hcx + 0.1, 1.68, "push", ha="left", va="center", fontsize=9, color=BLUE_TXT, style="italic")
+    arrow(ax, (hcx, 1.8), (hcx, 1.56), ORANGE)
+    ax.text(hcx + 0.1, 1.68, "push", ha="left", va="center", fontsize=9, color=ORANGE_TXT, style="italic")
     # pending FIFO with a queue glyph: in-flight pairs (hollow) at the back, completed ones (filled) at the front
     fx, fy, fh = hx, 0.78, 0.78
-    rbox(ax, fx, fy, hw, fh, BLUE_FILL, BLUE, lw=1.3)
+    rbox(ax, fx, fy, hw, fh, ORANGE_FILL, ORANGE, lw=1.3)
     ax.text(hcx, fy + fh - 0.16, "Pending FIFO", ha="center", va="center", fontsize=10.5, fontweight="bold",
-            color=BLUE_TXT, zorder=6)
+            color=ORANGE_TXT, zorder=6)
     cw, n_cells = 0.17, 9
     gx = hcx - n_cells * cw / 2
     for i in range(n_cells):
         done = i >= n_cells - 4
-        ax.add_patch(Rectangle((gx + i * cw, fy + 0.3), cw, 0.17, fc=BLUE if done else "white", ec=BLUE, lw=0.8,
+        ax.add_patch(Rectangle((gx + i * cw, fy + 0.3), cw, 0.17, fc=ORANGE if done else "white", ec=ORANGE, lw=0.8,
                                zorder=6))
     ax.text(hcx, fy + 0.15, "≤ 16384 pairs · full → drop oldest", ha="center", va="center", fontsize=8.8,
             color=MUTED, zorder=6)
@@ -250,46 +250,46 @@ def fig_mechanism() -> None:
     cx, cwid = 2.86, 2.07
     ccx = cx + cwid / 2
     node(ax, cx, 0.78, cwid, 0.78, "cold", "drain()", ["event.query() from front", "folds completed pairs"])
-    arrow(ax, (hx + hw, fy + 0.385), (cx, fy + 0.385), ORANGE, lw=1.7)
+    arrow(ax, (hx + hw, fy + 0.385), (cx, fy + 0.385), BLUE, lw=1.7)
     # WindowStats vector
     wy, wh = yc - 0.58, 1.16
-    rbox(ax, cx, wy, cwid, wh, ORANGE_FILL, ORANGE, lw=1.6)
+    rbox(ax, cx, wy, cwid, wh, BLUE_FILL, BLUE, lw=1.6)
     ax.text(ccx, wy + wh - 0.19, "WindowStats", ha="center", va="center", fontsize=10.5, fontweight="bold",
-            color=ORANGE_TXT, zorder=6)
+            color=BLUE_TXT, zorder=6)
     ax.text(ccx, wy + wh - 0.41, "18 × float64 per rank", ha="center", va="center", fontsize=9.5, color=MUTED,
             zorder=6)
     sc = 0.108
     sx = ccx - 18 * sc / 2
     strip(ax, sx, wy + 0.3, sc, 0.2)
-    ax.text(sx + 5 * sc, wy + 0.15, "GPU × 10", ha="center", va="center", fontsize=8.8, color=ORANGE_TXT, zorder=6)
-    ax.text(sx + 14 * sc, wy + 0.15, "CPU · counts", ha="center", va="center", fontsize=8.8, color=ORANGE_TXT,
+    ax.text(sx + 5 * sc, wy + 0.15, "GPU × 10", ha="center", va="center", fontsize=8.8, color=BLUE_TXT, zorder=6)
+    ax.text(sx + 14 * sc, wy + 0.15, "CPU · counts", ha="center", va="center", fontsize=8.8, color=BLUE_TXT,
             zorder=6)
-    arrow(ax, (ccx, 1.56), (ccx, wy), ORANGE)
+    arrow(ax, (ccx, 1.56), (ccx, wy), BLUE)
     node(ax, cx, 4.05, cwid, 0.66, "cold", "gc.callbacks", ["GC pauses inside the step"], lw=1.1)
-    arrow(ax, (ccx, 4.05), (ccx, wy + wh), ORANGE)
+    arrow(ax, (ccx, 4.05), (ccx, wy + wh), BLUE)
 
     # ---- middle: Gloo all_gather of N vectors
     mx, mw, my, mh = 5.5, 1.66, yc - 0.9, 1.8
-    rbox(ax, mx, my, mw, mh, ORANGE_FILL, ORANGE, lw=1.6)
+    rbox(ax, mx, my, mw, mh, BLUE_FILL, BLUE, lw=1.6)
     ax.text(mx + mw / 2, my + mh - 0.2, "Gloo all_gather", ha="center", va="center", fontsize=10.5,
-            fontweight="bold", color=ORANGE_TXT, zorder=6)
+            fontweight="bold", color=BLUE_TXT, zorder=6)
     rows = [("r0", 0), ("r1", 1), ("r2", 2), ("⋮", None), ("rN−1", 4)]
     sc2 = 0.06
     lab_x = mx + 0.44
     for k, (lab, _) in enumerate(rows):
         ry = my + mh - 0.55 - k * 0.245
-        ax.text(lab_x, ry + 0.065, lab, ha="right", va="center", fontsize=9, color=ORANGE_TXT, zorder=6)
+        ax.text(lab_x, ry + 0.065, lab, ha="right", va="center", fontsize=9, color=BLUE_TXT, zorder=6)
         if lab != "⋮":
             strip(ax, lab_x + 0.08, ry, sc2, 0.13)
-    arrow(ax, (cx + cwid, yc), (mx, yc), ORANGE, lw=1.8)
+    arrow(ax, (cx + cwid, yc), (mx, yc), BLUE, lw=1.8)
     for i, line in enumerate(("CPU group, not NCCL", "8 ranks ≈ 1.2 KB", "rank metadata: 1st window")):
         ax.text(mx + mw / 2, my - 0.22 - i * 0.22, line, ha="center", va="center", fontsize=9.3, color=MUTED)
 
     # ---- right: detector and outputs on the primary rank
     dx, dw, dh = 7.74, 1.24, 1.02
     node(ax, dx, yc - dh / 2, dw, dh, "cold", "Detector", ["numpy", "5 reasons"], lw=1.6)
-    arrow(ax, (mx + mw, yc), (dx, yc), ORANGE, lw=1.8)
-    ax.text((mx + mw + dx) / 2, yc + 0.14, "N × 18", ha="center", va="bottom", fontsize=9, color=ORANGE_TXT)
+    arrow(ax, (mx + mw, yc), (dx, yc), BLUE, lw=1.8)
+    ax.text((mx + mw + dx) / 2, yc + 0.14, "N × 18", ha="center", va="bottom", fontsize=9, color=BLUE_TXT)
     ox, ow, oh = 9.44, 2.36, 0.72
     outs = [
         (yc + 1.15, "out", "TensorBoard / WandB", ["straggler/* (49 at DP8)"]),
@@ -306,8 +306,8 @@ def fig_mechanism() -> None:
     ax.text(2.625, 0.25, "Profiler off: config.timers stays None (identical to upstream)", ha="center",
             va="center", fontsize=9.3, color=GRAY_TXT)
     legend_row(ax, 5.55, 0.25, [
-        ("hot path", BLUE_FILL, BLUE),
-        ("cold path", ORANGE_FILL, ORANGE),
+        ("hot path", ORANGE_FILL, ORANGE),
+        ("cold path", BLUE_FILL, BLUE),
         ("output", GREEN_FILL, GREEN),
         ("alert", RED_FILL, RED),
         ("unchanged Megatron", GRAY_FILL, GRAY),
@@ -331,15 +331,15 @@ def fig_detector() -> None:
          ["leave-one-out median m and MAD", "z = (x − m) / (1.4826 · MAD)",
           ("↑ significant: z ≥ 3.0 and ≥ 10% above m", TEXT, "bold"),
           ("↓ significant: z ≤ −3.0 and ≥ 10% below m", TEXT, "bold")])
-    arrow(ax, (2.55, top_y + top_h / 2), (2.95, top_y + top_h / 2), ORANGE)
-    arrow(ax, (6.55, top_y + top_h / 2), (6.95, top_y + top_h / 2), ORANGE)
+    arrow(ax, (2.55, top_y + top_h / 2), (2.95, top_y + top_h / 2), BLUE)
+    arrow(ax, (6.55, top_y + top_h / 2), (6.95, top_y + top_h / 2), BLUE)
 
     # ---- persistence gate
     gy, gh = 4.82, 0.5
-    rbox(ax, 0.15, gy, 10.5, gh, "#FFF8EF", ORANGE, lw=1.4, ls=(0, (4, 2)))
+    rbox(ax, 0.15, gy, 10.5, gh, BLUE_BAND, BLUE, lw=1.4, ls=(0, (4, 2)))
     ax.text(5.4, gy + gh / 2, "Persistence gate: a rank must be a candidate for 3 consecutive windows, "
-            "otherwise → none", ha="center", va="center", fontsize=10.2, fontweight="bold", color=ORANGE_TXT)
-    arrow(ax, (8.8, top_y), (8.8, gy + gh), ORANGE)
+            "otherwise → none", ha="center", va="center", fontsize=10.2, fontweight="bold", color=BLUE_TXT)
+    arrow(ax, (8.8, top_y), (8.8, gy + gh), BLUE)
     ax.text(8.7, (top_y + gy + gh) / 2, "every window, every rank", ha="right", va="center", fontsize=9,
             color=MUTED, style="italic")
 
@@ -366,13 +366,13 @@ def fig_detector() -> None:
         ry = y0 - i * (row_h + row_gap) - row_h
         ys.append(ry)
         root = i < 3
-        rbox(ax, bx, ry, bw, row_h, BLUE_FILL if root else "#F4F4F4", BLUE if root else GRAY, lw=1.1)
+        rbox(ax, bx, ry, bw, row_h, ORANGE_FILL if root else "#F4F4F4", ORANGE if root else GRAY, lw=1.1)
         ax.text(bx + 0.18, ry + row_h / 2, cond, ha="left", va="center", fontsize=9.6, color=TEXT, zorder=6)
         # priority badge
         ax.add_patch(matplotlib.patches.Circle((rail_x, ry + row_h / 2), 0.17, fc="white",
-                                               ec=BLUE if root else GRAY, lw=1.4, zorder=6))
+                                               ec=ORANGE if root else GRAY, lw=1.4, zorder=6))
         ax.text(rail_x, ry + row_h / 2, str(i + 1), ha="center", va="center", fontsize=10, fontweight="bold",
-                color=BLUE_TXT if root else GRAY_TXT, zorder=7)
+                color=ORANGE_TXT if root else GRAY_TXT, zorder=7)
         fc, ec, tc = KIND[kind]
         rbox(ax, px, ry, pw, row_h, fc, ec, lw=1.5, r=0.2)
         if note:
@@ -396,7 +396,7 @@ def fig_detector() -> None:
     arrow(ax, (rail_x + 1.05, ny + 0.2), (px, ny + 0.2), GRAY, lw=1.1, ls=(0, (3, 2)))
 
     # group brackets left of the badges
-    for top, bot, label, color in ((ys[0] + row_h, ys[2], "root cause", BLUE), (ys[3] + row_h, ys[4], "symptom",
+    for top, bot, label, color in ((ys[0] + row_h, ys[2], "root cause", ORANGE), (ys[3] + row_h, ys[4], "symptom",
                                                                                GRAY)):
         ax.plot([0.44, 0.38, 0.38, 0.44], [top, top, bot, bot], color=color, lw=1.3, solid_capstyle="butt")
         ax.text(0.24, (top + bot) / 2, label, rotation=90, ha="center", va="center", fontsize=9.3, color=color,
