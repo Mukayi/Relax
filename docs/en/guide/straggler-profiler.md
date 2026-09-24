@@ -1,6 +1,6 @@
 # Straggler Analysis
 
-The Megatron backend ships an always-on, low-overhead straggler profiler. Every training rank brackets its own forward / backward / optimizer / gradient-sync / parameter all-gather segments with CUDA events on the compute stream (so "GPU time" below includes any host launch gaps inside the bracket), and every K steps all ranks Gloo-all-gather one fixed-length statistics vector to the primary rank, which decides whether a rank is holding the group back, why, and writes the verdict to metrics, the timeline and the log.
+The Megatron backend ships an always-on, low-overhead straggler profiler. Every training rank brackets its own forward / backward / optimizer / gradient-sync / parameter all-gather segments with CUDA events on the compute stream (so "GPU time" below includes any host launch gaps inside the bracket), and every K rollouts all ranks Gloo-all-gather one fixed-length statistics vector to the primary rank, which decides whether a rank is holding the group back, why, and writes the verdict to metrics, the timeline and the log.
 
 This is not `torch.profiler`: no kernel tracing, no `cuda.synchronize()`, no change to compute/communication overlap. It is meant to stay enabled in production runs.
 
@@ -55,7 +55,7 @@ These scalars go out in the same `tracking_utils.log` call as the step's `perf/*
 | Metric | Meaning |
 |--------|---------|
 | `straggler/{fwd,bwd,optim,pp_recv,pp_send,dp_grad_sync,dp_param_gather,lp_fwd,lp_pp_recv,lp_pp_send}/{median_ms,max_ms,max_rank,spread}` | Per-segment GPU time (ms/step): median and global max across ranks; `max_rank` / `spread` are the rank with the largest excess over *its PP-stage peers* and that excess (`value/peer_median − 1`). `lp_*` are the same segments during log-prob / forward-only passes. `dp_param_gather` is only populated when `--overlap-param-gather` is off (Megatron does not time the overlapped path). |
-| `straggler/self/*`, `straggler/self_per_ktok/*` | Own compute time (`fwd + bwd + optim`) and its per-token normalisation. |
+| `straggler/self/*`, `straggler/self_per_ktok/*` | Own compute time (`fwd + bwd + optim`) and its per-token normalisation; the latter is omitted, like `tokens/*`, when any rank reports zero tokens. |
 | `straggler/wait/{median_ms,max_ms,max_rank,spread}` | Time spent waiting for peers (`pp_recv + dp_grad_sync + dp_param_gather`). |
 | `straggler/late/max_ms`, `straggler/late/max_rank`, `straggler/late/peer_idle_ms` | The rank that reaches the DP gradient sync last, by how much, and how long its peers idle for it per step. |
 | `straggler/tokens/{median,max,spread}` | Token-count imbalance: `median` / `max` are global, `spread` is the largest excess within a stage; omitted when any rank reports zero tokens. |
