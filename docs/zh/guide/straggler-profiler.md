@@ -84,9 +84,9 @@ its own GPU compute is 0.99x peers, gc 1.8 ms, cpu/gpu fwd 1.26x -> late_arrival
 - 每个 Megatron 计时点一对 `cudaEventRecord`（非阻塞，事件从池里复用）：每个 micro-batch 的 forward / backward 各一对，每步的梯度同步、参数 all-gather、optimizer 各阶段共约十对。
 - 每步末尾 `event.query()` 惰性读取已完成的事件并累加到窗口向量：`straggler/self_overhead_ms` 在 8×A100 上实测 0.12–0.15 ms/step。
 - 每 `REPORT_INTERVAL` 步一次 Gloo `all_gather`（每 rank 18 个 float64）加 primary 上的判定，分别记在 `gather_ms` 和 `analyze_ms`，摊到每步 < 1 ms。判定是 O(n log n)（n = 同 stage rank 数），单机 CPU 微基准每窗口 8 rank 2.4 ms、512 rank 10 ms、2048 rank 35 ms；其余 rank 会在下一次集合通信处等 primary。
-- 每次计时调用（start / stop 与两次 `event.record()`）约 24 µs；按每步最多 17 次计时（3 个 micro-batch）回放 Megatron 调用序列，单卡基准测得 0.40 ms/step（最大 0.46 ms）。
-- 以上各项相加，并假设全部落在关键路径上：典型约 0.93 ms/step，最坏约 1.54 ms/step，在 step 约 1.15 s 时分别为 0.08% 和 0.13%。在 kernel 发射受限的循环里，开启后每步墙钟增加 0.59 ms（含步末读取事件），与计时调用加读取事件的统计吻合。这是逐项相加的估算上界，不是端到端实测。
-- 端到端：8×A100、Qwen3-0.6B SFT（DP8，step ≈ 1.15 s，对计时开销最敏感的小模型场景），开启 / 关闭 profiler 交替各 3 次、每次 60 步，比较 step 10–59（数据顺序确定）：三对 `perf/step_time` 平均差 −1.69% / −0.54% / +0.46%，而三次关闭 profiler 的运行之间本身就相差 1.2%，与之同一量级，没有测出开启后变慢。以每次运行为单位的 95% 置信区间为 −3.3% ~ +2.1%（n = 3），这组对比还不足以证明开销 < 0.5%。
+- 每次计时调用（start / stop 与两次 `event.record()`）约 30 µs。在 A100 实验机的一张空卡上，按每步最多 17 次计时（3 个 micro-batch）回放 Megatron 调用序列：kernel 发射受限的循环里，计时调用加步末读取事件使每步墙钟增加 0.80 ms（最大 0.97 ms）；计算受限的循环里只增加 0.09 ms。
+- 以上各项相加，并假设全部落在关键路径上：典型约 1.2 ms/step，最坏约 1.9 ms/step，在 step 约 1.15 s 时分别为 0.10% 和 0.17%。这是逐项相加的估算上界。
+- 端到端：8×A100、Qwen3-0.6B SFT（DP8，step ≈ 1.15 s，对计时开销最敏感的小模型场景）。开启 / 关闭 profiler 各跑一次的对比受不同运行之间约 1% 的波动限制，所以改为在同一次运行内每 10 步切换一次开关，另一次运行的相位相反，使同一个 10 步块在相同数据上一开一关。1 对运行、各 300 步、27 个块：开销 −0.05% ± 0.37%（95% 置信区间 −0.42% ~ +0.32%），上界低于 0.5%。
 
 ## 实现位置
 
