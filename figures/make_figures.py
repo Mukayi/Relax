@@ -38,6 +38,7 @@ ORANGE, ORANGE_FILL, ORANGE_BAND, ORANGE_TXT = "#D9730D", "#FBE3CB", "#FDF4EA", 
 GREEN, GREEN_FILL, GREEN_TXT = "#2E7D46", "#DDF0E2", "#1D5530"
 RED, RED_FILL, RED_TXT = "#C0392B", "#F8DCD8", "#8E2A20"
 GRAY, GRAY_FILL, GRAY_TXT = "#7A7A7A", "#ECECEC", "#3A3A3A"
+PURPLE, PURPLE_FILL, PURPLE_TXT = "#6A4C93", "#ECE6F5", "#4A2F6E"
 TEXT, MUTED = "#1B1B1B", "#555555"
 OFF_C, ON_C = "#8C8C8C", BLUE
 STRIP_COLORS = ("#3C78C3", "#8FB3E2", "#C9DBF2")  # GPU segments, CPU fields, counters
@@ -210,7 +211,7 @@ def fig_mechanism() -> None:
     yc = 2.78  # height of the per-window data path (WindowStats -> gather -> detector)
 
     # column headers
-    for x, label in ((2.62, "Each training rank (× N)"), (6.33, "Every K = 10 steps"), (9.68, "Primary rank")):
+    for x, label in ((2.62, "Each training rank (× N)"), (6.33, "Every K = 10 rollouts"), (9.68, "Primary rank")):
         ax.text(x, 5.98, label, ha="center", va="center", fontsize=12.5, fontweight="bold", color=TEXT)
 
     # ---- left: one rank, hot path | cold path
@@ -220,7 +221,7 @@ def fig_mechanism() -> None:
     ax.text(1.41, 5.36, "HOT PATH", ha="center", fontsize=10.5, fontweight="bold", color=ORANGE)
     ax.text(1.41, 5.13, "every timer start / stop", ha="center", fontsize=9.5, color=ORANGE)
     ax.text(3.895, 5.36, "COLD PATH", ha="center", fontsize=10.5, fontweight="bold", color=BLUE)
-    ax.text(3.895, 5.13, "once per step end", ha="center", fontsize=9.5, color=BLUE)
+    ax.text(3.895, 5.13, "once per rollout end", ha="center", fontsize=9.5, color=BLUE)
 
     hx, hw = 0.32, 2.18
     hcx = hx + hw / 2
@@ -265,7 +266,7 @@ def fig_mechanism() -> None:
     ax.text(sx + 14 * sc, wy + 0.15, "CPU · counts", ha="center", va="center", fontsize=8.8, color=BLUE_TXT,
             zorder=6)
     arrow(ax, (ccx, 1.56), (ccx, wy), BLUE)
-    node(ax, cx, 4.05, cwid, 0.66, "cold", "gc.callbacks", ["GC pauses inside the step"], lw=1.1)
+    node(ax, cx, 4.05, cwid, 0.66, "cold", "gc.callbacks", ["on each GC, inside the step"], lw=1.1)
     arrow(ax, (ccx, 4.05), (ccx, wy + wh), BLUE)
 
     # ---- middle: Gloo all_gather of N vectors
@@ -323,7 +324,7 @@ def fig_detector() -> None:
     # ---- inputs: gathered table -> peer groups -> robust score (with the definitions the ladder uses)
     top_y, top_h = 5.72, 1.48
     node(ax, 0.15, top_y, 2.4, top_h, "cold", "Gathered window",
-         ["N ranks × 18", "÷ num_steps → per step", ("self = fwd + bwd + optim", TEXT, "bold")])
+         ["N ranks × 18", "÷ rollouts → per rollout", ("self = fwd + bwd + optim", TEXT, "bold")])
     node(ax, 2.95, top_y, 3.6, top_h, "cold", "Peer groups",
          ["self, tokens, pp_recv:", ("same PP stage", TEXT, "bold"), "dp_grad_sync:",
           ("same (pp, tp) = DP × CP group", TEXT, "bold")])
@@ -366,13 +367,13 @@ def fig_detector() -> None:
         ry = y0 - i * (row_h + row_gap) - row_h
         ys.append(ry)
         root = i < 3
-        rbox(ax, bx, ry, bw, row_h, ORANGE_FILL if root else "#F4F4F4", ORANGE if root else GRAY, lw=1.1)
+        rbox(ax, bx, ry, bw, row_h, PURPLE_FILL if root else "#F4F4F4", PURPLE if root else GRAY, lw=1.1)
         ax.text(bx + 0.18, ry + row_h / 2, cond, ha="left", va="center", fontsize=9.6, color=TEXT, zorder=6)
         # priority badge
         ax.add_patch(matplotlib.patches.Circle((rail_x, ry + row_h / 2), 0.17, fc="white",
-                                               ec=ORANGE if root else GRAY, lw=1.4, zorder=6))
+                                               ec=PURPLE if root else GRAY, lw=1.4, zorder=6))
         ax.text(rail_x, ry + row_h / 2, str(i + 1), ha="center", va="center", fontsize=10, fontweight="bold",
-                color=ORANGE_TXT if root else GRAY_TXT, zorder=7)
+                color=PURPLE_TXT if root else GRAY_TXT, zorder=7)
         fc, ec, tc = KIND[kind]
         rbox(ax, px, ry, pw, row_h, fc, ec, lw=1.5, r=0.2)
         if note:
@@ -396,7 +397,7 @@ def fig_detector() -> None:
     arrow(ax, (rail_x + 1.05, ny + 0.2), (px, ny + 0.2), GRAY, lw=1.1, ls=(0, (3, 2)))
 
     # group brackets left of the badges
-    for top, bot, label, color in ((ys[0] + row_h, ys[2], "root cause", ORANGE), (ys[3] + row_h, ys[4], "symptom",
+    for top, bot, label, color in ((ys[0] + row_h, ys[2], "root cause", PURPLE), (ys[3] + row_h, ys[4], "symptom",
                                                                                GRAY)):
         ax.plot([0.44, 0.38, 0.38, 0.44], [top, top, bot, bot], color=color, lw=1.3, solid_capstyle="butt")
         ax.text(0.24, (top + bot) / 2, label, rotation=90, ha="center", va="center", fontsize=9.3, color=color,
@@ -723,17 +724,17 @@ def fig_overhead(expil: Path) -> None:
         c.text(bk.max() + 0.6, 0.52, "±0.5% target", ha="right", va="bottom", fontsize=9, color=GREEN_TXT,
                bbox=white, zorder=5)
         ci_txt = f" ± {ch:.2f}%" if not math.isnan(ch) else ""
-        c.set_title("In-run crossover: each 10-step block measured once on, once off", loc="left")
+        c.set_title("In-run crossover: each 10-rollout block measured once on, once off (1 pair, no A/A control, metrics service off)", loc="left")
         c.text(0.995, 0.03, f"mean {pct(cm)}{ci_txt} (95% CI, n = {len(d)} blocks)", transform=c.transAxes,
                ha="right", va="bottom", fontsize=9.8, color=BLUE_TXT, fontweight="bold",
                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#CCCCCC", lw=0.8), zorder=6)
-        c.set_xlabel("10-step block")
+        c.set_xlabel("10-rollout block")
         c.set_ylabel("on / off − 1 (%)")
         c.legend(loc="upper left", ncol=len(pair_ids) + 1, fontsize=9)
         lim = max(np.abs(d).max() * 1.35, 1.0)
         c.set_ylim(-lim, lim)
 
-    fig.suptitle("Profiler overhead on 8×A100, Qwen3-0.6B SFT DP8 (3 off/on pairs × 60 steps)", x=0.06, ha="left",
+    fig.suptitle("Profiler overhead on 8×A100, Qwen3-0.6B SFT DP8", x=0.06, ha="left",
                  y=0.965 if blocks else 1.02, fontsize=12.5, fontweight="bold")
     save(fig, "fig_overhead")
 
