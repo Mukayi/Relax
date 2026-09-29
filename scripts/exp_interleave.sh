@@ -15,6 +15,7 @@
 set -uo pipefail
 umask 000
 
+: "${WORKDIR:?set WORKDIR to the directory holding Relax/, relax_work/ and envs/}"
 TASK_DIR=${WORKDIR}/relax_work/task11
 RELAX_ROOT=${WORKDIR}/Relax
 PAIRS=${PAIRS:-3}
