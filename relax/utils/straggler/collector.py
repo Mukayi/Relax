@@ -403,6 +403,7 @@ def install_straggler_collector(role: str) -> StragglerCollector | None:
             z_threshold=Envs.RELAX_STRAGGLER_Z_THRESHOLD,
             rel_threshold=Envs.RELAX_STRAGGLER_REL_THRESHOLD,
             persist_windows=Envs.RELAX_STRAGGLER_PERSIST_WINDOWS,
+            recover_windows=Envs.RELAX_STRAGGLER_RECOVER_WINDOWS,
         ),
     )
     logger.info(

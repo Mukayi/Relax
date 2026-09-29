@@ -6,6 +6,7 @@ import pytest
 
 from relax.utils.straggler.detector import (
     REASON_CODE,
+    UNCERTAIN_CODE,
     DetectorConfig,
     DetectorState,
     RankMeta,
@@ -97,8 +98,8 @@ def test_slow_device_flagged_only_after_persist_windows():
     assert report.alerts[0].new is False
 
 
-def test_flag_clears_when_rank_recovers():
-    config = DetectorConfig(persist_windows=1)
+def test_flag_clears_after_one_clean_window_when_recover_windows_is_1():
+    config = DetectorConfig(persist_windows=1, recover_windows=1)
     state = DetectorState()
     slow = [_healthy_row() for _ in range(4)]
     slow[2] = _healthy_row(fwd=150.0, bwd=300.0)
@@ -107,6 +108,122 @@ def test_flag_clears_when_rank_recovers():
     report = analyze_window(healthy, _meta(4), config, state)
     assert report.metrics["straggler/flagged/count"] == 0
     assert state.consecutive == {} and state.active == {}
+    assert [(r.rank, r.reason) for r in report.recovered] == [(2, "slow_device")]
+
+
+def _slow(rank=2, world=4, **extra):
+    table = [_healthy_row(**extra) for _ in range(world)]
+    table[rank] = _healthy_row(fwd=150.0, bwd=300.0, **extra)
+    return table
+
+
+def _clean(world=4, **extra):
+    return [_healthy_row(**extra) for _ in range(world)]
+
+
+def test_alert_survives_one_clean_window_and_clears_after_recover_windows():
+    config = DetectorConfig(persist_windows=1, recover_windows=2)
+    state = DetectorState()
+    analyze_window(_slow(), _meta(4), config, state)
+    held = analyze_window(_clean(), _meta(4), config, state)
+    assert held.metrics["straggler/flagged/count"] == 1, "one clean window is not a recovery"
+    assert [(a.rank, a.reason, a.new) for a in held.alerts] == [(2, "slow_device", False)]
+    assert held.recovered == []
+    cleared = analyze_window(_clean(), _meta(4), config, state)
+    assert cleared.metrics["straggler/flagged/count"] == 0
+    assert cleared.metrics["straggler/recovered/count"] == 1
+    assert [(r.rank, r.reason) for r in cleared.recovered] == [(2, "slow_device")]
+    assert "2 clean windows" in cleared.recovered[0].message
+    assert state.active == {}
+
+
+def test_relapse_during_recovery_keeps_the_alert_without_a_new_warning():
+    config = DetectorConfig(persist_windows=1, recover_windows=2)
+    state = DetectorState()
+    analyze_window(_slow(), _meta(4), config, state)
+    analyze_window(_clean(), _meta(4), config, state)
+    relapse = analyze_window(_slow(), _meta(4), config, state)
+    assert [(a.rank, a.new) for a in relapse.alerts] == [(2, False)]
+    # The clean count restarted: one clean window is again not enough.
+    assert analyze_window(_clean(), _meta(4), config, state).metrics["straggler/flagged/count"] == 1
+    assert analyze_window(_clean(), _meta(4), config, state).metrics["straggler/flagged/count"] == 0
+
+
+def test_rank_with_a_single_member_stage_is_uncertain_not_silently_ok():
+    # PP=2 with one rank per stage: nobody to compare with.
+    report = _analyze_once([_healthy_row(), _healthy_row(fwd=500.0)], _meta(2, pp_size=2))
+    assert report.alerts == []
+    assert [(u.rank, u.cause) for u in report.uncertain] == [(0, "no_peers"), (1, "no_peers")]
+    assert report.metrics["straggler/uncertain/count"] == 2
+    assert report.metrics["straggler/uncertain/rank"] == 0
+    assert report.metrics["straggler/uncertain/cause"] == UNCERTAIN_CODE["no_peers"]
+    assert report.rows[1]["uncertain"] == "no_peers"
+
+
+@pytest.mark.parametrize(
+    ("field", "cause"),
+    [("dropped", "dropped_events"), ("unread", "unread_events"), ("errors", "profiler_errors")],
+)
+def test_rank_with_incomplete_timing_is_uncertain_and_never_flagged(field, cause):
+    table = _slow(rank=2)
+    table[2] = _healthy_row(fwd=150.0, bwd=300.0, **{field: 1.0})
+    report = _analyze_once(table, _meta(4))
+    assert report.alerts == []
+    assert [(u.rank, u.cause) for u in report.uncertain] == [(2, cause)]
+
+
+def test_unread_grad_sync_bracket_does_not_fake_a_late_arrival():
+    # An unread dp_grad_sync bracket makes that rank's sync look short, which is
+    # exactly what a late arriver looks like.
+    table = [_healthy_row(dp_grad_sync=300.0) for _ in range(8)]
+    table[4] = _healthy_row(dp_grad_sync=20.0, unread=1.0)
+    report = _analyze_once(table, _meta(8))
+    assert report.alerts == []
+    assert [(u.rank, u.cause) for u in report.uncertain] == [(4, "unread_events")]
+
+
+def test_slow_rank_without_token_counts_is_uncertain_instead_of_slow_device():
+    # Without tokens, data imbalance cannot be told apart from a slow device.
+    report = _analyze_once(_slow(rank=1, tokens=0.0), _meta(4))
+    assert report.alerts == []
+    assert [(u.rank, u.cause) for u in report.uncertain] == [(1, "missing_tokens")]
+    # Healthy ranks without tokens have nothing to classify and stay certain.
+    assert _analyze_once(_clean(tokens=0.0), _meta(4)).uncertain == []
+
+
+def test_uncertain_window_breaks_the_candidate_streak():
+    config = DetectorConfig(persist_windows=3)
+    state = DetectorState()
+    for _ in range(2):
+        analyze_window(_slow(), _meta(4), config, state)
+    gap = _slow()
+    gap[2] = _healthy_row(fwd=150.0, bwd=300.0, dropped=1.0)
+    analyze_window(gap, _meta(4), config, state)
+    for _ in range(2):
+        assert analyze_window(_slow(), _meta(4), config, state).alerts == []
+    assert _reasons(analyze_window(_slow(), _meta(4), config, state)) == [(2, "slow_device")]
+
+
+def test_uncertain_window_does_not_count_towards_recovery():
+    config = DetectorConfig(persist_windows=1, recover_windows=2)
+    state = DetectorState()
+    analyze_window(_slow(), _meta(4), config, state)
+    analyze_window(_clean(), _meta(4), config, state)
+    unsure = _clean()
+    unsure[2] = _healthy_row(unread=1.0)
+    held = analyze_window(unsure, _meta(4), config, state)
+    assert [(a.rank, a.reason) for a in held.alerts] == [(2, "slow_device")], "uncertain keeps the alert"
+    assert [(u.rank, u.cause) for u in held.uncertain] == [(2, "unread_events")]
+    assert analyze_window(_clean(), _meta(4), config, state).metrics["straggler/flagged/count"] == 1
+    assert analyze_window(_clean(), _meta(4), config, state).metrics["straggler/flagged/count"] == 0
+
+
+def test_uncertain_cause_is_new_only_when_it_changes():
+    state = DetectorState()
+    table = [_healthy_row(), _healthy_row(fwd=500.0)]
+    first = analyze_window(table, _meta(2, pp_size=2), DetectorConfig(), state)
+    second = analyze_window(table, _meta(2, pp_size=2), DetectorConfig(), state)
+    assert all(u.new for u in first.uncertain) and not any(u.new for u in second.uncertain)
 
 
 def test_token_heavy_rank_is_data_imbalance_not_slow_device():

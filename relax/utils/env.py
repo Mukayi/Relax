@@ -228,6 +228,7 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_STRAGGLER_Z_THRESHOLD = EnvProperty("RELAX_STRAGGLER_Z_THRESHOLD", float, 3.0)
     RELAX_STRAGGLER_REL_THRESHOLD = EnvProperty("RELAX_STRAGGLER_REL_THRESHOLD", float, 0.10)
     RELAX_STRAGGLER_PERSIST_WINDOWS = EnvProperty("RELAX_STRAGGLER_PERSIST_WINDOWS", int, 3)
+    RELAX_STRAGGLER_RECOVER_WINDOWS = EnvProperty("RELAX_STRAGGLER_RECOVER_WINDOWS", int, 2)
 
     # ------------- Compiled kernel cache -------------
     RELAX_KERNEL_CACHE_DIR = EnvProperty("RELAX_KERNEL_CACHE_DIR", str, None)

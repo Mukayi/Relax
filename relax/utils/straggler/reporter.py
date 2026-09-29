@@ -68,14 +68,14 @@ def _timeline_events(report: WindowReport) -> list[TimelineEvent]:
 
 
 def _format_table(report: WindowReport) -> str:
-    header = " | ".join(f"{column:>11}" for column in _TABLE_COLUMNS) + " | reason"
+    header = " | ".join(f"{column:>11}" for column in _TABLE_COLUMNS) + " | reason | uncertain"
     lines = [header]
     for row in report.rows:
         cells = []
         for column in _TABLE_COLUMNS:
             value = row[column]
             cells.append(f"{value:>11.1f}" if isinstance(value, float) else f"{str(value):>11}")
-        lines.append(" | ".join(cells) + f" | {row['reason']}")
+        lines.append(" | ".join(cells) + f" | {row['reason']} | {row.get('uncertain', '')}")
     return "\n".join(lines)
 
 
@@ -103,14 +103,20 @@ def report_straggler_window(args: Any, rollout_id: int, report: WindowReport) ->
     for alert in report.alerts:
         if alert.new:
             logger.warning("[straggler] step=%d %s", step, alert.message)
+    for recovery in report.recovered:
+        logger.warning("[straggler] step=%d %s", step, recovery.message)
+    for unsure in report.uncertain:
+        if unsure.new:
+            logger.warning("[straggler] step=%d %s", step, unsure.message)
     if report.alerts:
         logger.info("[straggler] step=%d per-rank window (ms/step):\n%s", step, _format_table(report))
     else:
         logger.info(
-            "[straggler] step=%d no straggler; self median %.1f ms max %.1f ms (rank %d, +%.0f%%), "
+            "[straggler] step=%d no straggler (uncertain %d); self median %.1f ms max %.1f ms (rank %d, +%.0f%%), "
             "latest to grad-sync rank %d by %.1f ms (peers idle %.1f ms), pp_stage_imbalance %.2f, "
             "overhead %.2f ms/step",
             step,
+            len(report.uncertain),
             metrics.get("straggler/self/median_ms", 0.0),
             metrics.get("straggler/self/max_ms", 0.0),
             int(metrics.get("straggler/self/max_rank", -1)),

@@ -85,6 +85,36 @@ def test_switch_off_report_logs_why_instead_of_a_healthy_summary(monkeypatch):
     assert infos == [], "a switched-off profiler must not print a 'no straggler' summary"
 
 
+def _capture(monkeypatch):
+    warnings, infos = [], []
+    monkeypatch.setattr(reporter.logger, "warning", lambda msg, *a: warnings.append(msg % a))
+    monkeypatch.setattr(reporter.logger, "info", lambda msg, *a: infos.append(msg % a))
+    return warnings, infos
+
+
+def test_new_uncertain_ranks_are_warned_once_and_counted_in_the_summary(monkeypatch):
+    warnings, infos = _capture(monkeypatch)
+    state = DetectorState()
+    table = [_row(fwd=100.0, tokens=1000.0), _row(fwd=500.0, tokens=1000.0)]
+    for _ in range(2):
+        report = analyze_window(table, _meta(2, pp_size=2), DetectorConfig(), state)
+        reporter.report_straggler_window(_args(), rollout_id=1, report=report)
+    assert len(warnings) == 2, "one WARNING per rank when it becomes uncertain, not every window"
+    assert all("uncertain" in line and "no other rank" in line for line in warnings)
+    assert len(infos) == 2 and all("uncertain 2" in line for line in infos)
+
+
+def test_recovery_is_logged_as_warning(monkeypatch):
+    warnings, _ = _capture(monkeypatch)
+    config, state = DetectorConfig(persist_windows=1, recover_windows=1), DetectorState()
+    slow = [_row(fwd=100.0, bwd=200.0, tokens=1000.0) for _ in range(4)]
+    slow[1] = _row(fwd=150.0, bwd=300.0, tokens=1000.0)
+    analyze_window(slow, _meta(4), config, state)
+    clean = [_row(fwd=100.0, bwd=200.0, tokens=1000.0) for _ in range(4)]
+    reporter.report_straggler_window(_args(), rollout_id=2, report=analyze_window(clean, _meta(4), config, state))
+    assert len(warnings) == 1 and "recovered from slow_device" in warnings[0]
+
+
 def test_alert_is_logged_as_warning_with_table(monkeypatch):
     warnings, infos = [], []
     monkeypatch.setattr(reporter.logger, "warning", lambda msg, *a: warnings.append(msg % a))

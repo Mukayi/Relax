@@ -25,6 +25,14 @@ Two independent signals are checked:
 
 Segment times come from events on the compute stream, so they include host
 launch gaps inside the bracket; "GPU time" below is shorthand for that.
+
+A rank whose window cannot support a verdict is reported as **uncertain**
+with a cause instead of silently passing: its timing is incomplete (dropped or
+still-unread event pairs, caught profiler errors), it has no stage peer to
+compare with, or it looks slow but its stage has no token counts to rule out
+data imbalance. An uncertain window never counts as evidence either way: it
+breaks candidate streaks and does not count towards clearing an alert, which
+needs ``recover_windows`` consecutive clean windows.
 """
 
 from __future__ import annotations
@@ -46,6 +54,16 @@ from relax.utils.straggler.stats import (
 # Order is part of the metric contract (``straggler/flagged/reason`` logs the code).
 REASONS: tuple[str, ...] = ("none", "slow_device", "data_imbalance", "upstream_wait", "cpu_bound", "late_arrival")
 REASON_CODE: dict[str, int] = {reason: code for code, reason in enumerate(REASONS)}
+# Checked in this order; ``straggler/uncertain/cause`` logs the code.
+UNCERTAIN_CAUSES: tuple[str, ...] = (
+    "none",
+    "dropped_events",
+    "unread_events",
+    "profiler_errors",
+    "no_peers",
+    "missing_tokens",
+)
+UNCERTAIN_CODE: dict[str, int] = {cause: code for code, cause in enumerate(UNCERTAIN_CAUSES)}
 
 _EPS = 1e-9
 
@@ -76,6 +94,8 @@ class DetectorConfig:
     z_threshold: float = 3.0
     rel_threshold: float = 0.10
     persist_windows: int = 3
+    # Consecutive clean (neither candidate nor uncertain) windows before an alert clears.
+    recover_windows: int = 2
     # A slow rank whose GC pauses are at least this fraction of its compute is ``cpu_bound``.
     gc_ratio_threshold: float = 0.05
     # Extra PP waiting / DP lateness must be at least this fraction of the stage's
@@ -92,6 +112,10 @@ class DetectorState:
     # ``upstream_wait`` streaks are kept apart from ``consecutive`` so windows
     # spent as a victim never count towards flagging the same rank as a culprit.
     waiting: dict[int, int] = field(default_factory=dict)
+    # Consecutive clean windows of ranks that currently hold an alert.
+    clean: dict[int, int] = field(default_factory=dict)
+    # Uncertain cause per rank in the previous window.
+    uncertain: dict[int, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -105,6 +129,26 @@ class Alert:
     new: bool
 
 
+@dataclass(frozen=True)
+class Uncertain:
+    """A rank whose window supports no verdict; ``new`` when the cause
+    changed."""
+
+    rank: int
+    cause: str
+    message: str
+    new: bool
+
+
+@dataclass(frozen=True)
+class Recovery:
+    """A rank whose alert cleared after ``recover_windows`` clean windows."""
+
+    rank: int
+    reason: str
+    message: str
+
+
 @dataclass
 class WindowReport:
     """Scalars, alerts and per-rank rows produced by one ``analyze_window``."""
@@ -116,6 +160,8 @@ class WindowReport:
     window_start_wall: float = 0.0
     # Free-text status for the log, e.g. why the profiler switched itself off.
     note: str = ""
+    uncertain: list[Uncertain] = field(default_factory=list)
+    recovered: list[Recovery] = field(default_factory=list)
 
 
 def _leave_one_out_median(values: np.ndarray) -> np.ndarray:
@@ -192,6 +238,22 @@ def _column(table: np.ndarray, name: str) -> np.ndarray:
     return table[:, FIELD_INDEX[name]]
 
 
+def _uncertain_message(
+    rank_meta: RankMeta, cause: str, *, dropped: float, unread: float, errors: float, self_ms: float, rel_self: float
+) -> str:
+    detail = {
+        "dropped_events": f"{dropped:.0f} event pairs were dropped (pending queue full), so its segment totals are "
+        "incomplete",
+        "unread_events": f"{unread:.0f} event pairs were still in flight when the window closed; their time lands in "
+        "the next window",
+        "profiler_errors": f"the profiler caught {errors:.0f} errors on this rank during the window",
+        "no_peers": "its pipeline stage has no other rank to compare with",
+        "missing_tokens": f"its compute is {1 + rel_self:.2f}x its stage peers ({self_ms:.1f} ms/step) but the stage "
+        "has no token counts, so data imbalance cannot be ruled out",
+    }[cause]
+    return f"rank {rank_meta.rank} ({rank_meta.tag}) is uncertain: {detail}"
+
+
 def analyze_window(
     table: Sequence[Sequence[float]],
     meta: Sequence[RankMeta],
@@ -238,6 +300,8 @@ def analyze_window(
     stage_self_of = np.zeros(world)
     segment_rel = {name: np.zeros(world) for name in GPU_SEGMENTS}
     stage_median_self: dict[int, float] = {}
+    group_size = np.zeros(world)
+    group_has_tokens = np.zeros(world, dtype=bool)
 
     groups: dict[int, list[int]] = {}
     for index, rank_meta in enumerate(meta):
@@ -245,6 +309,8 @@ def analyze_window(
 
     for pp, members in groups.items():
         idx = np.asarray(members)
+        group_size[idx] = idx.shape[0]
+        group_has_tokens[idx] = bool(np.all(tokens[idx] > 0))
         stage_median_self[pp] = float(np.median(self_ms[idx]))
         stage_self_of[idx] = stage_median_self[pp]
         rel_self[idx], z_self[idx], _ = _relative_and_z(self_ms[idx])
@@ -283,34 +349,69 @@ def analyze_window(
     )
 
     self_candidates = (rel_self >= config.rel_threshold) & (z_self >= config.z_threshold)
+
+    causes: list[str] = []
+    for index in range(world):
+        if dropped[index] > 0:
+            causes.append("dropped_events")
+        elif unread[index] > 0:
+            causes.append("unread_events")
+        elif errors[index] > 0:
+            causes.append("profiler_errors")
+        elif group_size[index] < 2:
+            causes.append("no_peers")
+        elif self_candidates[index] and not group_has_tokens[index]:
+            causes.append("missing_tokens")
+        else:
+            causes.append("")
+    certain = np.asarray([not cause for cause in causes], dtype=bool)
+
+    self_candidates &= certain
+    late_candidates &= certain
     candidates = self_candidates | late_candidates
     wait_candidates = (
-        ~candidates
+        certain
+        & ~candidates
         & (pp_recv > _EPS)
         & (rel_recv >= config.rel_threshold)
         & (z_recv >= config.z_threshold)
         & (pp_recv - peer_recv >= config.wait_abs_frac * stage_self_of)
     )
     for index, rank_meta in enumerate(meta):
+        rank = rank_meta.rank
+        if not certain[index]:
+            # No evidence either way: a streak cannot span this window, and it
+            # is not a clean window for recovery.
+            for streaks in (state.consecutive, state.waiting, state.clean):
+                streaks.pop(rank, None)
+            continue
         for streaks, hit in ((state.consecutive, candidates[index]), (state.waiting, wait_candidates[index])):
             if hit:
-                streaks[rank_meta.rank] = streaks.get(rank_meta.rank, 0) + 1
+                streaks[rank] = streaks.get(rank, 0) + 1
             else:
-                streaks.pop(rank_meta.rank, None)
+                streaks.pop(rank, None)
+        if rank in state.active:
+            if candidates[index] or wait_candidates[index]:
+                state.clean.pop(rank, None)
+            else:
+                state.clean[rank] = state.clean.get(rank, 0) + 1
 
     alerts: list[Alert] = []
+    uncertain: list[Uncertain] = []
+    recovered: list[Recovery] = []
     rows: list[dict[str, float | int | str]] = []
     new_active: dict[int, str] = {}
+    new_uncertain: dict[int, str] = {}
     fwd = _column(x, "fwd")
     cpu_fwd = _column(x, "cpu_fwd")
     gc_ms = _column(x, "gc")
 
     for index, rank_meta in enumerate(meta):
         reason, message = "none", ""
-        if state.consecutive.get(rank_meta.rank, 0) >= config.persist_windows:
+        if certain[index] and state.consecutive.get(rank_meta.rank, 0) >= config.persist_windows:
             who = f"rank {rank_meta.rank} ({rank_meta.tag}, host={rank_meta.host}, gpu={rank_meta.device})"
             if self_candidates[index]:
-                if has_tokens and rel_tok[index] >= config.rel_threshold and rel_ktok[index] < config.rel_threshold:
+                if rel_tok[index] >= config.rel_threshold and rel_ktok[index] < config.rel_threshold:
                     reason = "data_imbalance"
                 elif self_ms[index] > _EPS and gc_ms[index] / self_ms[index] >= config.gc_ratio_threshold:
                     reason = "cpu_bound"
@@ -332,16 +433,52 @@ def analyze_window(
                     f"is {1 + rel_self[index]:.2f}x peers, gc {gc_ms[index]:.1f} ms, cpu/gpu fwd "
                     f"{cpu_fwd[index] / fwd[index] if fwd[index] > _EPS else 0.0:.2f}x -> {reason} (host-side stall)"
                 )
-        elif state.waiting.get(rank_meta.rank, 0) >= config.persist_windows:
+        elif certain[index] and state.waiting.get(rank_meta.rank, 0) >= config.persist_windows:
             reason = "upstream_wait"
             message = (
                 f"rank {rank_meta.rank} ({rank_meta.tag}) waits on PP peers {pp_recv[index]:.1f} ms/step = "
                 f"{1 + rel_recv[index]:.2f}x its stage for {state.waiting[rank_meta.rank]} windows; "
                 "its own compute is normal"
             )
+        previous = state.active.get(rank_meta.rank)
+        if reason == "none" and previous is not None:
+            clean = state.clean.get(rank_meta.rank, 0)
+            if not certain[index] or clean < config.recover_windows:
+                reason = previous
+                message = (
+                    f"rank {rank_meta.rank} ({rank_meta.tag}) still {previous}: {clean}/{config.recover_windows} "
+                    "clean windows" + (f", this window uncertain ({causes[index]})" if causes[index] else "")
+                )
+            else:
+                state.clean.pop(rank_meta.rank, None)
+                recovered.append(
+                    Recovery(
+                        rank_meta.rank,
+                        previous,
+                        f"rank {rank_meta.rank} ({rank_meta.tag}) recovered from {previous} after {clean} clean windows",
+                    )
+                )
         if reason != "none":
             new_active[rank_meta.rank] = reason
-            alerts.append(Alert(rank_meta.rank, reason, message, new=state.active.get(rank_meta.rank) != reason))
+            alerts.append(Alert(rank_meta.rank, reason, message, new=previous != reason))
+        if causes[index]:
+            new_uncertain[rank_meta.rank] = causes[index]
+            uncertain.append(
+                Uncertain(
+                    rank_meta.rank,
+                    causes[index],
+                    _uncertain_message(
+                        rank_meta,
+                        causes[index],
+                        dropped=dropped[index],
+                        unread=unread[index],
+                        errors=errors[index],
+                        self_ms=self_ms[index],
+                        rel_self=rel_self[index],
+                    ),
+                    new=state.uncertain.get(rank_meta.rank) != causes[index],
+                )
+            )
         rows.append(
             {
                 "rank": rank_meta.rank,
@@ -355,10 +492,12 @@ def analyze_window(
                 "ms_per_ktok": float(per_ktok[index]),
                 "gc_ms": float(gc_ms[index]),
                 "reason": reason,
+                "uncertain": causes[index],
                 **{name: float(_column(x, name)[index]) for name in GPU_SEGMENTS},
             }
         )
     state.active = new_active
+    state.uncertain = new_uncertain
 
     metrics: dict[str, float] = {}
 
@@ -395,6 +534,10 @@ def analyze_window(
     metrics["straggler/flagged/rank"] = float(flagged[0][0]) if flagged else -1.0
     metrics["straggler/flagged/reason"] = float(REASON_CODE[flagged[0][1]]) if flagged else 0.0
     metrics["straggler/waiting/count"] = float(sum(reason == "upstream_wait" for reason in new_active.values()))
+    metrics["straggler/uncertain/count"] = float(len(uncertain))
+    metrics["straggler/uncertain/rank"] = float(uncertain[0].rank) if uncertain else -1.0
+    metrics["straggler/uncertain/cause"] = float(UNCERTAIN_CODE[uncertain[0].cause]) if uncertain else 0.0
+    metrics["straggler/recovered/count"] = float(len(recovered))
     stage_values = [value for value in stage_median_self.values() if value > _EPS]
     metrics["straggler/pp_stage_imbalance"] = (
         float(max(stage_values) / min(stage_values)) if len(stage_values) > 1 else 1.0
@@ -406,4 +549,4 @@ def analyze_window(
     metrics["straggler/health/errors"] = float(np.sum(errors))
     metrics["straggler/health/degraded_ranks"] = float(np.sum(health > 0))
 
-    return WindowReport(metrics=metrics, alerts=alerts, rows=rows)
+    return WindowReport(metrics=metrics, alerts=alerts, rows=rows, uncertain=uncertain, recovered=recovered)
