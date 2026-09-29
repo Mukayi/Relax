@@ -119,8 +119,10 @@ Exceptions in the timer calls, the event read-out, the window gather, the analys
 
 - `relax/utils/straggler/timers.py`: the non-blocking drop-in for Megatron's `config.timers` (Megatron's own `Timer.start/stop` call `cuda.synchronize()`, which is why Relax sets it to `None` when the profiler is off).
 - `relax/utils/straggler/stats.py`: the statistics vector layout and the Megatron timer name → segment map.
-- `relax/utils/straggler/collector.py`: per-rank event pool, lazy read-out, GC callbacks, Gloo gather, and the background analysis thread on the primary rank.
+- `relax/utils/straggler/collector.py`: per-rank event pool, lazy read-out, GC callbacks, the per-window gather; torch-free, with events and gathers injected.
+- `relax/utils/straggler/worker.py`: the background thread on the primary rank that runs the analyses in order.
 - `relax/utils/straggler/detector.py`: pure-numpy window analysis (including uncertain verdicts and alert clearing), unit-testable without a GPU.
 - `relax/utils/straggler/health.py`: the profiler's own health (active → degraded → disabled).
 - `relax/utils/straggler/reporter.py`: metrics / timeline output (training thread), log output (background thread) and report latency.
-- Wiring: `relax/backends/megatron/model.py` (`config.timers = straggler_timers(...)` at three sites) and `relax/backends/megatron/actor.py` (`install_straggler_collector`, per-step `_straggler_end_step` and `_straggler_delivered`).
+- `relax/utils/straggler/runtime.py`: the only module that touches CUDA, the process groups or Megatron's parallel state; `StragglerProfiler` does the per-step reporting around `log_perf_data`.
+- Wiring: `relax/backends/megatron/model.py` (`config.timers = straggler_timers(...)` at three sites) and `relax/backends/megatron/actor.py` (`install_straggler_profiler`, per-step `_log_perf_data`).

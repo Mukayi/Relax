@@ -119,8 +119,10 @@ closed; their time lands in the next window
 
 - `relax/utils/straggler/timers.py`：替代 Megatron `config.timers` 的非阻塞计时器（Megatron 自带的 `Timer.start/stop` 会 `cuda.synchronize()`，所以不开 profiler 时 Relax 把它设为 `None`）。
 - `relax/utils/straggler/stats.py`：统计向量布局、Megatron timer 名 → 段的映射。
-- `relax/utils/straggler/collector.py`：每 rank 一个，事件池、惰性读取、GC 回调、Gloo 汇聚、primary 上的后台判定线程。
+- `relax/utils/straggler/collector.py`：每 rank 一个，事件池、惰性读取、GC 回调、每个窗口的 gather；不依赖 torch，事件、gather 等由外部传入。
+- `relax/utils/straggler/worker.py`：primary 上按顺序执行判定的后台线程。
 - `relax/utils/straggler/detector.py`：纯 numpy 的窗口分析与判定（含「不确定」与告警解除），可在无 GPU 环境单测。
 - `relax/utils/straggler/health.py`：分析器自身的健康状态（active → degraded → disabled）。
 - `relax/utils/straggler/reporter.py`：指标 / timeline 输出（训练线程）与日志输出（后台线程）、上报时延。
-- 接线：`relax/backends/megatron/model.py`（`config.timers = straggler_timers(...)` 三处）、`relax/backends/megatron/actor.py`（`install_straggler_collector`、每步 `_straggler_end_step` 与 `_straggler_delivered`）。
+- `relax/utils/straggler/runtime.py`：唯一接触 CUDA、进程组和 Megatron 并行状态的模块；`StragglerProfiler` 负责每步在 `log_perf_data` 前后的上报。
+- 接线：`relax/backends/megatron/model.py`（`config.timers = straggler_timers(...)` 三处）、`relax/backends/megatron/actor.py`（`install_straggler_profiler`，每步 `_log_perf_data`）。
