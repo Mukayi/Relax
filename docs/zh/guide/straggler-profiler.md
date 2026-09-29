@@ -124,5 +124,5 @@ closed; their time lands in the next window
 - `relax/utils/straggler/detector.py`：纯 numpy 的窗口分析与判定（含「不确定」与告警解除），可在无 GPU 环境单测。
 - `relax/utils/straggler/health.py`：分析器自身的健康状态（active → degraded → disabled）。
 - `relax/utils/straggler/reporter.py`：指标 / timeline 输出（训练线程）与日志输出（后台线程）、上报时延。
-- `relax/utils/straggler/runtime.py`：唯一接触 CUDA、进程组和 Megatron 并行状态的模块；`StragglerProfiler` 负责每步在 `log_perf_data` 前后的上报。
+- `relax/utils/straggler/runtime.py`：唯一接触加速器（经 `relax.utils.device`，CUDA / NPU 通用）、进程组和 Megatron 并行状态的模块；`StragglerProfiler` 负责每步在 `log_perf_data` 前后的上报。
 - 接线：`relax/backends/megatron/model.py`（`config.timers = straggler_timers(...)` 三处）、`relax/backends/megatron/actor.py`（`install_straggler_profiler`，每步 `_log_perf_data`）。
