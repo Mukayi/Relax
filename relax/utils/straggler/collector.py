@@ -126,6 +126,7 @@ class _WindowJob:
     window_start_wall: float
     first_rollout: int
     last_rollout: int
+    closed_wall: float = 0.0
     gather_ms: float = 0.0
     ready: WindowReport | None = None
 
@@ -202,6 +203,7 @@ class StragglerCollector:
         background: bool = True,
         on_report: Callable[[WindowReport], None] | None = None,
         max_backlog: int = 4,
+        wall_clock: Callable[[], float] = time,
     ) -> None:
         if report_interval < 1:
             raise ValueError(
@@ -217,7 +219,8 @@ class StragglerCollector:
         self._max_pending = max_pending
         self._pending: deque[tuple[int, Any, Any, float]] = deque()
         self._window = WindowStats()
-        self.window_start_wall = time()
+        self._wall = wall_clock
+        self.window_start_wall = wall_clock()
         self._gather = gather
         self._gather_objects = gather_objects
         self._clock = clock
@@ -367,6 +370,7 @@ class StragglerCollector:
         return self._take_reports()
 
     def _close_window(self) -> None:
+        closed_wall = self._wall()
         errors, code = self.health.close_window(self._window.get("dropped"))
         if code >= HEALTH_DISABLE:
             logger.warning(
@@ -409,14 +413,14 @@ class StragglerCollector:
                     rows=[],
                     note=note,
                 )
-                self._submit(self._job(None, ready=notice))
+                self._submit(self._job(None, closed_wall=closed_wall, ready=notice))
             self._disable(note)
             return
 
         if self.is_primary:
-            self._submit(self._job(table, gather_ms=(gathered - started) * 1e3))
+            self._submit(self._job(table, closed_wall=closed_wall, gather_ms=(gathered - started) * 1e3))
         self._window.reset()
-        self.window_start_wall = time()
+        self.window_start_wall = self._wall()
         self._window_first_rollout = None
 
     def _job(self, table: list[list[float]] | None, **kwargs: Any) -> _WindowJob:
@@ -465,6 +469,8 @@ class StragglerCollector:
             report.window_start_wall = job.window_start_wall
         report.first_rollout = job.first_rollout
         report.last_rollout = job.last_rollout
+        report.closed_wall = job.closed_wall
+        report.analyzed_wall = self._wall()
         if self._on_report is not None:
             try:
                 self._on_report(report)

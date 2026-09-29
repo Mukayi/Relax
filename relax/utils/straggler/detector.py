@@ -163,6 +163,12 @@ class WindowReport:
     # Rollouts covered by the window; the report may be emitted a rollout or so later.
     first_rollout: int = -1
     last_rollout: int = -1
+    # Wall-clock times for the report-latency measurement: the window closed
+    # (before the gather), the analysis finished (alerts are logged right then),
+    # and the training thread handed the scalars to the metrics call.
+    closed_wall: float = 0.0
+    analyzed_wall: float = 0.0
+    emitted_wall: float = 0.0
     uncertain: list[Uncertain] = field(default_factory=list)
     recovered: list[Recovery] = field(default_factory=list)
 

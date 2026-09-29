@@ -12,6 +12,7 @@ lines.
 
 from __future__ import annotations
 
+from time import time
 from typing import Any
 
 from relax.utils.logging_utils import get_logger
@@ -80,7 +81,7 @@ def _format_table(report: WindowReport) -> str:
     return "\n".join(lines)
 
 
-def report_straggler_window(args: Any, report: WindowReport) -> dict[str, float]:
+def report_straggler_window(args: Any, report: WindowReport, now: float | None = None) -> dict[str, float]:
     """Emit timeline events for one window and return its scalars (primary
     rank, training thread).
 
@@ -90,14 +91,41 @@ def report_straggler_window(args: Any, report: WindowReport) -> dict[str, float]
     finishing instead of paying for a second request. That step can be later
     than the window, hence ``straggler/window/*``.
     """
+    report.emitted_wall = time() if now is None else now
     metrics = report.metrics
     metrics["straggler/window/first_rollout"] = float(report.first_rollout)
     metrics["straggler/window/last_rollout"] = float(report.last_rollout)
+    if report.closed_wall > 0.0:
+        metrics["straggler/latency/analyzed_ms"] = (report.analyzed_wall - report.closed_wall) * 1e3
+        metrics["straggler/latency/emitted_ms"] = (report.emitted_wall - report.closed_wall) * 1e3
     if getattr(args, "timeline_dump_dir", None) and metrics.get("straggler/health/state", 0.0) < HEALTH_DISABLE:
         # These ride out (and get their step stamped) with the ``log_perf_data``
         # call the actor makes right after this function.
         Timer().records.extend(_timeline_events(report))
     return metrics
+
+
+def log_straggler_delivery(args: Any, report: WindowReport, rollout_id: int, now: float | None = None) -> float:
+    """Log how long one window took to reach the tracking backend and return
+    close-to-delivered in ms.
+
+    Called right after the ``log_perf_data`` that carried the report's
+    scalars returned. With ``--use-metrics-service`` that call is a
+    synchronous HTTP request, so "delivered" means the metrics service
+    acknowledged it; with TensorBoard / WandB it means the writer accepted it.
+    """
+    delivered_ms = ((time() if now is None else now) - report.closed_wall) * 1e3
+    logger.info(
+        "[straggler] step=%d window rollouts %d-%d: closed -> analyzed +%.1f ms (alerts logged), emitted +%.1f ms, "
+        "delivered +%.1f ms",
+        compute_rollout_step(args, rollout_id),
+        report.first_rollout,
+        report.last_rollout,
+        (report.analyzed_wall - report.closed_wall) * 1e3,
+        (report.emitted_wall - report.closed_wall) * 1e3,
+        delivered_ms,
+    )
+    return delivered_ms
 
 
 def log_straggler_window(args: Any, report: WindowReport) -> None:

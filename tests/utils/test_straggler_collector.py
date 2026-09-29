@@ -187,6 +187,20 @@ def test_gather_and_analysis_are_timed_separately(monkeypatch):
     assert report.metrics["straggler/analyze_ms"] == pytest.approx(7.0)
 
 
+def test_report_carries_window_close_and_analysis_wall_times():
+    now = [0.0]
+
+    def wall():
+        now[0] += 1.0
+        return now[0]
+
+    collector = _collector(world=2, interval=1, wall_clock=wall)  # window start = 1
+    _one_bracket(collector)
+    (report,) = collector.end_step()
+    assert (report.window_start_wall, report.closed_wall, report.analyzed_wall) == (1.0, 2.0, 3.0)
+    assert collector.window_start_wall == 4.0
+
+
 def test_non_primary_rank_participates_but_returns_no_report():
     collector = _collector(world=2, interval=1, is_primary=False)
     _one_bracket(collector)

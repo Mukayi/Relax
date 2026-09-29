@@ -67,6 +67,26 @@ def test_scalars_carry_the_rollout_range_of_their_window():
     assert metrics["straggler/window/last_rollout"] == 19.0
 
 
+def test_scalars_include_close_to_analysis_and_close_to_emit_latency():
+    report = _report()
+    report.closed_wall, report.analyzed_wall = 100.0, 100.004
+    metrics = reporter.report_straggler_window(_args(), report=report, now=100.9)
+    assert metrics["straggler/latency/analyzed_ms"] == pytest.approx(4.0)
+    assert metrics["straggler/latency/emitted_ms"] == pytest.approx(900.0)
+
+
+def test_delivery_line_reports_every_stage_and_returns_close_to_delivered(captured):
+    _, infos = captured
+    report = _report(first_rollout=10, last_rollout=19)
+    report.closed_wall, report.analyzed_wall = 100.0, 100.004
+    reporter.report_straggler_window(_args(), report=report, now=100.9)
+    delivered_ms = reporter.log_straggler_delivery(_args(), report, rollout_id=20, now=101.2)
+    assert delivered_ms == pytest.approx(1200.0)
+    (line,) = infos
+    for piece in ("rollouts 10-19", "analyzed +4.0 ms", "emitted +900.0 ms", "delivered +1200.0 ms", "step=20"):
+        assert piece in line, (piece, line)
+
+
 def test_timeline_events_one_row_per_rank_when_enabled(records):
     reporter.report_straggler_window(_args(timeline_dump_dir="/tmp/tl"), report=_report())
     events = list(records)

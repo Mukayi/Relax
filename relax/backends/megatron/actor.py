@@ -97,7 +97,12 @@ from relax.utils.utils import (
 )
 
 from ...utils.profile_utils import TrainProfiler
-from ...utils.straggler import install_straggler_collector, log_straggler_window, report_straggler_window
+from ...utils.straggler import (
+    install_straggler_collector,
+    log_straggler_delivery,
+    log_straggler_window,
+    report_straggler_window,
+)
 from ...utils.training.tensor_backper import TensorBackuper
 from .checkpoint import load_checkpoint
 from .collective_utils import _agree_drained
@@ -388,6 +393,8 @@ class MegatronTrainRayActor(TrainRayActor):
         # up its ``timers`` from the collector when it is built. Only the actor
         # role drives ``_straggler_end_step``; other roles get ``None``.
         self.straggler = install_straggler_collector(role, on_report=partial(log_straggler_window, args))
+        self._straggler_emitted = None
+        self._straggler_delivered_ms: float | None = None
 
         # read config and tokenizer serialized to prevent concurrent writing bug.
         for i in range(args.num_gpus_per_node):
@@ -1758,6 +1765,7 @@ class MegatronTrainRayActor(TrainRayActor):
             Timer().audio_seqlens = sum(all_audio_seqlens, [])
         straggler_metrics = self._straggler_end_step(rollout_id, total_lengths)
         log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter, extra_metrics=straggler_metrics)
+        self._straggler_delivered(rollout_id)
 
         is_train_done = (rollout_id + 1) == self.args.num_rollout
         if self.args.save is not None and (
@@ -2218,6 +2226,7 @@ class MegatronTrainRayActor(TrainRayActor):
             Timer().audio_seqlens = sum(all_audio_seqlens, [])
         straggler_metrics = self._straggler_end_step(rollout_id, total_lengths)
         log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter, extra_metrics=straggler_metrics)
+        self._straggler_delivered(rollout_id)
 
         is_train_done = (rollout_id + 1) == self.args.num_rollout
         if self.args.save is not None and (
@@ -2380,6 +2389,7 @@ class MegatronTrainRayActor(TrainRayActor):
             Timer().audio_seqlens = sum(all_audio_seqlens, [])
         straggler_metrics = self._straggler_end_step(rollout_id, total_lengths)
         log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter, extra_metrics=straggler_metrics)
+        self._straggler_delivered(rollout_id)
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
 
     def _straggler_end_step(self, rollout_id: int, total_lengths: Sequence[int]) -> dict[str, float] | None:
@@ -2397,12 +2407,29 @@ class MegatronTrainRayActor(TrainRayActor):
         self.straggler.add_tokens(int(sum(total_lengths)))
         metrics: dict[str, float] = {}
         final = (rollout_id + 1) == self.args.num_rollout
-        for report in self.straggler.end_step(rollout_id, final=final):
+        reports = self.straggler.end_step(rollout_id, final=final)
+        for report in reports:
             try:
                 metrics.update(report_straggler_window(self.args, report))
             except Exception as exc:
                 self.straggler.on_error("report", exc)
+        if reports:
+            self._straggler_emitted = reports[-1]
+            if self._straggler_delivered_ms is not None:
+                # A report cannot carry its own delivery time, so each one carries the previous one's.
+                metrics["straggler/latency/prev_delivered_ms"] = self._straggler_delivered_ms
         return metrics or None
+
+    def _straggler_delivered(self, rollout_id: int) -> None:
+        """Log close-to-delivered latency for the window whose scalars the
+        ``log_perf_data`` call that just returned carried."""
+        report, self._straggler_emitted = self._straggler_emitted, None
+        if report is None:
+            return
+        try:
+            self._straggler_delivered_ms = log_straggler_delivery(self.args, report, rollout_id)
+        except Exception as exc:
+            self.straggler.on_error("report", exc)
 
     @timer
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:

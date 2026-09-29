@@ -9,11 +9,12 @@ and timer internals live in their own modules.
 """
 
 from relax.utils.straggler.collector import install_straggler_collector, straggler_timers
-from relax.utils.straggler.reporter import log_straggler_window, report_straggler_window
+from relax.utils.straggler.reporter import log_straggler_delivery, log_straggler_window, report_straggler_window
 
 
 __all__ = [
     "install_straggler_collector",
+    "log_straggler_delivery",
     "log_straggler_window",
     "report_straggler_window",
     "straggler_timers",
