@@ -97,7 +97,7 @@ from relax.utils.utils import (
 )
 
 from ...utils.profile_utils import TrainProfiler
-from ...utils.straggler import install_straggler_collector, report_straggler_window
+from ...utils.straggler import install_straggler_collector, log_straggler_window, report_straggler_window
 from ...utils.training.tensor_backper import TensorBackuper
 from .checkpoint import load_checkpoint
 from .collective_utils import _agree_drained
@@ -387,7 +387,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # Must precede initialize_model_and_optimizer: the optimizer config picks
         # up its ``timers`` from the collector when it is built. Only the actor
         # role drives ``_straggler_end_step``; other roles get ``None``.
-        self.straggler = install_straggler_collector(role)
+        self.straggler = install_straggler_collector(role, on_report=partial(log_straggler_window, args))
 
         # read config and tokenizer serialized to prevent concurrent writing bug.
         for i in range(args.num_gpus_per_node):
@@ -2385,19 +2385,21 @@ class MegatronTrainRayActor(TrainRayActor):
     def _straggler_end_step(self, rollout_id: int, total_lengths: Sequence[int]) -> dict[str, float] | None:
         """Close this step in the straggler collector (all ranks; contains a
         Gloo collective every ``report_interval`` steps) and, on the primary
-        rank, return the scalars of any finished window for ``log_perf_data``.
+        rank, return the scalars of any window whose background analysis has
+        finished (usually the one that closed on the previous step) for this
+        step's ``log_perf_data``.
 
-        The collector never raises; the reporter runs on the training thread
-        too, so it is guarded the same way (a profiler bug must not stop
-        training).
+        The collector never raises; the reporter runs on the training thread,
+        so it is guarded the same way (a profiler bug must not stop training).
         """
         if self.straggler is None:
             return None
         self.straggler.add_tokens(int(sum(total_lengths)))
         metrics: dict[str, float] = {}
-        for report in self.straggler.end_step(rollout_id):
+        final = (rollout_id + 1) == self.args.num_rollout
+        for report in self.straggler.end_step(rollout_id, final=final):
             try:
-                metrics.update(report_straggler_window(self.args, rollout_id, report))
+                metrics.update(report_straggler_window(self.args, report))
             except Exception as exc:
                 self.straggler.on_error("report", exc)
         return metrics or None

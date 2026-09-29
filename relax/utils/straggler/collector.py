@@ -6,7 +6,10 @@ Hot path (called from Megatron's timer call sites and module hooks):
 current stream. Cold path (once per training step, from the actor):
 ``end_step`` reads back completed event pairs with ``event.query()`` -- never
 ``synchronize`` -- and every ``report_interval`` steps gathers one small vector
-per rank over the Gloo group and runs the detector on the primary rank.
+per rank over the Gloo group. The primary rank hands the gathered table to one
+background thread for analysis, so no rank waits on the primary's analysis at
+its next collective; finished reports are picked up by a later ``end_step``
+(normally the next one) and carry the rollout range of their window.
 
 A "step" throughout this package is one ``end_step`` call, i.e. one rollout,
 which may contain several optimizer steps.
@@ -15,8 +18,11 @@ which may contain several optimizer steps.
 from __future__ import annotations
 
 import gc
+import queue
 import socket
+import threading
 from collections import deque
+from dataclasses import dataclass
 from time import perf_counter, time
 from typing import Any, Callable
 
@@ -48,6 +54,9 @@ _HEALTH_INDEX = FIELD_INDEX["health"]
 # gets a collector; critic / reference / actor_fwd actors would only fill the
 # pending queue and never drain it.
 PROFILED_ROLES: frozenset[str] = frozenset({"actor"})
+
+# An analysis takes milliseconds (35 ms at 2048 ranks); this only bounds a stuck worker at the end of a run.
+_FINAL_FLUSH_TIMEOUT_S = 10.0
 
 GatherFn = Callable[[list[float]], list[list[float]]]
 GatherObjectsFn = Callable[[Any], list[Any]]
@@ -106,6 +115,70 @@ def _local_rank_meta() -> RankMeta:
     )
 
 
+@dataclass
+class _WindowJob:
+    """One closed window on its way to the analysis; ``ready`` carries a
+    report that needs no analysis (the switch-off notice) through the same
+    queue so reports stay in window order."""
+
+    table: list[list[float]] | None
+    meta: list[RankMeta]
+    window_start_wall: float
+    first_rollout: int
+    last_rollout: int
+    gather_ms: float = 0.0
+    ready: WindowReport | None = None
+
+
+class _AnalysisWorker:
+    """One daemon thread that handles queued jobs in submission order.
+
+    Daemon so that a stuck analysis can never hold up process exit; ``handle``
+    must not raise.
+    """
+
+    def __init__(self, handle: Callable[[_WindowJob], None], name: str = "straggler-analyze") -> None:
+        self._handle = handle
+        self._queue: queue.Queue[_WindowJob | None] = queue.Queue()
+        self._pending = 0
+        self._cond = threading.Condition()
+        self._stopped = False
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+        self._thread.start()
+
+    @property
+    def backlog(self) -> int:
+        return self._pending
+
+    def submit(self, job: _WindowJob) -> None:
+        with self._cond:
+            self._pending += 1
+        self._queue.put(job)
+
+    def flush(self, timeout: float | None) -> bool:
+        """Wait until every submitted job has been handled."""
+        with self._cond:
+            return self._cond.wait_for(lambda: self._pending == 0, timeout)
+
+    def stop(self) -> None:
+        """Let already-queued jobs finish, then end the thread."""
+        if not self._stopped:
+            self._stopped = True
+            self._queue.put(None)
+
+    def _run(self) -> None:
+        while True:
+            job = self._queue.get()
+            if job is None:
+                return
+            try:
+                self._handle(job)
+            finally:
+                with self._cond:
+                    self._pending -= 1
+                    self._cond.notify_all()
+
+
 class StragglerCollector:
     """Queue this rank's timing events, fold them lazily, and gather one window
     every ``report_interval`` steps."""
@@ -126,7 +199,9 @@ class StragglerCollector:
         register_gc_callback: bool = True,
         is_capturing: Callable[[], bool] = _is_stream_capturing,
         health_config: HealthConfig | None = None,
-        background: bool = False,
+        background: bool = True,
+        on_report: Callable[[WindowReport], None] | None = None,
+        max_backlog: int = 4,
     ) -> None:
         if report_interval < 1:
             raise ValueError(
@@ -156,7 +231,13 @@ class StragglerCollector:
         self.health = ProfilerHealth(health_config)
         # Plain attribute (not ``health.disabled``) because ``record_event`` checks it on every bracket.
         self._disabled = False
+        # Appended by the worker, drained by ``end_step`` (deque append / popleft are atomic).
         self._reports: deque[WindowReport] = deque()
+        self._on_report = on_report
+        self._max_backlog = max_backlog
+        self._window_first_rollout: int | None = None
+        self._window_last_rollout = -1
+        self._worker = _AnalysisWorker(self._handle_job) if background and is_primary else None
         if register_gc_callback:
             gc.callbacks.append(self._on_gc)
         # One timers object per phase so the same Megatron call sites land in
@@ -257,14 +338,16 @@ class StragglerCollector:
     def disabled(self) -> bool:
         return self._disabled
 
-    def end_step(self, rollout_id: int = -1) -> list[WindowReport]:
+    def end_step(self, rollout_id: int = -1, final: bool = False) -> list[WindowReport]:
         """Close one training step; every ``report_interval`` steps gather and
         analyze.
 
         All ranks must call this at the same logical step (it contains a
         collective). Never raises: profiler failures are counted by
         ``self.health``. Returns the reports that are ready on the primary
-        rank (empty elsewhere and between windows).
+        rank (empty elsewhere and between windows). On the ``final`` step of a
+        run it waits (bounded) for the pending analyses, since no later call
+        would pick them up.
         """
         if self._disabled:
             return self._take_reports()
@@ -274,8 +357,13 @@ class StragglerCollector:
             self.on_error("drain", exc)
         self._step_open = False
         self._window.add("num_steps", 1.0)
+        if self._window_first_rollout is None:
+            self._window_first_rollout = rollout_id
+        self._window_last_rollout = rollout_id
         if self._window.get("num_steps") >= self.report_interval:
             self._close_window()
+        if final and not self.flush(timeout=_FINAL_FLUSH_TIMEOUT_S):
+            self.on_error("analyze", TimeoutError(f"analysis still running {_FINAL_FLUSH_TIMEOUT_S} s after the run"))
         return self._take_reports()
 
     def _close_window(self) -> None:
@@ -311,37 +399,89 @@ class StragglerCollector:
                 + "; the reason is in that rank's log"
             )
             if self.is_primary:
-                self._reports.append(
-                    WindowReport(
-                        metrics={
-                            "straggler/health/state": float(HEALTH_DISABLE),
-                            "straggler/health/requested_by": float(requesting[0]),
-                            "straggler/health/errors": float(sum(row[_ERRORS_INDEX] for row in table)),
-                        },
-                        alerts=[],
-                        rows=[],
-                        note=note,
-                    )
+                notice = WindowReport(
+                    metrics={
+                        "straggler/health/state": float(HEALTH_DISABLE),
+                        "straggler/health/requested_by": float(requesting[0]),
+                        "straggler/health/errors": float(sum(row[_ERRORS_INDEX] for row in table)),
+                    },
+                    alerts=[],
+                    rows=[],
+                    note=note,
                 )
+                self._submit(self._job(None, ready=notice))
             self._disable(note)
             return
 
         if self.is_primary:
-            try:
-                report = analyze_window(table, self._all_meta, self.detector_config, self.detector_state)
-                report.metrics["straggler/gather_ms"] = (gathered - started) * 1e3
-                report.metrics["straggler/analyze_ms"] = (self._clock() - gathered) * 1e3
-                report.window_start_wall = self.window_start_wall
-                self._reports.append(report)
-            except Exception as exc:
-                self.on_error("analyze", exc)
+            self._submit(self._job(table, gather_ms=(gathered - started) * 1e3))
         self._window.reset()
         self.window_start_wall = time()
+        self._window_first_rollout = None
+
+    def _job(self, table: list[list[float]] | None, **kwargs: Any) -> _WindowJob:
+        first = self._window_first_rollout
+        return _WindowJob(
+            table=table,
+            meta=list(self._all_meta or []),
+            window_start_wall=self.window_start_wall,
+            first_rollout=self._window_last_rollout if first is None else first,
+            last_rollout=self._window_last_rollout,
+            **kwargs,
+        )
+
+    def _submit(self, job: _WindowJob) -> None:
+        if self._worker is None:
+            self._handle_job(job)
+            return
+        if self._worker.backlog >= self._max_backlog:
+            self.on_error(
+                "analyze",
+                RuntimeError(
+                    f"{self._worker.backlog} windows are still waiting for analysis; the window ending at rollout "
+                    f"{job.last_rollout} is dropped"
+                ),
+            )
+            return
+        self._worker.submit(job)
+
+    def _handle_job(self, job: _WindowJob) -> None:
+        """Analyze one window (worker thread, or inline without a worker) and
+        queue its report for ``end_step``; never raises.
+
+        Only this method touches ``detector_state``, and jobs run one at a
+        time in window order.
+        """
+        report = job.ready
+        if report is None:
+            started = self._clock()
+            try:
+                report = analyze_window(job.table, job.meta, self.detector_config, self.detector_state)
+            except Exception as exc:
+                self.on_error("analyze", exc)
+                return
+            report.metrics["straggler/gather_ms"] = job.gather_ms
+            report.metrics["straggler/analyze_ms"] = (self._clock() - started) * 1e3
+            report.window_start_wall = job.window_start_wall
+        report.first_rollout = job.first_rollout
+        report.last_rollout = job.last_rollout
+        if self._on_report is not None:
+            try:
+                self._on_report(report)
+            except Exception as exc:
+                self.on_error("report", exc)
+        self._reports.append(report)
 
     def _take_reports(self) -> list[WindowReport]:
-        reports = list(self._reports)
-        self._reports.clear()
+        reports: list[WindowReport] = []
+        while self._reports:
+            reports.append(self._reports.popleft())
         return reports
+
+    def flush(self, timeout: float | None = None) -> bool:
+        """Wait for queued analyses (tests and shutdown); True when none is
+        left."""
+        return self._worker.flush(timeout) if self._worker is not None else True
 
     def _disable(self, reason: str) -> None:
         """Switch the profiler off on this rank for the rest of the run."""
@@ -361,9 +501,12 @@ class StragglerCollector:
         )
 
     def close(self) -> None:
-        """Unregister the GC callback; safe to call more than once."""
+        """Unregister the GC callback and stop the worker once its queue is
+        empty; safe to call more than once."""
         if self._on_gc in gc.callbacks:
             gc.callbacks.remove(self._on_gc)
+        if self._worker is not None:
+            self._worker.stop()
 
 
 # ---- process-wide instance ----------------------------------------------------------------------------------------
@@ -371,13 +514,17 @@ class StragglerCollector:
 _COLLECTOR: StragglerCollector | None = None
 
 
-def install_straggler_collector(role: str) -> StragglerCollector | None:
+def install_straggler_collector(
+    role: str, on_report: Callable[[WindowReport], None] | None = None
+) -> StragglerCollector | None:
     """Create the process-wide collector if the profiler is enabled and this
     actor's ``role`` runs training steps.
 
     Must run after Megatron parallel state and Relax's Gloo group exist (i.e.
-    from ``MegatronTrainRayActor.init``). Returns ``None`` when disabled so the
-    caller's hot path stays a plain attribute check.
+    from ``MegatronTrainRayActor.init``). ``on_report`` runs on the primary
+    rank's analysis thread for every finished window, so it must only log.
+    Returns ``None`` when disabled so the caller's hot path stays a plain
+    attribute check.
     """
     global _COLLECTOR
     from relax.utils.env import Envs
@@ -405,6 +552,7 @@ def install_straggler_collector(role: str) -> StragglerCollector | None:
             persist_windows=Envs.RELAX_STRAGGLER_PERSIST_WINDOWS,
             recover_windows=Envs.RELAX_STRAGGLER_RECOVER_WINDOWS,
         ),
+        on_report=on_report,
     )
     logger.info(
         "Straggler profiler enabled: report_interval=%d primary=%s meta=%s",

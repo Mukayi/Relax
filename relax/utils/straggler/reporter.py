@@ -6,7 +6,8 @@ lines.
   the step's ``perf/*`` metrics (MetricsService / TensorBoard / WandB / ClearML)
 * per-rank segment bars -> ``Timer().records`` so they ride along with the
   existing timeline trace (one Perfetto row per rank, ``pid = TIMELINE_PID_BASE + rank``)
-* alerts -> logger (WARNING on state change, INFO table while any alert is active)
+* alerts, recoveries, uncertain ranks -> logger (WARNING on state change, INFO table while any
+  alert is active), from the collector's analysis thread via ``log_straggler_window``
 """
 
 from __future__ import annotations
@@ -79,26 +80,39 @@ def _format_table(report: WindowReport) -> str:
     return "\n".join(lines)
 
 
-def report_straggler_window(args: Any, rollout_id: int, report: WindowReport) -> dict[str, float]:
-    """Emit timeline events and log lines for one window (primary rank only)
-    and return its scalars.
+def report_straggler_window(args: Any, report: WindowReport) -> dict[str, float]:
+    """Emit timeline events for one window and return its scalars (primary
+    rank, training thread).
 
     The scalars are not logged here: with ``--use-metrics-service`` every
     ``tracking_utils.log`` is a synchronous HTTP request on the training
-    thread, so the actor hands them to ``log_perf_data`` for the same step
-    instead of paying for a second request.
+    thread, so the actor hands them to ``log_perf_data`` for the step it is
+    finishing instead of paying for a second request. That step can be later
+    than the window, hence ``straggler/window/*``.
     """
-    step = compute_rollout_step(args, rollout_id)
     metrics = report.metrics
+    metrics["straggler/window/first_rollout"] = float(report.first_rollout)
+    metrics["straggler/window/last_rollout"] = float(report.last_rollout)
+    if getattr(args, "timeline_dump_dir", None) and metrics.get("straggler/health/state", 0.0) < HEALTH_DISABLE:
+        # These ride out (and get their step stamped) with the ``log_perf_data``
+        # call the actor makes right after this function.
+        Timer().records.extend(_timeline_events(report))
+    return metrics
 
+
+def log_straggler_window(args: Any, report: WindowReport) -> None:
+    """Log one window's alerts, recoveries, uncertain ranks and summary at the
+    window's own step.
+
+    Only touches the logger, so the collector runs it on its analysis thread
+    as soon as the analysis ends; the WARNING lines do not wait for the next
+    training step.
+    """
+    step = compute_rollout_step(args, report.last_rollout)
+    metrics = report.metrics
     if metrics.get("straggler/health/state", 0.0) >= HEALTH_DISABLE:
         logger.warning("[straggler] step=%d profiler switched off on every rank: %s", step, report.note)
-        return metrics
-
-    if getattr(args, "timeline_dump_dir", None):
-        # These ride out (and get their step stamped) with the ``log_perf_data``
-        # call the actor makes for the same step right after this function.
-        Timer().records.extend(_timeline_events(report))
+        return
 
     for alert in report.alerts:
         if alert.new:
@@ -127,4 +141,3 @@ def report_straggler_window(args: Any, rollout_id: int, report: WindowReport) ->
             metrics.get("straggler/pp_stage_imbalance", 1.0),
             metrics.get("straggler/self_overhead_ms", 0.0),
         )
-    return metrics

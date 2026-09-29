@@ -45,6 +45,7 @@ def _collector(world, interval=2, is_primary=True, register_gc=False, gather=Non
         gather_objects=counting_gather_objects,
         register_gc_callback=register_gc,
         is_capturing=is_capturing or _FakeCapture(),
+        background=False,
         **kwargs,
     )
     collector.gather_calls = gather_calls

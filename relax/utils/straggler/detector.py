@@ -160,6 +160,9 @@ class WindowReport:
     window_start_wall: float = 0.0
     # Free-text status for the log, e.g. why the profiler switched itself off.
     note: str = ""
+    # Rollouts covered by the window; the report may be emitted a rollout or so later.
+    first_rollout: int = -1
+    last_rollout: int = -1
     uncertain: list[Uncertain] = field(default_factory=list)
     recovered: list[Recovery] = field(default_factory=list)
 
