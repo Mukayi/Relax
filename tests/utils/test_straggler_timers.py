@@ -13,14 +13,21 @@ class _FakeSink:
         self.pool = EventPool(4, FakeEvent)
         self.pushed = []
         self.discarded = []
+        self.errors = []
         self.capturing = capturing
+        self.fail = False
 
     def record_event(self):
+        if self.fail:
+            raise RuntimeError("cudaErrorLaunchFailure")
         if self.capturing:
             return None
         event = self.pool.acquire()
         event.record()
         return event
+
+    def on_error(self, where, exc):
+        self.errors.append((where, exc))
 
     def discard_event(self, event):
         self.discarded.append(event)
@@ -92,6 +99,21 @@ def test_segment_timer_skips_bracket_when_sink_cannot_record():
     assert sink.pushed == []
     assert len(sink.discarded) == 1 and len(sink.pool) == 4
     assert not timer.active
+
+
+def test_sink_errors_skip_the_bracket_and_are_reported_instead_of_raised():
+    sink = _FakeSink()
+    timer = StragglerTimers(sink, MEGATRON_TIMER_SEGMENTS)("forward-compute")
+    sink.fail = True
+    timer.start()  # must not raise into Megatron's schedule
+    assert not timer.active and [where for where, _ in sink.errors] == ["timer"]
+
+    sink.fail = False
+    timer.start()
+    sink.fail = True
+    timer.stop()
+    assert sink.pushed == [] and len(sink.errors) == 2 and not timer.active
+    assert len(sink.pool) == 4, "the start event of a bracket that failed to close goes back to the pool"
 
 
 def test_all_megatron_optimizer_and_comm_names_map_to_buckets():

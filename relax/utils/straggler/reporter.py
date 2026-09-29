@@ -16,6 +16,7 @@ from typing import Any
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.straggler.detector import WindowReport
+from relax.utils.straggler.health import HEALTH_DISABLE
 from relax.utils.straggler.stats import GPU_SEGMENTS
 from relax.utils.timer import TimelineEvent, Timer
 
@@ -89,6 +90,10 @@ def report_straggler_window(args: Any, rollout_id: int, report: WindowReport) ->
     """
     step = compute_rollout_step(args, rollout_id)
     metrics = report.metrics
+
+    if metrics.get("straggler/health/state", 0.0) >= HEALTH_DISABLE:
+        logger.warning("[straggler] step=%d profiler switched off on every rank: %s", step, report.note)
+        return metrics
 
     if getattr(args, "timeline_dump_dir", None):
         # These ride out (and get their step stamped) with the ``log_perf_data``

@@ -22,6 +22,7 @@ from typing import Any, Callable
 
 from relax.utils.logging_utils import get_logger
 from relax.utils.straggler.detector import DetectorConfig, DetectorState, RankMeta, WindowReport, analyze_window
+from relax.utils.straggler.health import HEALTH_DISABLE, HealthConfig, ProfilerHealth
 from relax.utils.straggler.stats import (
     FIELD_INDEX,
     FORWARD_ONLY_TIMER_SEGMENTS,
@@ -40,6 +41,8 @@ _CPU_BWD_INDEX = FIELD_INDEX["cpu_bwd"]
 _NUM_FWD_INDEX = FIELD_INDEX["num_fwd"]
 _GC_INDEX = FIELD_INDEX["gc"]
 _DROPPED_INDEX = FIELD_INDEX["dropped"]
+_ERRORS_INDEX = FIELD_INDEX["errors"]
+_HEALTH_INDEX = FIELD_INDEX["health"]
 
 # Only the role that runs the training step (and therefore calls ``end_step``)
 # gets a collector; critic / reference / actor_fwd actors would only fill the
@@ -122,6 +125,8 @@ class StragglerCollector:
         clock: Callable[[], float] = perf_counter,
         register_gc_callback: bool = True,
         is_capturing: Callable[[], bool] = _is_stream_capturing,
+        health_config: HealthConfig | None = None,
+        background: bool = False,
     ) -> None:
         if report_interval < 1:
             raise ValueError(
@@ -148,6 +153,10 @@ class StragglerCollector:
         # offload / clear_memory, etc.).
         self._step_open = False
         self._gc_start: float | None = None
+        self.health = ProfilerHealth(health_config)
+        # Plain attribute (not ``health.disabled``) because ``record_event`` checks it on every bracket.
+        self._disabled = False
+        self._reports: deque[WindowReport] = deque()
         if register_gc_callback:
             gc.callbacks.append(self._on_gc)
         # One timers object per phase so the same Megatron call sites land in
@@ -162,10 +171,11 @@ class StragglerCollector:
         while the stream is being captured.
 
         Events recorded into a CUDA graph capture have no meaningful
-        ``elapsed_time`` on replay, so the whole bracket is skipped. The first
-        recorded event of a step also opens the step for GC attribution.
+        ``elapsed_time`` on replay, so the whole bracket is skipped; so is
+        every bracket once the profiler is disabled. The first recorded event
+        of a step also opens the step for GC attribution.
         """
-        if self._is_capturing():
+        if self._disabled or self._is_capturing():
             return None
         self._step_open = True
         event = self._pool.acquire()
@@ -175,6 +185,11 @@ class StragglerCollector:
     def discard_event(self, event: Any) -> None:
         """Return the start event of a bracket that could not be closed."""
         self._pool.release(event)
+
+    def on_error(self, where: str, exc: BaseException) -> None:
+        """Count an exception caught anywhere in the profiler (see
+        ``ProfilerHealth``)."""
+        self.health.record_error(where, exc)
 
     def push(self, segment_index: int, start_event: Any, end_event: Any, cpu_ms: float) -> None:
         """Queue one bracket for ``drain``; when the queue is full drop the
@@ -238,33 +253,112 @@ class StragglerCollector:
         window.add("overhead", (self._clock() - started) * 1e3)
         return folded
 
-    def end_step(self) -> WindowReport | None:
+    @property
+    def disabled(self) -> bool:
+        return self._disabled
+
+    def end_step(self, rollout_id: int = -1) -> list[WindowReport]:
         """Close one training step; every ``report_interval`` steps gather and
         analyze.
 
         All ranks must call this at the same logical step (it contains a
-        collective). Returns the report on the primary rank when a window
-        closes, ``None`` otherwise.
+        collective). Never raises: profiler failures are counted by
+        ``self.health``. Returns the reports that are ready on the primary
+        rank (empty elsewhere and between windows).
         """
-        self.drain()
+        if self._disabled:
+            return self._take_reports()
+        try:
+            self.drain()
+        except Exception as exc:
+            self.on_error("drain", exc)
         self._step_open = False
         self._window.add("num_steps", 1.0)
-        if self._window.get("num_steps") < self.report_interval:
-            return None
+        if self._window.get("num_steps") >= self.report_interval:
+            self._close_window()
+        return self._take_reports()
+
+    def _close_window(self) -> None:
+        errors, code = self.health.close_window(self._window.get("dropped"))
+        if code >= HEALTH_DISABLE:
+            logger.warning(
+                "[straggler] rank %d asks to switch the profiler off: %s",
+                self.rank_meta.rank,
+                self.health.request_reason(),
+            )
+        self._window.set("unread", float(len(self._pending)))
+        self._window.set("errors", errors)
+        self._window.set("health", code)
         started = self._clock()
-        if self._all_meta is None:
-            self._all_meta = list(self._gather_objects(self.rank_meta))
-        table = self._gather(self._window.as_list())
-        report = None
+        try:
+            if self._all_meta is None:
+                self._all_meta = list(self._gather_objects(self.rank_meta))
+            table = self._gather(self._window.as_list())
+        except Exception as exc:
+            self.on_error("gather", exc)
+            self._disable(
+                f"the window gather failed ({type(exc).__name__}: {exc}); only this rank can tell, so it stops "
+                "joining straggler gathers"
+            )
+            return
+        gathered = self._clock()
+
+        requesting = [self._all_meta[i].rank for i, row in enumerate(table) if row[_HEALTH_INDEX] >= HEALTH_DISABLE]
+        if requesting:
+            note = (
+                f"rank {requesting[0]} asked to switch the profiler off"
+                + (f" (with {len(requesting) - 1} more)" if len(requesting) > 1 else "")
+                + "; the reason is in that rank's log"
+            )
+            if self.is_primary:
+                self._reports.append(
+                    WindowReport(
+                        metrics={
+                            "straggler/health/state": float(HEALTH_DISABLE),
+                            "straggler/health/requested_by": float(requesting[0]),
+                            "straggler/health/errors": float(sum(row[_ERRORS_INDEX] for row in table)),
+                        },
+                        alerts=[],
+                        rows=[],
+                        note=note,
+                    )
+                )
+            self._disable(note)
+            return
+
         if self.is_primary:
-            gathered = self._clock()
-            report = analyze_window(table, self._all_meta, self.detector_config, self.detector_state)
-            report.metrics["straggler/gather_ms"] = (gathered - started) * 1e3
-            report.metrics["straggler/analyze_ms"] = (self._clock() - gathered) * 1e3
-            report.window_start_wall = self.window_start_wall
+            try:
+                report = analyze_window(table, self._all_meta, self.detector_config, self.detector_state)
+                report.metrics["straggler/gather_ms"] = (gathered - started) * 1e3
+                report.metrics["straggler/analyze_ms"] = (self._clock() - gathered) * 1e3
+                report.window_start_wall = self.window_start_wall
+                self._reports.append(report)
+            except Exception as exc:
+                self.on_error("analyze", exc)
         self._window.reset()
         self.window_start_wall = time()
-        return report
+
+    def _take_reports(self) -> list[WindowReport]:
+        reports = list(self._reports)
+        self._reports.clear()
+        return reports
+
+    def _disable(self, reason: str) -> None:
+        """Switch the profiler off on this rank for the rest of the run."""
+        if self._disabled:
+            return
+        self._disabled = True
+        self.health.disable(reason)
+        while self._pending:
+            _, start_event, end_event, _ = self._pending.popleft()
+            self._pool.release(start_event)
+            self._pool.release(end_event)
+        self.close()
+        logger.warning(
+            "[straggler] profiler disabled on rank %d: %s. Training continues; config.timers now records nothing.",
+            self.rank_meta.rank,
+            reason,
+        )
 
     def close(self) -> None:
         """Unregister the GC callback; safe to call more than once."""

@@ -114,6 +114,8 @@ class WindowReport:
     rows: list[dict[str, float | int | str]]
     # Wall-clock start of the window; filled in by the collector for the timeline.
     window_start_wall: float = 0.0
+    # Free-text status for the log, e.g. why the profiler switched itself off.
+    note: str = ""
 
 
 def _leave_one_out_median(values: np.ndarray) -> np.ndarray:
@@ -207,6 +209,12 @@ def analyze_window(
             f"straggler table has {world} rows but {len(meta)} rank metas; the value and metadata gathers must "
             "run over the same process group so row i describes rank i."
         )
+
+    # Window-level counters and status, read before the per-step normalization below.
+    dropped = _column(x, "dropped").copy()
+    unread = _column(x, "unread").copy()
+    errors = _column(x, "errors").copy()
+    health = _column(x, "health").copy()
 
     # Everything below is per step so numbers stay comparable across intervals.
     steps = np.maximum(_column(x, "num_steps"), 1.0)[:, None]
@@ -392,6 +400,10 @@ def analyze_window(
         float(max(stage_values) / min(stage_values)) if len(stage_values) > 1 else 1.0
     )
     metrics["straggler/self_overhead_ms"] = float(np.mean(_column(x, "overhead")))
-    metrics["straggler/dropped_events"] = float(np.sum(_column(x, "dropped") * steps[:, 0]))
+    metrics["straggler/dropped_events"] = float(np.sum(dropped))
+    metrics["straggler/unread_events"] = float(np.sum(unread))
+    metrics["straggler/health/state"] = float(np.max(health))
+    metrics["straggler/health/errors"] = float(np.sum(errors))
+    metrics["straggler/health/degraded_ranks"] = float(np.sum(health > 0))
 
     return WindowReport(metrics=metrics, alerts=alerts, rows=rows)

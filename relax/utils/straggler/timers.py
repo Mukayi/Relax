@@ -32,6 +32,10 @@ class EventSink(Protocol):
     def discard_event(self, event: Any) -> None:
         """Return an event whose bracket could not be completed."""
 
+    def on_error(self, where: str, exc: BaseException) -> None:
+        """Count an exception caught on the hot path instead of raising it
+        into Megatron's schedule."""
+
 
 def cuda_timing_event() -> Any:
     """Create a CUDA event that supports ``elapsed_time`` (default factory)."""
@@ -85,8 +89,9 @@ class _SegmentTimer:
 
     ``barrier`` is accepted for protocol compatibility and ignored: a barrier
     here would reintroduce exactly the synchronization we are avoiding. A
-    second ``start`` without ``stop`` is ignored rather than asserted so the
-    profiler can never take the training loop down.
+    second ``start`` without ``stop`` is ignored rather than asserted, and an
+    exception from the sink skips the bracket and goes to ``sink.on_error``,
+    so the profiler can never take the training loop down.
     """
 
     __slots__ = ("_segment_index", "_sink", "_start_event", "_start_cpu")
@@ -100,7 +105,11 @@ class _SegmentTimer:
     def start(self, barrier: bool = False) -> None:
         if self._start_event is not None:
             return
-        self._start_event = self._sink.record_event()  # None while capturing -> bracket is skipped
+        try:
+            self._start_event = self._sink.record_event()  # None while capturing -> bracket is skipped
+        except Exception as exc:
+            self._sink.on_error("timer", exc)
+            return
         self._start_cpu = perf_counter()
 
     def stop(self, barrier: bool = False) -> None:
@@ -108,11 +117,15 @@ class _SegmentTimer:
         if start_event is None:
             return
         self._start_event = None
-        end_event = self._sink.record_event()
-        if end_event is None:
+        try:
+            end_event = self._sink.record_event()
+            if end_event is None:
+                self._sink.discard_event(start_event)
+                return
+            self._sink.push(self._segment_index, start_event, end_event, (perf_counter() - self._start_cpu) * 1e3)
+        except Exception as exc:
             self._sink.discard_event(start_event)
-            return
-        self._sink.push(self._segment_index, start_event, end_event, (perf_counter() - self._start_cpu) * 1e3)
+            self._sink.on_error("timer", exc)
 
     @property
     def active(self) -> bool:

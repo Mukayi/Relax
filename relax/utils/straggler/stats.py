@@ -35,8 +35,13 @@ CPU_FIELDS: tuple[str, ...] = ("cpu_fwd", "cpu_bwd", "gc")
 # steps in the window, event pairs dropped because the pending queue was full,
 # and the collector's own CPU cost (ms) spent draining events.
 COUNT_FIELDS: tuple[str, ...] = ("tokens", "num_fwd", "num_steps", "dropped", "overhead")
+# Window-level status, not summed per step: event pairs still unread when the
+# window closed (their time lands in the next window), exceptions the profiler
+# caught on this rank during the window, and this rank's health code
+# (``health.HEALTH_*``; 2 asks every rank to switch the profiler off).
+STATUS_FIELDS: tuple[str, ...] = ("unread", "errors", "health")
 
-FIELDS: tuple[str, ...] = GPU_SEGMENTS + CPU_FIELDS + COUNT_FIELDS
+FIELDS: tuple[str, ...] = GPU_SEGMENTS + CPU_FIELDS + COUNT_FIELDS + STATUS_FIELDS
 FIELD_INDEX: Mapping[str, int] = {name: index for index, name in enumerate(FIELDS)}
 NUM_FIELDS: int = len(FIELDS)
 
@@ -106,6 +111,9 @@ class WindowStats:
 
     def get(self, field: str) -> float:
         return self.values[FIELD_INDEX[field]]
+
+    def set(self, field: str, value: float) -> None:
+        self.values[FIELD_INDEX[field]] = value
 
     def reset(self) -> None:
         self.values = [0.0] * NUM_FIELDS

@@ -7,7 +7,7 @@ import pytest
 
 from relax.utils import tracking_utils
 from relax.utils.straggler import reporter
-from relax.utils.straggler.detector import DetectorConfig, DetectorState, analyze_window
+from relax.utils.straggler.detector import DetectorConfig, DetectorState, WindowReport, analyze_window
 from relax.utils.timer import Timer
 from tests.utils.straggler_helpers import meta as _meta
 from tests.utils.straggler_helpers import row as _row
@@ -67,6 +67,22 @@ def test_timeline_events_one_row_per_rank_when_enabled(records):
 def test_no_timeline_events_when_disabled(records):
     reporter.report_straggler_window(_args(), rollout_id=3, report=_report())
     assert records == []
+
+
+def test_switch_off_report_logs_why_instead_of_a_healthy_summary(monkeypatch):
+    warnings, infos = [], []
+    monkeypatch.setattr(reporter.logger, "warning", lambda msg, *a: warnings.append(msg % a))
+    monkeypatch.setattr(reporter.logger, "info", lambda msg, *a: infos.append(msg % a))
+    report = WindowReport(
+        metrics={"straggler/health/state": 2.0, "straggler/health/requested_by": 3.0},
+        alerts=[],
+        rows=[],
+        note="rank 3 asked to switch the profiler off",
+    )
+    metrics = reporter.report_straggler_window(_args(timeline_dump_dir="/tmp/tl"), rollout_id=1, report=report)
+    assert metrics["straggler/health/state"] == 2.0
+    assert len(warnings) == 1 and "rank 3 asked" in warnings[0]
+    assert infos == [], "a switched-off profiler must not print a 'no straggler' summary"
 
 
 def test_alert_is_logged_as_warning_with_table(monkeypatch):

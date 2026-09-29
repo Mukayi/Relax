@@ -2385,14 +2385,22 @@ class MegatronTrainRayActor(TrainRayActor):
     def _straggler_end_step(self, rollout_id: int, total_lengths: Sequence[int]) -> dict[str, float] | None:
         """Close this step in the straggler collector (all ranks; contains a
         Gloo collective every ``report_interval`` steps) and, on the primary
-        rank when a window closes, return its scalars for ``log_perf_data``."""
+        rank, return the scalars of any finished window for ``log_perf_data``.
+
+        The collector never raises; the reporter runs on the training thread
+        too, so it is guarded the same way (a profiler bug must not stop
+        training).
+        """
         if self.straggler is None:
             return None
         self.straggler.add_tokens(int(sum(total_lengths)))
-        report = self.straggler.end_step()
-        if report is None:
-            return None
-        return report_straggler_window(self.args, rollout_id, report)
+        metrics: dict[str, float] = {}
+        for report in self.straggler.end_step(rollout_id):
+            try:
+                metrics.update(report_straggler_window(self.args, rollout_id, report))
+            except Exception as exc:
+                self.straggler.on_error("report", exc)
+        return metrics or None
 
     @timer
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:

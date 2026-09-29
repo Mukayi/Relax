@@ -154,8 +154,8 @@ def test_end_step_reports_every_interval_and_resets_window():
         _one_bracket(collector)
         collector.add_tokens(1000)
         reports.append(collector.end_step())
-    assert [report is not None for report in reports] == [False, False, True, False, False, True]
-    report = reports[2]
+    assert [len(ready) for ready in reports] == [0, 0, 1, 0, 0, 1]
+    report = reports[2][0]
     assert report.metrics["straggler/fwd/median_ms"] == pytest.approx(1.0)  # per step
     assert report.metrics["straggler/tokens/median"] == pytest.approx(1000.0)
     assert report.metrics["straggler/flagged/count"] == 0
@@ -181,7 +181,7 @@ def test_gather_and_analysis_are_timed_separately(monkeypatch):
     monkeypatch.setattr(collector_module, "analyze_window", slow_analyze)
     collector = _collector(world=2, interval=1, gather=slow_gather, clock=lambda: now[0])
     _one_bracket(collector)
-    report = collector.end_step()
+    (report,) = collector.end_step()
     assert report.metrics["straggler/gather_ms"] == pytest.approx(5.0), "gather_ms must stop before the analysis"
     assert report.metrics["straggler/analyze_ms"] == pytest.approx(7.0)
 
@@ -189,7 +189,7 @@ def test_gather_and_analysis_are_timed_separately(monkeypatch):
 def test_non_primary_rank_participates_but_returns_no_report():
     collector = _collector(world=2, interval=1, is_primary=False)
     _one_bracket(collector)
-    assert collector.end_step() is None
+    assert collector.end_step() == []
     assert len(collector.gather_calls) == 1
     assert collector.gather_calls[0][FIELD_INDEX["fwd"]] == 1.0
     assert collector.window.get("fwd") == 0.0
@@ -207,7 +207,7 @@ def test_gather_table_from_other_ranks_drives_detection():
     _one_bracket(collector)
     _one_bracket(collector, "backward-compute")
     collector.add_tokens(500)
-    report = collector.end_step()
+    (report,) = collector.end_step()
     assert report.metrics["straggler/flagged/rank"] == 1
     assert report.alerts and report.alerts[0].reason == "slow_device"
 
