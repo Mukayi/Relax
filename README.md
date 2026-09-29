@@ -3,6 +3,7 @@
 Code: `Mukayi/Relax` branch `feat/task11-straggler-profiler` (PR redai-studio/Relax#363, RFC redai-studio/Relax#362).
 Recipe: Qwen3-0.6B SFT DP8, OpenMathReasoning-mini, GBS 32; one rollout = one optimizer step in this recipe.
 Hosts: 8×A100 (ge40-11, ge50-12) and 8×A800 (ge26-60, ge26-59). Overhead runs use the metrics service **off** unless noted.
+The measurements were taken on `f203bff`; `fig_mechanism` and `fig_detector` show the current code (analysis on a background thread, uncertain verdicts, alert clearing, profiler health).
 
 ## Headline numbers
 
@@ -23,12 +24,12 @@ Hosts: 8×A100 (ge40-11, ge50-12) and 8×A800 (ge26-60, ge26-59). Overhead runs 
 | `gc_counts.md` | Generation-2 GC counts on vs off (4 hosts × 3 runs) |
 | `bench_timer_cost_ge40.txt` | Single-GPU hot-path microbenchmark output |
 | `steps.csv`, `summary.md` | Separate-run A/B: per-step `step_time` / `loss` for 3 off/on pairs |
-| `figures/fig_mechanism` | End-to-end mechanism (hot path orange, cold path blue) |
-| `figures/fig_detector` | Detector: peer groups, robust z, 3-window persistence, priority ladder |
+| `figures/fig_mechanism` | End-to-end mechanism (hot path orange, cold path blue, analysis thread on the primary rank) |
+| `figures/fig_detector` | Detector: peer groups, robust z, uncertain pre-check, raise after 3 / clear after 2 windows, priority ladder |
 | `figures/fig_late_arrival` | Why the latest rank has the shortest `dp_grad_sync` |
 | `figures/fig_injection` | Per-rank self / wait at step 29 with a matmul hog on GPU 5 |
 | `figures/fig_real_case` | Real CPU-side slow rank |
 | `figures/fig_overhead` | Separate-run A/B and in-run crossover (4 pairs) |
 | `figures/fig_loss` | Same-seed loss off vs on |
 | `figures/make_figures.py` | Regenerates every figure (PNG + SVG) |
-| `scripts/` | Microbenchmark, crossover driver, holders, experiment-only toggle patch |
+| `scripts/` | Microbenchmark, crossover driver, holders, experiment-only toggle patch (set `WORKDIR` before running) |
