@@ -1,18 +1,15 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Per-rank event collection, lazy readout and cross-rank aggregation.
+"""Per-rank event collection, lazy readout and the per-window gather.
 
-Hot path (called from Megatron's timer call sites and module hooks):
-``record_event`` + ``push`` only touch Python lists and record events on the
-current stream. Cold path (once per training step, from the actor):
-``end_step`` reads back completed event pairs with ``event.query()`` -- never
-``synchronize`` -- and every ``report_interval`` steps gathers one small vector
-per rank over the Gloo group. The primary rank hands the gathered table to one
-background thread for analysis, so no rank waits on the primary's analysis at
-its next collective; finished reports are picked up by a later ``end_step``
-(normally the next one) and carry the rollout range of their window.
+Hot path (Megatron's timer call sites): ``record_event`` / ``push`` record
+events on the current stream and append to a queue. Once per step ``end_step``
+reads completed pairs with ``event.query()`` (never ``synchronize``); every
+``report_interval`` steps all ranks gather one small vector and the primary
+rank queues the table for the background analysis, whose reports a later
+``end_step`` returns.
 
-A "step" throughout this package is one ``end_step`` call, i.e. one rollout,
-which may contain several optimizer steps.
+A "step" in this package is one ``end_step`` call, i.e. one rollout, which may
+contain several optimizer steps.
 """
 
 from __future__ import annotations
@@ -146,13 +143,12 @@ class StragglerCollector:
     # ---- hot path -----------------------------------------------------------------------------------------------
 
     def record_event(self) -> Any:
-        """Record a pooled event on the current stream, or return ``None``
-        while the stream is being captured.
+        """Record a pooled event on the current stream and open the step for
+        GC attribution.
 
-        Events recorded into a CUDA graph capture have no meaningful
-        ``elapsed_time`` on replay, so the whole bracket is skipped; so is
-        every bracket once the profiler is disabled. The first recorded event
-        of a step also opens the step for GC attribution.
+        Returns ``None`` (the bracket is skipped) once the profiler is
+        disabled, and during CUDA graph capture, where ``elapsed_time`` would
+        be meaningless on replay.
         """
         if self._disabled or self._is_capturing():
             return None
@@ -380,8 +376,7 @@ class StragglerCollector:
         return reports
 
     def flush(self, timeout: float | None = None) -> bool:
-        """Wait for queued analyses (tests and shutdown); True when none is
-        left."""
+        """Wait for queued analyses; True when none is left."""
         return self._worker.flush(timeout) if self._worker is not None else True
 
     def _disable(self, reason: str) -> None:

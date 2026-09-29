@@ -428,8 +428,7 @@ def setup_model_and_optimizer(
     # Optimizer
     kwargs = _build_optimizer_config_kwargs(args)
     config = OptimizerConfig(**kwargs)
-    # None unless the straggler profiler is on: Megatron's own Timers synchronize the device on every
-    # bracket, StragglerTimers only records CUDA events at the same call sites.
+    # None unless the straggler profiler is on (Megatron's own Timers synchronize the device on every bracket).
     config.timers = straggler_timers("train")
     _validate_vit_lr_trainable_params(args, model)
 

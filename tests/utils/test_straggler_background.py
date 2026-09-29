@@ -4,32 +4,16 @@
 import threading
 
 from relax.utils.straggler import collector as collector_module
-from relax.utils.straggler.collector import StragglerCollector
-from relax.utils.straggler.detector import DetectorConfig, RankMeta
 from relax.utils.straggler.stats import FIELD_INDEX
-from tests.utils.straggler_helpers import FakeEvent, meta
+from tests.utils.straggler_helpers import bracket, make_collector
 
 
-def _collector(world=2, interval=1, gather=None, persist=1, on_report=None):
-    return StragglerCollector(
-        rank_meta=RankMeta(rank=0, dp=0, tp=0, pp=0),
-        is_primary=True,
-        report_interval=interval,
-        detector_config=DetectorConfig(persist_windows=persist),
-        event_factory=FakeEvent,
-        pool_size=4,
-        gather=gather or (lambda values: [list(values) for _ in range(world)]),
-        gather_objects=lambda obj: meta(world),
-        register_gc_callback=False,
-        is_capturing=lambda: False,
-        background=True,
-        on_report=on_report,
-    )
+def _collector(**kwargs):
+    return make_collector(background=True, **kwargs)
 
 
 def _step(collector, rollout_id):
-    collector.train_timers("forward-compute").start()
-    collector.train_timers("forward-compute").stop()
+    bracket(collector)
     collector.add_tokens(1000)
     return collector.end_step(rollout_id)
 
@@ -99,8 +83,7 @@ def test_windows_are_analyzed_in_order_by_one_worker(monkeypatch):
 def test_final_step_waits_for_its_own_window_so_the_last_report_is_not_lost():
     collector = _collector()
     try:
-        collector.train_timers("forward-compute").start()
-        collector.train_timers("forward-compute").stop()
+        bracket(collector)
         (report,) = collector.end_step(rollout_id=59, final=True)
         assert report.last_rollout == 59
     finally:

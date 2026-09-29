@@ -2,12 +2,9 @@
 """Turn one analyzed straggler window into scalars, timeline events and log
 lines.
 
-* scalars -> returned to the actor, which logs them in the same ``tracking_utils.log`` call as
-  the step's ``perf/*`` metrics (MetricsService / TensorBoard / WandB / ClearML)
-* per-rank segment bars -> ``Timer().records`` so they ride along with the
-  existing timeline trace (one Perfetto row per rank, ``pid = TIMELINE_PID_BASE + rank``)
-* alerts, recoveries, uncertain ranks -> logger (WARNING on state change, INFO table while any
-  alert is active), from the collector's analysis thread via ``log_straggler_window``
+* scalars -> returned for the step's ``log_perf_data``
+* per-rank segment bars -> ``Timer().records``, one Perfetto row per rank
+* alerts, recoveries, uncertain ranks -> logger, from the analysis thread
 """
 
 from __future__ import annotations
@@ -81,26 +78,29 @@ def _format_table(report: WindowReport) -> str:
     return "\n".join(lines)
 
 
-def report_straggler_window(args: Any, report: WindowReport, now: float | None = None) -> dict[str, float]:
-    """Emit timeline events for one window and return its scalars (primary
-    rank, training thread).
+def _switched_off(report: WindowReport) -> bool:
+    return report.metrics.get("straggler/health/state", 0.0) >= HEALTH_DISABLE
 
-    The scalars are not logged here: with ``--use-metrics-service`` every
-    ``tracking_utils.log`` is a synchronous HTTP request on the training
-    thread, so the actor hands them to ``log_perf_data`` for the step it is
-    finishing instead of paying for a second request. That step can be later
-    than the window, hence ``straggler/window/*``.
+
+def _ms_after_close(report: WindowReport, wall: float) -> float:
+    return (wall - report.closed_wall) * 1e3
+
+
+def report_straggler_window(args: Any, report: WindowReport, now: float | None = None) -> dict[str, float]:
+    """Emit timeline events for one window and return its scalars for the
+    step's ``log_perf_data`` (primary rank, training thread).
+
+    That step can be later than the window, hence ``straggler/window/*``.
     """
     report.emitted_wall = time() if now is None else now
     metrics = report.metrics
     metrics["straggler/window/first_rollout"] = float(report.first_rollout)
     metrics["straggler/window/last_rollout"] = float(report.last_rollout)
     if report.closed_wall > 0.0:
-        metrics["straggler/latency/analyzed_ms"] = (report.analyzed_wall - report.closed_wall) * 1e3
-        metrics["straggler/latency/emitted_ms"] = (report.emitted_wall - report.closed_wall) * 1e3
-    if getattr(args, "timeline_dump_dir", None) and metrics.get("straggler/health/state", 0.0) < HEALTH_DISABLE:
-        # These ride out (and get their step stamped) with the ``log_perf_data``
-        # call the actor makes right after this function.
+        metrics["straggler/latency/analyzed_ms"] = _ms_after_close(report, report.analyzed_wall)
+        metrics["straggler/latency/emitted_ms"] = _ms_after_close(report, report.emitted_wall)
+    if getattr(args, "timeline_dump_dir", None) and not _switched_off(report):
+        # Flushed, and stamped with the step, by the ``log_perf_data`` that follows.
         Timer().records.extend(_timeline_events(report))
     return metrics
 
@@ -109,20 +109,19 @@ def log_straggler_delivery(args: Any, report: WindowReport, rollout_id: int, now
     """Log how long one window took to reach the tracking backend and return
     close-to-delivered in ms.
 
-    Called right after the ``log_perf_data`` that carried the report's
-    scalars returned. With ``--use-metrics-service`` that call is a
-    synchronous HTTP request, so "delivered" means the metrics service
-    acknowledged it; with TensorBoard / WandB it means the writer accepted it.
+    Call it once the ``log_perf_data`` that carried the report's scalars has
+    returned: with ``--use-metrics-service`` the metrics service has then
+    acknowledged them; with TensorBoard / WandB the writer has accepted them.
     """
-    delivered_ms = ((time() if now is None else now) - report.closed_wall) * 1e3
+    delivered_ms = _ms_after_close(report, time() if now is None else now)
     logger.info(
         "[straggler] step=%d window rollouts %d-%d: closed -> analyzed +%.1f ms (alerts logged), emitted +%.1f ms, "
         "delivered +%.1f ms",
         compute_rollout_step(args, rollout_id),
         report.first_rollout,
         report.last_rollout,
-        (report.analyzed_wall - report.closed_wall) * 1e3,
-        (report.emitted_wall - report.closed_wall) * 1e3,
+        _ms_after_close(report, report.analyzed_wall),
+        _ms_after_close(report, report.emitted_wall),
         delivered_ms,
     )
     return delivered_ms
@@ -132,13 +131,12 @@ def log_straggler_window(args: Any, report: WindowReport) -> None:
     """Log one window's alerts, recoveries, uncertain ranks and summary at the
     window's own step.
 
-    Only touches the logger, so the collector runs it on its analysis thread
-    as soon as the analysis ends; the WARNING lines do not wait for the next
-    training step.
+    Only touches the logger, so it is safe on the analysis thread, which runs
+    it as soon as the analysis ends.
     """
     step = compute_rollout_step(args, report.last_rollout)
     metrics = report.metrics
-    if metrics.get("straggler/health/state", 0.0) >= HEALTH_DISABLE:
+    if _switched_off(report):
         logger.warning("[straggler] step=%d profiler switched off on every rank: %s", step, report.note)
         return
 

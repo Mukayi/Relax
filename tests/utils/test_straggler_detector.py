@@ -301,9 +301,9 @@ def test_wait_below_absolute_guard_is_not_reported():
 
 
 def test_late_arriver_is_the_rank_with_the_shortest_grad_sync():
-    # Observed on a real 8xA800 SFT run: rank 0's kernels are as fast as everyone
-    # else's, but it reaches the DP reduce-scatter ~1 s late, so the 7 peers show a
-    # ~1 s grad-sync bracket while rank 0's bracket is just the 20 ms transfer.
+    # Rank 0's kernels are as fast as everyone else's, but it reaches the DP
+    # reduce-scatter ~1 s late, so the 7 peers show a ~1 s grad-sync bracket while
+    # rank 0's bracket is just the 20 ms transfer.
     config = DetectorConfig(persist_windows=2)
     state = DetectorState()
     table = [_healthy_row(dp_grad_sync=1020.0) for _ in range(8)]

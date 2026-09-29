@@ -6,8 +6,6 @@ import gc
 
 import pytest
 
-from relax.utils.straggler.collector import StragglerCollector
-from relax.utils.straggler.detector import DetectorConfig, RankMeta
 from relax.utils.straggler.health import (
     HEALTH_ACTIVE,
     HEALTH_DEGRADED,
@@ -16,7 +14,7 @@ from relax.utils.straggler.health import (
     ProfilerHealth,
 )
 from relax.utils.straggler.stats import FIELD_INDEX
-from tests.utils.straggler_helpers import FakeEvent, meta
+from tests.utils.straggler_helpers import bracket, make_collector
 
 
 def test_health_goes_degraded_on_drops_and_back_to_active_on_a_clean_window():
@@ -54,39 +52,22 @@ def test_disabled_is_terminal():
     assert health.state == "disabled"
 
 
-def _collector(world=2, interval=1, is_primary=True, gather=None, register_gc=False, **kwargs):
+def _collector(world=2, gather=None, **kwargs):
+    """``make_collector`` that also records what this rank sends."""
     calls = []
 
     def counting_gather(values):
         calls.append(list(values))
         return gather(values) if gather is not None else [list(values) for _ in range(world)]
 
-    collector = StragglerCollector(
-        rank_meta=RankMeta(rank=0, dp=0, tp=0, pp=0),
-        is_primary=is_primary,
-        report_interval=interval,
-        detector_config=DetectorConfig(persist_windows=1),
-        event_factory=FakeEvent,
-        pool_size=4,
-        gather=counting_gather,
-        gather_objects=lambda obj: meta(world),
-        register_gc_callback=register_gc,
-        is_capturing=lambda: False,
-        background=False,
-        **kwargs,
-    )
+    collector = make_collector(world, gather=counting_gather, **kwargs)
     collector.gather_calls = calls
     return collector
 
 
-def _bracket(collector, name="forward-compute"):
-    collector.train_timers(name).start()
-    collector.train_timers(name).stop()
-
-
 def test_drain_error_never_reaches_training_and_is_counted_in_the_window():
     collector = _collector()
-    _bracket(collector)
+    bracket(collector)
     _, start, _, _ = collector._pending[0]
 
     def boom(other):
@@ -108,7 +89,7 @@ def test_timer_errors_skip_the_bracket_and_are_counted():
 
     collector._pool._free.clear()
     collector._pool._factory = broken_factory
-    _bracket(collector)  # must not raise
+    bracket(collector)  # must not raise
     assert collector.pending_events == 0
     assert collector.health.errors_total == 1
 
@@ -121,7 +102,7 @@ def test_one_rank_asking_to_disable_turns_the_profiler_off_on_every_rank():
 
     collector = _collector(gather=gather, register_gc=True)
     before = len(gc.callbacks)
-    _bracket(collector)
+    bracket(collector)
     reports = collector.end_step(rollout_id=4)
     assert collector.disabled
     assert len(reports) == 1 and reports[0].metrics["straggler/health/state"] == HEALTH_DISABLE
@@ -129,7 +110,7 @@ def test_one_rank_asking_to_disable_turns_the_profiler_off_on_every_rank():
     assert "rank 1" in reports[0].note
     # Off means off: no more collectives, no events, no GC hook, pool whole again.
     assert len(gc.callbacks) == before - 1
-    _bracket(collector)
+    bracket(collector)
     assert collector.pending_events == 0 and len(collector._pool) == 4
     assert collector.end_step(rollout_id=5) == []
     assert len(collector.gather_calls) == 1
@@ -151,7 +132,7 @@ def test_gather_failure_disables_locally_without_raising():
         raise RuntimeError("gloo timeout")
 
     collector = _collector(gather=gather)
-    _bracket(collector)
+    bracket(collector)
     assert collector.end_step(rollout_id=0) == []
     assert collector.disabled
     assert "gather" in collector.health.disabled_reason
@@ -163,7 +144,7 @@ def test_repeated_drain_errors_escalate_to_disable_across_windows():
     def boom(other):
         raise RuntimeError("device error")
 
-    _bracket(collector)
+    bracket(collector)
     collector._pending[0][1].elapsed_time = boom
     collector.end_step(rollout_id=0)  # 1 error -> degraded
     assert not collector.disabled
@@ -175,7 +156,7 @@ def test_repeated_drain_errors_escalate_to_disable_across_windows():
 def test_health_scalars_ride_along_with_every_report(dropped):
     collector = _collector(max_pending=1)
     for _ in range(dropped + 1):
-        _bracket(collector)
+        bracket(collector)
     (report,) = collector.end_step(rollout_id=0)
     assert report.metrics["straggler/health/state"] == (HEALTH_DEGRADED if dropped else HEALTH_ACTIVE)
     assert report.metrics["straggler/health/errors"] == 0.0
