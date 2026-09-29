@@ -41,7 +41,7 @@ GRAY, GRAY_FILL, GRAY_TXT = "#7A7A7A", "#ECECEC", "#3A3A3A"
 PURPLE, PURPLE_FILL, PURPLE_TXT = "#6A4C93", "#ECE6F5", "#4A2F6E"
 TEXT, MUTED = "#1B1B1B", "#555555"
 OFF_C, ON_C = "#8C8C8C", BLUE
-STRIP_COLORS = ("#3C78C3", "#8FB3E2", "#C9DBF2")  # GPU segments, CPU fields, counters
+STRIP_COLORS = ("#3C78C3", "#8FB3E2", "#C9DBF2", "#E8A39B")  # GPU segments, CPU fields, counters, status
 
 KIND = {
     "hot": (ORANGE_FILL, ORANGE, ORANGE_TXT),
@@ -127,9 +127,9 @@ def arrow(ax, p0, p1, color, lw=1.5, ms=11, conn="arc3", ls="-", z=4, style="-|>
 
 
 def strip(ax, x, y, cell_w, cell_h, z=6):
-    """18-cell WindowStats vector: 10 GPU segments, 3 CPU fields, 5 counters."""
+    """21-cell WindowStats vector: 10 GPU segments, 3 CPU fields, 5 counters, 3 status fields."""
     i = 0
-    for n, color in zip((10, 3, 5), STRIP_COLORS):
+    for n, color in zip((10, 3, 5, 3), STRIP_COLORS):
         for _ in range(n):
             ax.add_patch(Rectangle((x + i * cell_w, y), cell_w, cell_h, fc=color, ec="white", lw=0.6, zorder=z))
             i += 1
@@ -257,14 +257,14 @@ def fig_mechanism() -> None:
     rbox(ax, cx, wy, cwid, wh, BLUE_FILL, BLUE, lw=1.6)
     ax.text(ccx, wy + wh - 0.19, "WindowStats", ha="center", va="center", fontsize=10.5, fontweight="bold",
             color=BLUE_TXT, zorder=6)
-    ax.text(ccx, wy + wh - 0.41, "18 × float64 per rank", ha="center", va="center", fontsize=9.5, color=MUTED,
+    ax.text(ccx, wy + wh - 0.41, "21 × float64 per rank", ha="center", va="center", fontsize=9.5, color=MUTED,
             zorder=6)
-    sc = 0.108
-    sx = ccx - 18 * sc / 2
+    sc = 0.092
+    sx = ccx - 21 * sc / 2
     strip(ax, sx, wy + 0.3, sc, 0.2)
-    ax.text(sx + 5 * sc, wy + 0.15, "GPU × 10", ha="center", va="center", fontsize=8.8, color=BLUE_TXT, zorder=6)
-    ax.text(sx + 14 * sc, wy + 0.15, "CPU · counts", ha="center", va="center", fontsize=8.8, color=BLUE_TXT,
-            zorder=6)
+    ax.text(sx + 5 * sc, wy + 0.15, "GPU × 10", ha="center", va="center", fontsize=8.2, color=BLUE_TXT, zorder=6)
+    ax.text(sx + 12.6 * sc, wy + 0.15, "CPU·counts", ha="center", va="center", fontsize=8.2, color=BLUE_TXT, zorder=6)
+    ax.text(sx + 19.8 * sc, wy + 0.15, "status", ha="center", va="center", fontsize=8.2, color=RED_TXT, zorder=6)
     arrow(ax, (ccx, 1.56), (ccx, wy), BLUE)
     node(ax, cx, 4.05, cwid, 0.66, "cold", "gc.callbacks", ["on each GC, inside the step"], lw=1.1)
     arrow(ax, (ccx, 4.05), (ccx, wy + wh), BLUE)
@@ -275,7 +275,7 @@ def fig_mechanism() -> None:
     ax.text(mx + mw / 2, my + mh - 0.2, "Gloo all_gather", ha="center", va="center", fontsize=10.5,
             fontweight="bold", color=BLUE_TXT, zorder=6)
     rows = [("r0", 0), ("r1", 1), ("r2", 2), ("⋮", None), ("rN−1", 4)]
-    sc2 = 0.06
+    sc2 = 0.05
     lab_x = mx + 0.44
     for k, (lab, _) in enumerate(rows):
         ry = my + mh - 0.55 - k * 0.245
@@ -283,19 +283,27 @@ def fig_mechanism() -> None:
         if lab != "⋮":
             strip(ax, lab_x + 0.08, ry, sc2, 0.13)
     arrow(ax, (cx + cwid, yc), (mx, yc), BLUE, lw=1.8)
-    for i, line in enumerate(("CPU group, not NCCL", "8 ranks ≈ 1.2 KB", "rank metadata: 1st window")):
-        ax.text(mx + mw / 2, my - 0.22 - i * 0.22, line, ha="center", va="center", fontsize=9.3, color=MUTED)
+    notes = ("CPU group, not NCCL", "8 ranks ≈ 1.3 KB", "rank metadata: 1st window",
+             ("health field: any rank can", RED_TXT), ("switch every rank off", RED_TXT))
+    for i, line in enumerate(notes):
+        text, color = (line, MUTED) if isinstance(line, str) else line
+        ax.text(mx + mw / 2, my - 0.22 - i * 0.22, text, ha="center", va="center", fontsize=9.3, color=color)
 
-    # ---- right: detector and outputs on the primary rank
-    dx, dw, dh = 7.74, 1.24, 1.02
-    node(ax, dx, yc - dh / 2, dw, dh, "cold", "Detector", ["numpy", "5 reasons"], lw=1.6)
+    # ---- right: detector on a background thread of the primary rank, and the outputs
+    dx, dw, dh = 7.86, 1.36, 1.02
+    rbox(ax, dx - 0.12, yc - dh / 2 - 0.14, dw + 0.24, dh + 0.62, "none", BLUE, lw=1.1, ls=(0, (3, 2)), r=0.08, z=1)
+    ax.text(dx + dw / 2, yc + dh / 2 + 0.25, "analysis thread", ha="center", va="center", fontsize=8.8,
+            color=BLUE_TXT, style="italic")
+    node(ax, dx, yc - dh / 2, dw, dh, "cold", "Detector", ["numpy · 5 reasons", "+ uncertain"], ls=9.0, lw=1.6)
+    ax.text(dx + dw / 2, yc - dh / 2 - 0.34, "off the training thread", ha="center", va="center", fontsize=8.8,
+            color=MUTED)
     arrow(ax, (mx + mw, yc), (dx, yc), BLUE, lw=1.8)
-    ax.text((mx + mw + dx) / 2, yc + 0.14, "N × 18", ha="center", va="bottom", fontsize=9, color=BLUE_TXT)
+    ax.text((mx + mw + dx - 0.12) / 2, yc + 0.14, "N × 21", ha="center", va="bottom", fontsize=9, color=BLUE_TXT)
     ox, ow, oh = 9.44, 2.36, 0.72
     outs = [
-        (yc + 1.15, "out", "TensorBoard / WandB", ["straggler/* (49 at DP8)"]),
+        (yc + 1.2, "out", "TensorBoard / WandB", ["straggler/* (62 at DP8)", "with the next rollout's perf/*"]),
         (yc, "out", "Perfetto timeline", ["one row per rank"]),
-        (yc - 1.15, "alert", "WARNING log", ["on reason change", "+ INFO per-rank table"]),
+        (yc - 1.2, "alert", "WARNING log", ["new alert · recovery · uncertain", "+ INFO per-rank table"]),
     ]
     for oy, kind, title, lines in outs:
         h = oh + (0.2 if len(lines) > 1 else 0)
@@ -318,13 +326,13 @@ def fig_mechanism() -> None:
 
 # ============================================================================= fig_detector
 def fig_detector() -> None:
-    W, H = 10.8, 7.3
+    W, H = 10.8, 8.1
     fig, ax = canvas(W, H)
 
     # ---- inputs: gathered table -> peer groups -> robust score (with the definitions the ladder uses)
-    top_y, top_h = 5.72, 1.48
+    top_y, top_h = 6.52, 1.48
     node(ax, 0.15, top_y, 2.4, top_h, "cold", "Gathered window",
-         ["N ranks × 18", "÷ rollouts → per rollout", ("self = fwd + bwd + optim", TEXT, "bold")])
+         ["N ranks × 21", "÷ rollouts → per rollout", ("self = fwd + bwd + optim", TEXT, "bold")])
     node(ax, 2.95, top_y, 3.6, top_h, "cold", "Peer groups",
          ["self, tokens, pp_recv:", ("same PP stage", TEXT, "bold"), "dp_grad_sync:",
           ("same (pp, tp) = DP × CP group", TEXT, "bold")])
@@ -335,14 +343,32 @@ def fig_detector() -> None:
     arrow(ax, (2.55, top_y + top_h / 2), (2.95, top_y + top_h / 2), BLUE)
     arrow(ax, (6.55, top_y + top_h / 2), (6.95, top_y + top_h / 2), BLUE)
 
+    # ---- uncertain pre-check: no verdict when the window cannot support one
+    uy, uh = 5.62, 0.62
+    ux = 2.5
+    rbox(ax, ux, uy, 10.65 - ux, uh, "#F4F4F4", GRAY, lw=1.1)
+    ax.text(ux + 0.18, uy + uh * 0.66, "Uncertain if: dropped / unread event pairs · profiler errors · no stage peer · "
+            "slow but no token counts", ha="left", va="center", fontsize=9.5, color=TEXT, zorder=6)
+    ax.text(ux + 0.18, uy + uh * 0.28, "breaks candidate streaks and never counts as a clean window", ha="left",
+            va="center", fontsize=8.8, color=MUTED, zorder=6)
+    upw = 1.95
+    rbox(ax, 0.15, uy, upw, uh, GRAY_FILL, GRAY, lw=1.5, r=0.2)
+    ax.text(0.15 + upw / 2, uy + uh * 0.66, "uncertain", ha="center", va="center", fontsize=10.5, fontweight="bold",
+            color=GRAY_TXT, family="DejaVu Sans Mono", zorder=6)
+    ax.text(0.15 + upw / 2, uy + uh * 0.28, "no verdict · alert held", ha="center", va="center", fontsize=8.8,
+            color=GRAY_TXT, zorder=6)
+    arrow(ax, (ux, uy + uh / 2), (0.15 + upw, uy + uh / 2), GRAY, lw=1.4)
+    arrow(ax, (8.8, top_y), (8.8, uy + uh), BLUE)
+    ax.text(8.7, (top_y + uy + uh) / 2, "every window, every rank", ha="right", va="center", fontsize=9,
+            color=MUTED, style="italic")
+
     # ---- persistence gate
     gy, gh = 4.82, 0.5
     rbox(ax, 0.15, gy, 10.5, gh, BLUE_BAND, BLUE, lw=1.4, ls=(0, (4, 2)))
-    ax.text(5.4, gy + gh / 2, "Persistence gate: a rank must be a candidate for 3 consecutive windows, "
-            "otherwise → none", ha="center", va="center", fontsize=10.2, fontweight="bold", color=BLUE_TXT)
-    arrow(ax, (8.8, top_y), (8.8, gy + gh), BLUE)
-    ax.text(8.7, (top_y + gy + gh) / 2, "every window, every rank", ha="right", va="center", fontsize=9,
-            color=MUTED, style="italic")
+    ax.text(5.4, gy + gh / 2, "Persistence: raise after 3 consecutive candidate windows, clear after 2 consecutive "
+            "clean ones", ha="center", va="center", fontsize=10.2, fontweight="bold", color=BLUE_TXT)
+    arrow(ax, (8.8, uy), (8.8, gy + gh), BLUE)
+    ax.text(8.7, (uy + gy + gh) / 2, "otherwise", ha="right", va="center", fontsize=9, color=MUTED, style="italic")
 
     # ---- priority ladder
     ax.text(0.15, 4.5, "Priority ladder — first match wins", ha="left", va="center", fontsize=10.8,
