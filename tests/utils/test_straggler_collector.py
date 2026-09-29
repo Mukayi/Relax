@@ -7,7 +7,7 @@ import gc
 import pytest
 
 from relax.utils.straggler import collector as collector_module
-from relax.utils.straggler.collector import StragglerCollector, install_straggler_collector
+from relax.utils.straggler.collector import StragglerCollector
 from relax.utils.straggler.detector import DetectorConfig, RankMeta
 from relax.utils.straggler.stats import FIELD_INDEX
 from tests.utils.straggler_helpers import FakeEvent, meta
@@ -258,13 +258,3 @@ def test_forward_only_timers_land_in_lp_buckets():
 def test_report_interval_must_be_positive():
     with pytest.raises(ValueError):
         _collector(world=1, interval=0)
-
-
-def test_install_is_a_no_op_when_disabled_or_for_non_training_roles(monkeypatch):
-    monkeypatch.setenv("RELAX_STRAGGLER_PROFILER", "0")
-    assert install_straggler_collector("actor") is None
-    monkeypatch.setenv("RELAX_STRAGGLER_PROFILER", "1")
-    # These roles never call end_step, so they must not get a collector
-    # (checked before any Megatron parallel state is touched).
-    for role in ("critic", "reference", "actor_fwd"):
-        assert install_straggler_collector(role) is None

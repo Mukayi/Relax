@@ -18,9 +18,6 @@ which may contain several optimizer steps.
 from __future__ import annotations
 
 import gc
-import queue
-import socket
-import threading
 from collections import deque
 from dataclasses import dataclass
 from time import perf_counter, time
@@ -35,7 +32,8 @@ from relax.utils.straggler.stats import (
     MEGATRON_TIMER_SEGMENTS,
     WindowStats,
 )
-from relax.utils.straggler.timers import EventPool, StragglerTimers, cuda_timing_event
+from relax.utils.straggler.timers import EventPool, StragglerTimers
+from relax.utils.straggler.worker import AnalysisWorker
 
 
 logger = get_logger(__name__)
@@ -50,69 +48,11 @@ _DROPPED_INDEX = FIELD_INDEX["dropped"]
 _ERRORS_INDEX = FIELD_INDEX["errors"]
 _HEALTH_INDEX = FIELD_INDEX["health"]
 
-# Only the role that runs the training step (and therefore calls ``end_step``)
-# gets a collector; critic / reference / actor_fwd actors would only fill the
-# pending queue and never drain it.
-PROFILED_ROLES: frozenset[str] = frozenset({"actor"})
-
 # An analysis takes milliseconds (35 ms at 2048 ranks); this only bounds a stuck worker at the end of a run.
 _FINAL_FLUSH_TIMEOUT_S = 10.0
 
 GatherFn = Callable[[list[float]], list[list[float]]]
 GatherObjectsFn = Callable[[Any], list[Any]]
-
-
-def _is_stream_capturing() -> bool:
-    import torch
-
-    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-
-
-def _gloo_all_gather(values: list[float]) -> list[list[float]]:
-    """All-gather one CPU vector over Relax's Gloo group (ranks == global
-    ranks)."""
-    import torch
-    import torch.distributed as dist
-
-    from relax.utils.distributed_utils import get_gloo_group
-
-    group = get_gloo_group()
-    local = torch.tensor(values, dtype=torch.float64)
-    gathered = [torch.empty_like(local) for _ in range(dist.get_world_size(group))]
-    dist.all_gather(gathered, local, group=group)
-    return [row.tolist() for row in gathered]
-
-
-def _gloo_all_gather_objects(obj: Any) -> list[Any]:
-    import torch.distributed as dist
-
-    from relax.utils.distributed_utils import get_gloo_group
-
-    group = get_gloo_group()
-    gathered: list[Any] = [None] * dist.get_world_size(group)
-    dist.all_gather_object(gathered, obj, group=group)
-    return gathered
-
-
-def _local_rank_meta() -> RankMeta:
-    """Build this rank's ``RankMeta`` from Megatron's parallel state."""
-    import torch
-    import torch.distributed as dist
-    from megatron.core import mpu
-
-    from relax.utils.distributed_utils import get_gloo_group
-
-    return RankMeta(
-        # Rank within the Gloo group == global rank; it indexes the gathered table.
-        rank=dist.get_rank(get_gloo_group()),
-        dp=mpu.get_data_parallel_rank(with_context_parallel=True),
-        tp=mpu.get_tensor_model_parallel_rank(),
-        pp=mpu.get_pipeline_model_parallel_rank(),
-        cp=mpu.get_context_parallel_rank(),
-        ep=mpu.get_expert_model_parallel_rank(),
-        host=socket.gethostname(),
-        device=torch.cuda.current_device() if torch.cuda.is_available() else -1,
-    )
 
 
 @dataclass
@@ -131,74 +71,29 @@ class _WindowJob:
     ready: WindowReport | None = None
 
 
-class _AnalysisWorker:
-    """One daemon thread that handles queued jobs in submission order.
-
-    Daemon so that a stuck analysis can never hold up process exit; ``handle``
-    must not raise.
-    """
-
-    def __init__(self, handle: Callable[[_WindowJob], None], name: str = "straggler-analyze") -> None:
-        self._handle = handle
-        self._queue: queue.Queue[_WindowJob | None] = queue.Queue()
-        self._pending = 0
-        self._cond = threading.Condition()
-        self._stopped = False
-        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
-        self._thread.start()
-
-    @property
-    def backlog(self) -> int:
-        return self._pending
-
-    def submit(self, job: _WindowJob) -> None:
-        with self._cond:
-            self._pending += 1
-        self._queue.put(job)
-
-    def flush(self, timeout: float | None) -> bool:
-        """Wait until every submitted job has been handled."""
-        with self._cond:
-            return self._cond.wait_for(lambda: self._pending == 0, timeout)
-
-    def stop(self) -> None:
-        """Let already-queued jobs finish, then end the thread."""
-        if not self._stopped:
-            self._stopped = True
-            self._queue.put(None)
-
-    def _run(self) -> None:
-        while True:
-            job = self._queue.get()
-            if job is None:
-                return
-            try:
-                self._handle(job)
-            finally:
-                with self._cond:
-                    self._pending -= 1
-                    self._cond.notify_all()
-
-
 class StragglerCollector:
     """Queue this rank's timing events, fold them lazily, and gather one window
-    every ``report_interval`` steps."""
+    every ``report_interval`` steps.
+
+    Torch-free: CUDA events, stream-capture detection and the gathers are
+    injected (``runtime`` passes the real ones, tests pass fakes).
+    """
 
     def __init__(
         self,
         *,
         rank_meta: RankMeta,
         is_primary: bool,
+        event_factory: Callable[[], Any],
+        gather: GatherFn,
+        gather_objects: GatherObjectsFn,
+        is_capturing: Callable[[], bool],
         report_interval: int = 10,
         detector_config: DetectorConfig | None = None,
-        event_factory: Callable[[], Any] = cuda_timing_event,
         pool_size: int = 4096,
         max_pending: int = 16384,
-        gather: GatherFn = _gloo_all_gather,
-        gather_objects: GatherObjectsFn = _gloo_all_gather_objects,
         clock: Callable[[], float] = perf_counter,
         register_gc_callback: bool = True,
-        is_capturing: Callable[[], bool] = _is_stream_capturing,
         health_config: HealthConfig | None = None,
         background: bool = True,
         on_report: Callable[[WindowReport], None] | None = None,
@@ -240,7 +135,7 @@ class StragglerCollector:
         self._max_backlog = max_backlog
         self._window_first_rollout: int | None = None
         self._window_last_rollout = -1
-        self._worker = _AnalysisWorker(self._handle_job) if background and is_primary else None
+        self._worker = AnalysisWorker(self._handle_job) if background and is_primary else None
         if register_gc_callback:
             gc.callbacks.append(self._on_gc)
         # One timers object per phase so the same Megatron call sites land in
@@ -513,70 +408,3 @@ class StragglerCollector:
             gc.callbacks.remove(self._on_gc)
         if self._worker is not None:
             self._worker.stop()
-
-
-# ---- process-wide instance ----------------------------------------------------------------------------------------
-
-_COLLECTOR: StragglerCollector | None = None
-
-
-def install_straggler_collector(
-    role: str, on_report: Callable[[WindowReport], None] | None = None
-) -> StragglerCollector | None:
-    """Create the process-wide collector if the profiler is enabled and this
-    actor's ``role`` runs training steps.
-
-    Must run after Megatron parallel state and Relax's Gloo group exist (i.e.
-    from ``MegatronTrainRayActor.init``). ``on_report`` runs on the primary
-    rank's analysis thread for every finished window, so it must only log.
-    Returns ``None`` when disabled so the caller's hot path stays a plain
-    attribute check.
-    """
-    global _COLLECTOR
-    from relax.utils.env import Envs
-
-    if not Envs.RELAX_STRAGGLER_PROFILER or role not in PROFILED_ROLES:
-        return None
-    if _COLLECTOR is not None:
-        return _COLLECTOR
-    from megatron.core import mpu
-
-    # Must match ``log_perf_data``'s primary rank: the window scalars are logged
-    # through it, which drops them on every other rank.
-    is_primary = (
-        mpu.get_tensor_model_parallel_rank() == 0
-        and mpu.is_pipeline_last_stage()
-        and mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-    )
-    _COLLECTOR = StragglerCollector(
-        rank_meta=_local_rank_meta(),
-        is_primary=is_primary,
-        report_interval=Envs.RELAX_STRAGGLER_REPORT_INTERVAL,
-        detector_config=DetectorConfig(
-            z_threshold=Envs.RELAX_STRAGGLER_Z_THRESHOLD,
-            rel_threshold=Envs.RELAX_STRAGGLER_REL_THRESHOLD,
-            persist_windows=Envs.RELAX_STRAGGLER_PERSIST_WINDOWS,
-            recover_windows=Envs.RELAX_STRAGGLER_RECOVER_WINDOWS,
-        ),
-        on_report=on_report,
-    )
-    logger.info(
-        "Straggler profiler enabled: report_interval=%d primary=%s meta=%s",
-        _COLLECTOR.report_interval,
-        is_primary,
-        _COLLECTOR.rank_meta,
-    )
-    return _COLLECTOR
-
-
-def straggler_timers(phase: str) -> StragglerTimers | None:
-    """Return the ``config.timers`` value for ``phase``: the phase-specific
-    timers, or ``None`` when no collector is installed (which is exactly what
-    Relax assigns without the profiler)."""
-    if _COLLECTOR is None:
-        return None
-    if phase == "train":
-        return _COLLECTOR.train_timers
-    if phase == "forward_only":
-        return _COLLECTOR.forward_only_timers
-    raise ValueError(f"unknown straggler phase {phase!r}; expected 'train' or 'forward_only'")

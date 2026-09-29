@@ -37,13 +37,6 @@ class EventSink(Protocol):
         into Megatron's schedule."""
 
 
-def cuda_timing_event() -> Any:
-    """Create a CUDA event that supports ``elapsed_time`` (default factory)."""
-    import torch
-
-    return torch.cuda.Event(enable_timing=True)
-
-
 class EventPool:
     """Reuse timing-event objects so the hot path never allocates.
 
@@ -53,7 +46,7 @@ class EventPool:
 
     __slots__ = ("_free", "_factory", "created")
 
-    def __init__(self, size: int, factory: Callable[[], Any] = cuda_timing_event) -> None:
+    def __init__(self, size: int, factory: Callable[[], Any]) -> None:
         self._factory = factory
         self._free: list[Any] = [factory() for _ in range(size)]
         self.created: int = size

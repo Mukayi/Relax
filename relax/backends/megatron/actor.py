@@ -97,12 +97,7 @@ from relax.utils.utils import (
 )
 
 from ...utils.profile_utils import TrainProfiler
-from ...utils.straggler import (
-    install_straggler_collector,
-    log_straggler_delivery,
-    log_straggler_window,
-    report_straggler_window,
-)
+from ...utils.straggler import install_straggler_profiler
 from ...utils.training.tensor_backper import TensorBackuper
 from .checkpoint import load_checkpoint
 from .collective_utils import _agree_drained
@@ -389,12 +384,8 @@ class MegatronTrainRayActor(TrainRayActor):
             init_tracking(args, primary=False)
 
         self.prof = TrainProfiler(args)
-        # Must precede initialize_model_and_optimizer: the optimizer config picks
-        # up its ``timers`` from the collector when it is built. Only the actor
-        # role drives ``_straggler_end_step``; other roles get ``None``.
-        self.straggler = install_straggler_collector(role, on_report=partial(log_straggler_window, args))
-        self._straggler_emitted = None
-        self._straggler_delivered_ms: float | None = None
+        # Must precede initialize_model_and_optimizer: the optimizer config takes its timers from the profiler.
+        self.straggler = install_straggler_profiler(role, args)
 
         # read config and tokenizer serialized to prevent concurrent writing bug.
         for i in range(args.num_gpus_per_node):
@@ -1763,9 +1754,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 all_audio_seqlens, audio_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
             )
             Timer().audio_seqlens = sum(all_audio_seqlens, [])
-        straggler_metrics = self._straggler_end_step(rollout_id, total_lengths)
-        log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter, extra_metrics=straggler_metrics)
-        self._straggler_delivered(rollout_id)
+        self._log_perf_data(rollout_id, total_lengths)
 
         is_train_done = (rollout_id + 1) == self.args.num_rollout
         if self.args.save is not None and (
@@ -2224,9 +2213,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 all_audio_seqlens, audio_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
             )
             Timer().audio_seqlens = sum(all_audio_seqlens, [])
-        straggler_metrics = self._straggler_end_step(rollout_id, total_lengths)
-        log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter, extra_metrics=straggler_metrics)
-        self._straggler_delivered(rollout_id)
+        self._log_perf_data(rollout_id, total_lengths)
 
         is_train_done = (rollout_id + 1) == self.args.num_rollout
         if self.args.save is not None and (
@@ -2387,49 +2374,18 @@ class MegatronTrainRayActor(TrainRayActor):
                 all_audio_seqlens, audio_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
             )
             Timer().audio_seqlens = sum(all_audio_seqlens, [])
-        straggler_metrics = self._straggler_end_step(rollout_id, total_lengths)
-        log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter, extra_metrics=straggler_metrics)
-        self._straggler_delivered(rollout_id)
+        self._log_perf_data(rollout_id, total_lengths)
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
 
-    def _straggler_end_step(self, rollout_id: int, total_lengths: Sequence[int]) -> dict[str, float] | None:
-        """Close this step in the straggler collector (all ranks; contains a
-        Gloo collective every ``report_interval`` steps) and, on the primary
-        rank, return the scalars of any window whose background analysis has
-        finished (usually the one that closed on the previous step) for this
-        step's ``log_perf_data``.
-
-        The collector never raises; the reporter runs on the training thread,
-        so it is guarded the same way (a profiler bug must not stop training).
-        """
-        if self.straggler is None:
-            return None
-        self.straggler.add_tokens(int(sum(total_lengths)))
-        metrics: dict[str, float] = {}
-        final = (rollout_id + 1) == self.args.num_rollout
-        reports = self.straggler.end_step(rollout_id, final=final)
-        for report in reports:
-            try:
-                metrics.update(report_straggler_window(self.args, report))
-            except Exception as exc:
-                self.straggler.on_error("report", exc)
-        if reports:
-            self._straggler_emitted = reports[-1]
-            if self._straggler_delivered_ms is not None:
-                # A report cannot carry its own delivery time, so each one carries the previous one's.
-                metrics["straggler/latency/prev_delivered_ms"] = self._straggler_delivered_ms
-        return metrics or None
-
-    def _straggler_delivered(self, rollout_id: int) -> None:
-        """Log close-to-delivered latency for the window whose scalars the
-        ``log_perf_data`` call that just returned carried."""
-        report, self._straggler_emitted = self._straggler_emitted, None
-        if report is None:
-            return
-        try:
-            self._straggler_delivered_ms = log_straggler_delivery(self.args, report, rollout_id)
-        except Exception as exc:
-            self.straggler.on_error("report", exc)
+    def _log_perf_data(self, rollout_id: int, total_lengths: Sequence[int]) -> None:
+        """``log_perf_data`` plus the straggler scalars of any analysed window;
+        every rank must call it (the profiler gathers once per window)."""
+        extra = None
+        if self.straggler is not None:
+            extra = self.straggler.step_metrics(rollout_id, int(sum(total_lengths)))
+        log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter, extra_metrics=extra)
+        if self.straggler is not None:
+            self.straggler.delivered(rollout_id)
 
     @timer
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:

@@ -1,21 +1,17 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Always-on, low-overhead straggler (slow rank) analysis for the Megatron
-backend.
+backend; off unless ``RELAX_STRAGGLER_PROFILER`` is set.
 
-See ``relax/utils/straggler/collector.py`` for the data flow. Enabled with the
-``RELAX_STRAGGLER_PROFILER`` environment variable; off by default. Only the
-entry points used by the Megatron backend are re-exported here; the detector
-and timer internals live in their own modules.
+Data flow: ``timers`` (Megatron call sites) -> ``collector`` (per rank, one
+Gloo gather per window) -> ``worker`` thread on the primary rank ->
+``detector`` -> ``reporter``. ``runtime`` binds it to torch / Megatron.
 """
 
-from relax.utils.straggler.collector import install_straggler_collector, straggler_timers
-from relax.utils.straggler.reporter import log_straggler_delivery, log_straggler_window, report_straggler_window
+from relax.utils.straggler.runtime import StragglerProfiler, install_straggler_profiler, straggler_timers
 
 
 __all__ = [
-    "install_straggler_collector",
-    "log_straggler_delivery",
-    "log_straggler_window",
-    "report_straggler_window",
+    "StragglerProfiler",
+    "install_straggler_profiler",
     "straggler_timers",
 ]

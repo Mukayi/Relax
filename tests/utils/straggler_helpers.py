@@ -1,7 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Shared fakes for the CPU-only straggler profiler tests."""
 
-from relax.utils.straggler.detector import RankMeta
+from relax.utils.straggler.collector import StragglerCollector
+from relax.utils.straggler.detector import DetectorConfig, RankMeta
 from relax.utils.straggler.stats import FIELD_INDEX, NUM_FIELDS
 
 
@@ -34,6 +35,43 @@ def row(steps=1, **fields):
     for name, value in fields.items():
         values[FIELD_INDEX[name]] = value * steps
     return values
+
+
+def make_collector(
+    world=2,
+    interval=1,
+    *,
+    is_primary=True,
+    gather=None,
+    persist=1,
+    background=False,
+    register_gc=False,
+    is_capturing=None,
+    **kwargs,
+):
+    """A CPU collector for rank 0 of ``world`` fake ranks; by default every
+    rank reports the same vector as rank 0."""
+    return StragglerCollector(
+        rank_meta=RankMeta(rank=0, dp=0, tp=0, pp=0),
+        is_primary=is_primary,
+        report_interval=interval,
+        detector_config=DetectorConfig(persist_windows=persist),
+        event_factory=FakeEvent,
+        pool_size=kwargs.pop("pool_size", 4),
+        gather=gather or (lambda values: [list(values) for _ in range(world)]),
+        gather_objects=lambda obj: meta(world),
+        register_gc_callback=register_gc,
+        is_capturing=is_capturing or (lambda: False),
+        background=background,
+        **kwargs,
+    )
+
+
+def bracket(collector, name="forward-compute", timers=None):
+    """One start / stop of a Megatron timer name."""
+    timer = (timers or collector.train_timers)(name)
+    timer.start()
+    timer.stop()
 
 
 def meta(world, pp_size=1, tp_size=1):
