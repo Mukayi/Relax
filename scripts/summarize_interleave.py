@@ -9,6 +9,7 @@ cancel in the mean over an equal number of even and odd blocks.
 import csv
 import glob
 import math
+import os
 import re
 import statistics as st
 import sys
@@ -17,7 +18,7 @@ from pathlib import Path
 from scipy.stats import t as student_t
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
-TASK = Path("${WORKDIR}/relax_work/task11")
+TASK = Path(os.environ["WORKDIR"]) / "relax_work" / "task11"
 PERIOD = 10
 SKIP_BLOCKS = 2
 def t975(df: int) -> float:
