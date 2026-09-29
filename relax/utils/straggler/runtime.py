@@ -2,15 +2,16 @@
 """Bindings to torch / Megatron, and the process-wide profiler the Megatron
 actor holds.
 
-Everything that touches CUDA, the process groups or Megatron's parallel state
-is here, so the rest of the package runs (and is tested) on CPU with fakes.
+Everything that touches the accelerator (through ``relax.utils.device``, so
+CUDA and NPU alike), the process groups or Megatron's parallel state is here,
+so the rest of the package runs (and is tested) on CPU with fakes.
 """
 
 from __future__ import annotations
 
 import socket
 from functools import partial
-from typing import Any
+from typing import Any, Callable
 
 from relax.utils.logging_utils import get_logger
 from relax.utils.straggler.collector import StragglerCollector
@@ -26,16 +27,28 @@ logger = get_logger(__name__)
 PROFILED_ROLES: frozenset[str] = frozenset({"actor"})
 
 
-def cuda_timing_event() -> Any:
-    import torch
+def timing_event_factory() -> Callable[[], Any]:
+    """Build timing events of the active accelerator."""
+    from relax.utils.device import device_module
 
-    return torch.cuda.Event(enable_timing=True)
+    return partial(device_module.Event, enable_timing=True)
 
 
-def is_stream_capturing() -> bool:
-    import torch
+def stream_capture_check() -> Callable[[], bool]:
+    """The active accelerator's "is the current stream being captured"
+    check, resolved once because the timers call it on every bracket.
 
-    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+    A backend without one cannot be capturing through this API.
+    """
+    from relax.utils import device
+
+    if not device.is_available():
+        return _never
+    return getattr(device.device_module, "is_current_stream_capturing", None) or _never
+
+
+def _never() -> bool:
+    return False
 
 
 def gloo_all_gather(values: list[float]) -> list[list[float]]:
@@ -65,10 +78,10 @@ def gloo_all_gather_objects(obj: Any) -> list[Any]:
 
 
 def local_rank_meta() -> RankMeta:
-    import torch
     import torch.distributed as dist
     from megatron.core import mpu
 
+    from relax.utils import device
     from relax.utils.distributed_utils import get_gloo_group
 
     return RankMeta(
@@ -80,7 +93,7 @@ def local_rank_meta() -> RankMeta:
         cp=mpu.get_context_parallel_rank(),
         ep=mpu.get_expert_model_parallel_rank(),
         host=socket.gethostname(),
-        device=torch.cuda.current_device() if torch.cuda.is_available() else -1,
+        device=device.device_module.current_device() if device.is_available() else -1,
     )
 
 
@@ -164,10 +177,10 @@ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None
             persist_windows=Envs.RELAX_STRAGGLER_PERSIST_WINDOWS,
             recover_windows=Envs.RELAX_STRAGGLER_RECOVER_WINDOWS,
         ),
-        event_factory=cuda_timing_event,
+        event_factory=timing_event_factory(),
         gather=gloo_all_gather,
         gather_objects=gloo_all_gather_objects,
-        is_capturing=is_stream_capturing,
+        is_capturing=stream_capture_check(),
         on_report=partial(log_straggler_window, args),
     )
     _PROFILER = StragglerProfiler(collector, args)

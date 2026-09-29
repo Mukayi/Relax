@@ -74,6 +74,47 @@ def test_install_is_a_no_op_when_disabled_or_for_non_training_roles(monkeypatch)
         assert install_straggler_profiler(role, _args()) is None
 
 
+class _FakeBackend:
+    """Stands in for ``relax.utils.device.device_module`` on a non-CUDA
+    accelerator."""
+
+    def __init__(self, capturing=None):
+        self.events = []
+        if capturing is not None:
+            self.is_current_stream_capturing = lambda: capturing
+
+    def Event(self, **kwargs):
+        self.events.append(kwargs)
+        return object()
+
+
+def _use_backend(monkeypatch, backend, available=True):
+    from relax.utils import device
+
+    monkeypatch.setattr(device, "device_module", backend)
+    monkeypatch.setattr(device, "is_available", lambda: available)
+
+
+def test_timing_events_come_from_the_active_accelerator(monkeypatch):
+    backend = _FakeBackend()
+    _use_backend(monkeypatch, backend)
+    runtime.timing_event_factory()()
+    assert backend.events == [{"enable_timing": True}]
+
+
+@pytest.mark.parametrize(
+    ("capturing", "available", "expected"), [(True, True, True), (False, True, False), (True, False, False)]
+)
+def test_capture_check_uses_the_backend_function_when_there_is_one(monkeypatch, capturing, available, expected):
+    _use_backend(monkeypatch, _FakeBackend(capturing=capturing), available=available)
+    assert runtime.stream_capture_check()() is expected
+
+
+def test_capture_check_is_false_when_the_backend_has_none(monkeypatch):
+    _use_backend(monkeypatch, _FakeBackend())
+    assert runtime.stream_capture_check()() is False
+
+
 def test_timers_are_none_without_a_profiler():
     assert runtime.straggler_timers("train") is None
     with pytest.raises(ValueError):
