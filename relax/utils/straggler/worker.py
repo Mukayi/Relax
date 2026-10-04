@@ -11,8 +11,8 @@ from typing import Any, Callable
 class AnalysisWorker:
     """Hand each submitted job to ``handle`` on a single daemon thread.
 
-    Daemon so that a stuck job can never hold up process exit; ``handle``
-    must not raise.
+    Daemon so that a stuck job can never hold up process exit; ``handle`` must
+    not raise.
     """
 
     def __init__(self, handle: Callable[[Any], None], name: str = "straggler-analyze") -> None:

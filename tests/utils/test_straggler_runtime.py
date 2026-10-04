@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""CPU tests for the per-step reporting the Megatron actor drives, and for
-when the profiler gets installed."""
+"""CPU tests for the per-step reporting the Megatron actor drives, and for when
+the profiler gets installed."""
 
 from argparse import Namespace
 

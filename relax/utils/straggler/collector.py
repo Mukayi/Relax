@@ -54,9 +54,9 @@ GatherObjectsFn = Callable[[Any], list[Any]]
 
 @dataclass
 class _WindowJob:
-    """One closed window on its way to the analysis; ``ready`` carries a
-    report that needs no analysis (the switch-off notice) through the same
-    queue so reports stay in window order."""
+    """One closed window on its way to the analysis; ``ready`` carries a report
+    that needs no analysis (the switch-off notice) through the same queue so
+    reports stay in window order."""
 
     table: list[list[float]] | None
     meta: list[RankMeta]
@@ -143,8 +143,8 @@ class StragglerCollector:
     # ---- hot path -----------------------------------------------------------------------------------------------
 
     def record_event(self) -> Any:
-        """Record a pooled event on the current stream and open the step for
-        GC attribution.
+        """Record a pooled event on the current stream and open the step for GC
+        attribution.
 
         Returns ``None`` (the bracket is skipped) once the profiler is
         disabled, and during CUDA graph capture, where ``elapsed_time`` would
@@ -238,10 +238,10 @@ class StragglerCollector:
 
         All ranks must call this at the same logical step (it contains a
         collective). Never raises: profiler failures are counted by
-        ``self.health``. Returns the reports that are ready on the primary
-        rank (empty elsewhere and between windows). On the ``final`` step of a
-        run it waits (bounded) for the pending analyses, since no later call
-        would pick them up.
+        ``self.health``. Returns the reports that are ready on the primary rank
+        (empty elsewhere and between windows). On the ``final`` step of a run
+        it waits (bounded) for the pending analyses, since no later call would
+        pick them up.
         """
         if self._disabled:
             return self._take_reports()
@@ -344,8 +344,8 @@ class StragglerCollector:
         """Analyze one window (worker thread, or inline without a worker) and
         queue its report for ``end_step``; never raises.
 
-        Only this method touches ``detector_state``, and jobs run one at a
-        time in window order.
+        Only this method touches ``detector_state``, and jobs run one at a time
+        in window order.
         """
         report = job.ready
         if report is None:

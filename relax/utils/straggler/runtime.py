@@ -35,8 +35,8 @@ def timing_event_factory() -> Callable[[], Any]:
 
 
 def stream_capture_check() -> Callable[[], bool]:
-    """The active accelerator's "is the current stream being captured"
-    check, resolved once because the timers call it on every bracket.
+    """The active accelerator's "is the current stream being captured" check,
+    resolved once because the timers call it on every bracket.
 
     A backend without one cannot be capturing through this API.
     """

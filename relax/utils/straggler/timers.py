@@ -33,8 +33,8 @@ class EventSink(Protocol):
         """Return an event whose bracket could not be completed."""
 
     def on_error(self, where: str, exc: BaseException) -> None:
-        """Count an exception caught on the hot path instead of raising it
-        into Megatron's schedule."""
+        """Count an exception caught on the hot path instead of raising it into
+        Megatron's schedule."""
 
 
 class EventPool:
@@ -83,8 +83,8 @@ class _SegmentTimer:
     ``barrier`` is accepted for protocol compatibility and ignored: a barrier
     here would reintroduce exactly the synchronization we are avoiding. A
     second ``start`` without ``stop`` is ignored rather than asserted, and an
-    exception from the sink skips the bracket and goes to ``sink.on_error``,
-    so the profiler can never take the training loop down.
+    exception from the sink skips the bracket and goes to ``sink.on_error``, so
+    the profiler can never take the training loop down.
     """
 
     __slots__ = ("_segment_index", "_sink", "_start_event", "_start_cpu")
