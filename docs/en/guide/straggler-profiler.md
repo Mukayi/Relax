@@ -49,6 +49,8 @@ its own GPU compute is 0.99x peers, gc 1.8 ms, cpu/gpu fwd 1.26x -> late_arrival
     1 | rank1_dp1_tp0_pp0 | …    |      1 |  1083.4 |   404.3 |    54.7 | 15534.4 |        69.7 |   2.2 | none
 ```
 
+This alert is from the prototype's first real job (see `late_arrival` below); the `its own GPU …` item has since changed from the own-time ratio to the forward ratio (`its own GPU forward is …x peers`).
+
 A rank whose window cannot support a verdict is reported as uncertain with a cause (one WARNING when the cause changes) instead of silently passing as healthy:
 
 ```text
@@ -61,6 +63,7 @@ closed; their time lands in the next window
 | `dropped_events` / `unread_events` / `profiler_errors` | That rank's timing for the window is incomplete: event pairs were dropped because the queue was full, were not yet readable when the window closed (they count in the next window), or the profiler caught errors on that rank. An unread `dp_grad_sync` bracket would make the rank look like a late arriver, so no verdict is drawn. |
 | `no_peers` | Its PP stage has no other rank to compare with. |
 | `missing_tokens` | It looks slow, but its stage has no token counts, so data imbalance cannot be told apart from a slow device. |
+| `no_wait_reference` | It waits on PP peers, but every other rank of its stage is flagged, late or uncertain, so there is no wait to compare with. |
 
 An uncertain window counts neither way: it breaks candidate streaks and is not a clean window for clearing an alert; an existing alert stays as it is.
 
@@ -73,13 +76,13 @@ These scalars go out in the same `tracking_utils.log` call as the `perf/*` metri
 | `straggler/{fwd,bwd,optim,pp_recv,pp_send,dp_grad_sync,dp_param_gather,lp_fwd,lp_pp_recv,lp_pp_send}/{median_ms,max_ms,max_rank,spread}` | Per-segment GPU time (ms/step): median and global max across ranks; `max_rank` / `spread` are the rank with the largest excess over *its PP-stage peers* and that excess (`value/peer_median − 1`). `lp_*` are the same segments during log-prob / forward-only passes. `dp_param_gather` is only populated when `--overlap-param-gather` is off (Megatron does not time the overlapped path). |
 | `straggler/self/*`, `straggler/self_per_ktok/*` | Own compute time (`fwd + bwd + optim`) and its per-token normalisation; the latter is omitted, like `tokens/*`, when any rank reports zero tokens. |
 | `straggler/wait/{median_ms,max_ms,max_rank,spread}` | Time spent waiting for peers (`pp_recv + dp_grad_sync + dp_param_gather`). |
-| `straggler/late/max_ms`, `straggler/late/max_rank`, `straggler/late/peer_idle_ms` | The rank that reaches the DP gradient sync last, by how much, and how long its peers idle for it per step. |
+| `straggler/late/max_ms`, `straggler/late/max_rank`, `straggler/late/peer_idle_ms` | The rank that reaches the DP gradient sync last, by how much (compared on `bwd + dp_grad_sync`, see `late_arrival` below), and how long its peers idle for it per step. |
 | `straggler/tokens/{median,max,spread}` | Token-count imbalance: `median` / `max` are global, `spread` is the largest excess within a stage; omitted when any rank reports zero tokens. |
 | `straggler/pp_stage_imbalance` | `max/min` of per-stage median compute time; independent of any slow device. |
 | `straggler/gc/{median_ms,max_ms}` | Python GC pauses. |
 | `straggler/flagged/count`, `straggler/flagged/rank` (−1 if none), `straggler/flagged/reason` | Alert state. Reason codes: 0 none, 1 slow_device, 2 data_imbalance, 3 upstream_wait, 4 cpu_bound, 5 late_arrival. |
 | `straggler/waiting/count` | Ranks waiting on a slow upstream PP stage in this window (victims, not culprits; not counted in `flagged`). |
-| `straggler/uncertain/count`, `straggler/uncertain/rank` (−1 if none), `straggler/uncertain/cause` | Number of uncertain ranks, the first one and its cause. Cause codes: 0 none, 1 dropped_events, 2 unread_events, 3 profiler_errors, 4 no_peers, 5 missing_tokens. |
+| `straggler/uncertain/count`, `straggler/uncertain/rank` (−1 if none), `straggler/uncertain/cause` | Number of uncertain ranks, the first one and its cause. Cause codes: 0 none, 1 dropped_events, 2 unread_events, 3 profiler_errors, 4 no_peers, 5 missing_tokens, 6 no_wait_reference. |
 | `straggler/recovered/count` | Ranks whose alert cleared in this window. |
 | `straggler/window/first_rollout`, `straggler/window/last_rollout` | The window these scalars belong to (they are usually emitted one rollout later). |
 | `straggler/latency/analyzed_ms`, `straggler/latency/emitted_ms`, `straggler/latency/prev_delivered_ms` | Report latency, all measured from the window close (before the gather): analysis done (the alert lines are logged at that moment), scalars handed to `log_perf_data` on the training thread, and the previous window's `log_perf_data` returned (with the metrics service: the service acknowledged it; a window cannot carry its own delivery time). Each delivered window also logs an INFO line `window rollouts 10-19: closed -> analyzed +… ms (alerts logged), emitted +… ms, delivered +… ms`. |
@@ -94,13 +97,15 @@ With `--timeline-dump-dir` set (the timeline is flushed through the metrics-serv
 
 | reason | Rule | Where to look |
 |--------|------|---------------|
-| `slow_device` | Own GPU time well above the other ranks of the same PP stage, token count normal | `nvidia-smi -q -d CLOCK,PERFORMANCE,TEMPERATURE`, ECC, neighbours on the node, NVLink topology |
-| `data_imbalance` | Own time high but normal per token; token count clearly higher | `--balance-data`, dynamic batch splitting, oversize samples |
-| `cpu_bound` | Own time high *and* Python GC pauses during the step ≥ 5 % of it | `gc.freeze()`, data threads contending for the GIL, per-token Python loops |
-| `upstream_wait` | Own time normal but `pp_recv` well above the same-stage peers, by at least 5 % of the stage's median own time | The flagged rank on the upstream stage, or `pp_stage_imbalance` (uneven layer split) |
-| `late_arrival` | Own GPU time normal, but its `dp_grad_sync` bracket is much *shorter* than its DP peers' — a collective finishes for everyone at once, so the last rank to arrive has the shortest bracket and everyone else's bracket contains the wait for it | Host-side gaps between kernels: data fetch, synchronous I/O / HTTP, GIL, launch gaps. `py-spy dump --pid <pid>` on that rank is the quickest confirmation |
+| `slow_device` | Own GPU time or forward time well above the other ranks of the same PP stage, token count normal | `nvidia-smi -q -d CLOCK,PERFORMANCE,TEMPERATURE`, ECC, neighbours on the node, NVLink topology |
+| `data_imbalance` | Own or forward time high but normal per token; token count clearly higher | `--balance-data`, dynamic batch splitting, oversize samples |
+| `cpu_bound` | Own or forward time high *and* Python GC pauses during the step ≥ 5 % of its own time | `gc.freeze()`, data threads contending for the GIL, per-token Python loops |
+| `upstream_wait` | Own time normal but `pp_recv` well above the same-stage ranks that are neither flagged nor late, by at least 5 % of the stage's median own time; a rank that reaches the gradient sync late because it waits on PP is classed here too | The flagged rank on the upstream stage, or `pp_stage_imbalance` (uneven layer split) |
+| `late_arrival` | Own GPU time normal, but its `bwd + dp_grad_sync` is much *shorter* than its DP peers' — a collective finishes for everyone at once, so the last rank to arrive waits least and everyone else's time contains the wait for it | Host-side gaps between kernels: data fetch, synchronous I/O / HTTP, GIL, launch gaps. `py-spy dump --pid <pid>` on that rank is the quickest confirmation |
 
 `late_arrival` is easy to miss: any rule that only looks at GPU time cannot see it. It showed up in the very first real job the prototype ran on — rank 0's GPU time matched its peers, yet it reached every gradient sync 0.4–1.5 s late because the primary rank was posting logging metrics over synchronous HTTP on the training thread.
+
+With `--overlap-grad-reduce` the gradient reduce-scatter is issued bucket by bucket during backward, so the wait for the slowest rank lands in every DP peer's `bwd` and only a short tail is left in `dp_grad_sync`. That is why late arrival is compared on `bwd + dp_grad_sync` (which ends when the gradient sync completes, with or without the overlap), and why slow ranks are also compared on forward alone (forward has no DP collective). The waiting peers' own time grows too, so a `late_arrival` alert quotes the rank's forward against its peers, not its own time.
 
 ## When the profiler itself fails
 

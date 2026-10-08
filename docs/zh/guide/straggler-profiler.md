@@ -49,6 +49,8 @@ its own GPU compute is 0.99x peers, gc 1.8 ms, cpu/gpu fwd 1.26x -> late_arrival
     1 | rank1_dp1_tp0_pp0 | …    |      1 |  1083.4 |   404.3 |    54.7 | 15534.4 |        69.7 |   2.2 | none
 ```
 
+这条告警来自原型的第一个真实作业（见下文 `late_arrival`）；此后 `its own GPU …` 一项已从自身时间之比改为 forward 之比（`its own GPU forward is …x peers`）。
+
 某个 rank 的窗口不足以下结论时，它被标为「不确定」并给出原因（原因变化时打一条 WARNING），而不是默默当作正常：
 
 ```text
@@ -61,6 +63,7 @@ closed; their time lands in the next window
 | `dropped_events` / `unread_events` / `profiler_errors` | 该 rank 这个窗口的计时不完整：有事件对因队列满被丢弃、窗口结束时还没读到（会计入下一个窗口）、或分析器在该 rank 上捕获了异常。未读到的 `dp_grad_sync` 会让该 rank 看起来像晚到，所以不下结论。 |
 | `no_peers` | 所在 PP stage 没有其他 rank 可比。 |
 | `missing_tokens` | 看起来算得慢，但该 stage 没有 token 数，分不清是数据不均还是设备慢。 |
+| `no_wait_reference` | 它在等 PP，但同 stage 的其他 rank 都被判为慢、晚到或不确定，没有可以对比的等待时间。 |
 
 「不确定」的窗口两头都不算：它打断候选的连续计数，也不算作告警解除的干净窗口；已有的告警保持不变。
 
@@ -73,13 +76,13 @@ closed; their time lands in the next window
 | `straggler/{fwd,bwd,optim,pp_recv,pp_send,dp_grad_sync,dp_param_gather,lp_fwd,lp_pp_recv,lp_pp_send}/{median_ms,max_ms,max_rank,spread}` | 每段 GPU 时间（ms/step）的全局中位数、最大值；`max_rank` / `spread` 是相对**同 PP stage 其他 rank** 超出最多的那个 rank 及其超出比例（`value/peer_median − 1`）。`lp_*` 是 log-prob / forward-only 阶段的同一组段。`dp_param_gather` 只在关闭 `--overlap-param-gather` 时有值（Megatron 不给 overlap 路径计时）。 |
 | `straggler/self/*`、`straggler/self_per_ktok/*` | 自身计算时间（`fwd + bwd + optim`）及其按 token 归一化后的版本；后者与 `tokens/*` 一样，任一 rank token 数为 0 时不输出。 |
 | `straggler/wait/{median_ms,max_ms,max_rank,spread}` | 等待别人的时间（`pp_recv + dp_grad_sync + dp_param_gather`）。 |
-| `straggler/late/max_ms`、`straggler/late/max_rank`、`straggler/late/peer_idle_ms` | 最晚到达 DP 梯度同步的 rank、晚了多少、同组其他 rank 因此每步空转多久。 |
+| `straggler/late/max_ms`、`straggler/late/max_rank`、`straggler/late/peer_idle_ms` | 最晚到达 DP 梯度同步的 rank、晚了多少（按 `bwd + dp_grad_sync` 比较，见下文 `late_arrival`）、同组其他 rank 因此每步空转多久。 |
 | `straggler/tokens/{median,max,spread}` | 各 rank 每步 token 数的不均程度：`median` / `max` 为全局值，`spread` 为同 stage 内最大超出；任一 rank token 数为 0 时不输出。 |
 | `straggler/pp_stage_imbalance` | 各 PP stage 计算时间中位数的 `max/min`，与是否有慢 rank 无关。 |
 | `straggler/gc/{median_ms,max_ms}` | Python GC 停顿。 |
 | `straggler/flagged/count`、`straggler/flagged/rank`（无则 −1）、`straggler/flagged/reason` | 告警状态。reason 编码：0 none、1 slow_device、2 data_imbalance、3 upstream_wait、4 cpu_bound、5 late_arrival。 |
 | `straggler/waiting/count` | 本窗口因上游 PP stage 慢而在等的 rank 数（被上游拖慢，不是慢 rank；不计入 `flagged`）。 |
-| `straggler/uncertain/count`、`straggler/uncertain/rank`（无则 −1）、`straggler/uncertain/cause` | 「不确定」的 rank 数、第一个这样的 rank 及其原因。原因编码：0 none、1 dropped_events、2 unread_events、3 profiler_errors、4 no_peers、5 missing_tokens。 |
+| `straggler/uncertain/count`、`straggler/uncertain/rank`（无则 −1）、`straggler/uncertain/cause` | 「不确定」的 rank 数、第一个这样的 rank 及其原因。原因编码：0 none、1 dropped_events、2 unread_events、3 profiler_errors、4 no_peers、5 missing_tokens、6 no_wait_reference。 |
 | `straggler/recovered/count` | 本窗口解除告警的 rank 数。 |
 | `straggler/window/first_rollout`、`straggler/window/last_rollout` | 这组标量属于哪个窗口（它们通常随下一个 rollout 发出）。 |
 | `straggler/latency/analyzed_ms`、`straggler/latency/emitted_ms`、`straggler/latency/prev_delivered_ms` | 上报时延，均从窗口结束（gather 之前）算起：判定完成（告警日志此刻打出）、训练线程把标量交给 `log_perf_data`、上一个窗口的 `log_perf_data` 返回（开 metrics service 时即服务端已确认收到；一个窗口不能在自己的数据里带自己的送达时间）。每个窗口送达后另有一行 INFO：`window rollouts 10-19: closed -> analyzed +… ms (alerts logged), emitted +… ms, delivered +… ms`。 |
@@ -94,13 +97,15 @@ closed; their time lands in the next window
 
 | reason | 判定依据 | 排查方向 |
 |--------|----------|----------|
-| `slow_device` | 自身 GPU 时间显著高于同 PP stage 的其他 rank，token 数正常 | `nvidia-smi -q -d CLOCK,PERFORMANCE,TEMPERATURE`、ECC、同机邻居、NVLink 拓扑 |
-| `data_imbalance` | 自身时间高，但按 token 归一化后正常，token 数明显偏多 | `--balance-data`、动态 batch 切分、超长样本 |
-| `cpu_bound` | 自身时间偏高，**且**训练步内的 Python GC 停顿占自身时间 ≥ 5% | `gc.freeze()`、数据处理线程与训练线程抢 GIL、Python 侧 per-token 循环 |
-| `upstream_wait` | 自身正常，但 `pp_recv` 显著高于同 stage 其他 rank，且超出量 ≥ 该 stage 中位自身时间的 5% | 看上游 stage 被 flag 的 rank，或 `pp_stage_imbalance`（层划分不均） |
-| `late_arrival` | 自身 GPU 时间正常，但它的 `dp_grad_sync` 区间显著**短于**同 DP 组其他 rank——一次集合通信对所有人同时结束，最后到的那个 rank 区间最短，其他人的区间里都含着等它的时间 | GPU 之间的 CPU 侧空隙：数据取用、同步 I/O / HTTP、GIL、launch gap；对该 rank `py-spy dump --pid <pid>` 最直接 |
+| `slow_device` | 自身 GPU 时间或 forward 时间显著高于同 PP stage 的其他 rank，token 数正常 | `nvidia-smi -q -d CLOCK,PERFORMANCE,TEMPERATURE`、ECC、同机邻居、NVLink 拓扑 |
+| `data_imbalance` | 自身时间或 forward 时间高，但按 token 归一化后正常，token 数明显偏多 | `--balance-data`、动态 batch 切分、超长样本 |
+| `cpu_bound` | 自身时间或 forward 时间偏高，**且**训练步内的 Python GC 停顿占自身时间 ≥ 5% | `gc.freeze()`、数据处理线程与训练线程抢 GIL、Python 侧 per-token 循环 |
+| `upstream_wait` | 自身正常，但 `pp_recv` 显著高于同 stage 中未被判为慢或晚到的 rank，且超出量 ≥ 该 stage 中位自身时间的 5%；因为等 PP 而晚到梯度同步的 rank 也归为这一类 | 看上游 stage 被 flag 的 rank，或 `pp_stage_imbalance`（层划分不均） |
+| `late_arrival` | 自身 GPU 时间正常，但它的 `bwd + dp_grad_sync` 显著**短于**同 DP 组其他 rank——一次集合通信对所有人同时结束，最后到的那个 rank 等得最少，其他人的这段时间里都含着等它的时间 | GPU 之间的 CPU 侧空隙：数据取用、同步 I/O / HTTP、GIL、launch gap；对该 rank `py-spy dump --pid <pid>` 最直接 |
 
 `late_arrival` 容易被漏掉：只看 GPU 时间的规则抓不到它。它在原型的第一个真实作业里就出现了——rank 0 的 GPU 时间和大家一样，却每步晚 0.4–1.5 s 到梯度同步，原因是 primary rank 在训练线程上同步发送日志指标的 HTTP 请求。
+
+开启 `--overlap-grad-reduce` 时，梯度 reduce-scatter 在 backward 中按 bucket 发出，同 DP 组其他 rank 等最慢 rank 的时间落在各自的 `bwd` 里，`dp_grad_sync` 只剩很短的尾段。所以晚到按 `bwd + dp_grad_sync` 比较（开不开 overlap，这段时间都在梯度同步完成时结束），慢 rank 除了自身时间还单独比较 forward（forward 里没有 DP 集合通信）。在等的 rank 自身时间也会变长，所以 `late_arrival` 告警报的是该 rank 的 forward 与其他 rank 之比，而不是自身时间之比。
 
 ## 分析器自身出错时
 
