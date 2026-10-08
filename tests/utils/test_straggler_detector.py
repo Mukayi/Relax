@@ -284,7 +284,8 @@ def test_upstream_wait_needs_persist_windows_and_never_feeds_the_culprit_streak(
 
 
 def test_two_rank_group_uses_leave_one_out_reference():
-    table = [_healthy_row(), _healthy_row(fwd=115.0, bwd=230.0)]  # self 365 vs 320 = 14% slower than its only peer
+    # self 365 vs 320 = 14% slower than its only peer, which waits those 45 ms in the grad-sync.
+    table = [_healthy_row(dp_grad_sync=50.0), _healthy_row(fwd=115.0, bwd=230.0)]
     report = _analyze_once(table, _meta(2), rel_threshold=0.10)
     assert report.metrics["straggler/flagged/rank"] == 1
     assert report.metrics["straggler/self/spread"] == pytest.approx(365.0 / 320.0 - 1.0, abs=1e-6)
@@ -362,11 +363,102 @@ def test_small_or_uniform_grad_sync_is_not_late_arrival():
     assert report.metrics["straggler/flagged/count"] == 0
 
 
+def test_group_without_grad_sync_brackets_has_no_late_arrival():
+    # A shorter backward alone is not lateness when no grad-sync was timed.
+    table = [_healthy_row(bwd=400.0, dp_grad_sync=0.0) for _ in range(4)]
+    table[1] = _healthy_row(bwd=200.0, dp_grad_sync=0.0)
+    report = _analyze_once(table, _meta(4))
+    assert report.metrics["straggler/late/max_rank"] == -1
+    assert all(reason != "late_arrival" for _, reason in _reasons(report))
+
+
 def test_slow_compute_takes_precedence_over_late_arrival_classification():
     # A rank whose kernels are slow naturally also arrives late; report the root cause.
     table = [_healthy_row(dp_grad_sync=200.0) for _ in range(4)]
     table[1] = _healthy_row(fwd=150.0, bwd=300.0, dp_grad_sync=20.0)
     assert _reasons(_analyze_once(table, _meta(4))) == [(1, "slow_device")]
+
+
+def test_slow_device_under_overlapped_grad_reduce_is_caught_by_its_forward():
+    # Qwen3-0.6B DP8 with --overlap-grad-reduce and another process contending for
+    # GPU 5's SMs: the peers' backward waits for rank 5, so the self totals match.
+    table = [_healthy_row(fwd=289.0, bwd=1374.0, optim=2.0, dp_grad_sync=30.0) for _ in range(8)]
+    table[5] = _healthy_row(fwd=615.0, bwd=1065.0, optim=2.0, dp_grad_sync=5.0)
+    report = _analyze_once(table, _meta(8))
+    assert report.metrics["straggler/self/spread"] < 0.02
+    assert _reasons(report) == [(5, "slow_device")]
+    assert "fwd 615.0 ms/step = 2.13x peers" in report.alerts[0].message
+    assert "self 1.01x" in report.alerts[0].message
+
+
+def test_token_heavy_forward_under_overlap_is_data_imbalance():
+    table = [_healthy_row(fwd=100.0, bwd=260.0) for _ in range(8)]
+    table[2] = _healthy_row(fwd=140.0, bwd=225.0, tokens=11200.0)  # 40% more tokens, peers wait in backward
+    report = _analyze_once(table, _meta(8))
+    assert _reasons(report) == [(2, "data_imbalance")]
+    assert "fwd ms/ktok 1.00x" in report.alerts[0].message
+
+
+def test_late_arrival_under_overlapped_grad_reduce_shows_in_the_peers_backward():
+    # Rank 3 sleeps 200 ms on the host before each step's forward: with the grad
+    # reduce overlapped, the peers wait inside backward and every grad-sync bracket is short.
+    table = [_healthy_row(fwd=290.0, bwd=664.0, optim=2.0, dp_grad_sync=7.0) for _ in range(8)]
+    table[3] = _healthy_row(fwd=290.0, bwd=513.0, optim=2.0, dp_grad_sync=7.0)
+    report = _analyze_once(table, _meta(8))
+    assert _reasons(report) == [(3, "late_arrival")]
+    assert "151.0 ms/step after its DP peers (peers idle 158.0 ms/step" in report.alerts[0].message
+    assert report.metrics["straggler/late/max_rank"] == 3
+    assert report.metrics["straggler/late/peer_idle_ms"] == pytest.approx(158.0)
+
+
+def test_slow_tp_pair_does_not_make_its_unflagged_stage_peers_upstream_wait():
+    # Qwen3-4B TP2 x PP2 x DP2 with SM contention on GPU 1 (numbers from that run): ranks 0 / 1
+    # (dp0, stage 0) are slow, so they hardly wait on PP; ranks 2 / 3 wait as usual
+    # (820 ms) and must not be compared with 0 / 1. Ranks 4 / 5 (dp0, stage 1) wait
+    # for 0 / 1 and are the real victims.
+    stage0 = [
+        _healthy_row(fwd=2300.0, bwd=3740.0, pp_recv=159.0, dp_grad_sync=100.0),
+        _healthy_row(fwd=2250.0, bwd=3690.0, pp_recv=180.0, dp_grad_sync=100.0),
+        _healthy_row(fwd=1130.0, bwd=4240.0, pp_recv=829.0, dp_grad_sync=100.0),
+        _healthy_row(fwd=1120.0, bwd=4170.0, pp_recv=822.0, dp_grad_sync=100.0),
+    ]
+    stage1 = [
+        _healthy_row(fwd=1000.0, bwd=1960.0, pp_recv=3218.0, dp_grad_sync=100.0),
+        _healthy_row(fwd=990.0, bwd=1940.0, pp_recv=3259.0, dp_grad_sync=100.0),
+        _healthy_row(fwd=995.0, bwd=1955.0, pp_recv=800.0, dp_grad_sync=100.0),
+        _healthy_row(fwd=995.0, bwd=1955.0, pp_recv=801.0, dp_grad_sync=100.0),
+    ]
+    report = _analyze_once(stage0 + stage1, _meta(8, pp_size=2, tp_size=2))
+    assert _reasons(report) == [(0, "slow_device"), (1, "slow_device"), (4, "upstream_wait"), (5, "upstream_wait")]
+    assert report.uncertain == []
+
+
+def test_rank_late_to_the_grad_sync_because_it_waits_on_pp_is_upstream_wait():
+    # Without overlap: stage-1 ranks 4 / 5 (dp0) wait 2.4 s on a slow stage 0 and so
+    # reach the DP grad-sync 2.4 s after ranks 6 / 7, which idle there.
+    table = [_healthy_row() for _ in range(4)] + [
+        _healthy_row(pp_recv=2400.0, dp_grad_sync=20.0),
+        _healthy_row(pp_recv=2410.0, dp_grad_sync=20.0),
+        _healthy_row(pp_recv=10.0, dp_grad_sync=2420.0),
+        _healthy_row(pp_recv=10.0, dp_grad_sync=2410.0),
+    ]
+    report = _analyze_once(table, _meta(8, pp_size=2, tp_size=2))
+    assert _reasons(report) == [(4, "upstream_wait"), (5, "upstream_wait")]
+
+
+def test_pp_wait_without_an_unflagged_stage_peer_is_uncertain():
+    # PP=2 x DP=2: rank 0 is slow, so rank 1, its only stage peer, has nobody to
+    # compare its PP wait with. Rank 2 (stage 1, same replica as rank 0) waits on it.
+    table = [
+        _healthy_row(fwd=150.0, bwd=300.0, pp_recv=20.0),
+        _healthy_row(pp_recv=60.0, dp_grad_sync=135.0),
+        _healthy_row(pp_recv=200.0),
+        _healthy_row(pp_recv=60.0, dp_grad_sync=135.0),
+    ]
+    report = _analyze_once(table, _meta(4, pp_size=2))
+    assert _reasons(report) == [(0, "slow_device"), (2, "upstream_wait")]
+    assert [(u.rank, u.cause) for u in report.uncertain] == [(1, "no_wait_reference")]
+    assert report.metrics["straggler/uncertain/cause"] == UNCERTAIN_CODE["no_wait_reference"]
 
 
 def test_missing_tokens_disables_token_metrics():

@@ -49,8 +49,6 @@ NUM_FIELDS: int = len(FIELDS)
 # "time this rank spent waiting for a peer". Used by the detector.
 SELF_SEGMENTS: tuple[str, ...] = ("fwd", "bwd", "optim")
 WAIT_SEGMENTS: tuple[str, ...] = ("pp_recv", "dp_grad_sync", "dp_param_gather")
-# Segment whose per-rank asymmetry inside a grad-sync group exposes late arrival.
-LATE_ARRIVAL_SEGMENT = "dp_grad_sync"
 
 # Megatron timer name -> segment, for the training phase. Names come from
 # megatron/core/pipeline_parallel/schedules.py, p2p_communication.py,
