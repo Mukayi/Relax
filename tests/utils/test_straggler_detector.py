@@ -407,6 +407,8 @@ def test_late_arrival_under_overlapped_grad_reduce_shows_in_the_peers_backward()
     report = _analyze_once(table, _meta(8))
     assert _reasons(report) == [(3, "late_arrival")]
     assert "151.0 ms/step after its DP peers (peers idle 158.0 ms/step" in report.alerts[0].message
+    # Its self total is lower than the peers', whose backward includes waiting for it.
+    assert "its own GPU forward is 1.00x peers" in report.alerts[0].message
     assert report.metrics["straggler/late/max_rank"] == 3
     assert report.metrics["straggler/late/peer_idle_ms"] == pytest.approx(158.0)
 

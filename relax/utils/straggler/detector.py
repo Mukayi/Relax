@@ -538,7 +538,7 @@ def _culprit(
     return "late_arrival", (
         f"{who} reaches the DP grad-sync {late.ms[i]:.1f} ms/step after its DP peers "
         f"(peers idle {late.peer_idle[i]:.1f} ms/step = {idle_frac:.0%} of their compute, z={late.z[i]:.1f}) "
-        f"for {windows} windows; its own GPU compute is {1 + peers.rel_self[i]:.2f}x peers, gc {gc_ms:.1f} ms, "
+        f"for {windows} windows; its own GPU forward is {1 + peers.rel_fwd[i]:.2f}x peers, gc {gc_ms:.1f} ms, "
         f"cpu/gpu fwd {cpu_over_gpu:.2f}x -> late_arrival (host-side stall)"
     )
 
