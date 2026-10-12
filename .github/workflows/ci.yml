@@ -28,6 +28,8 @@ jobs:
     # A failed gate must run the tests, never grant an exemption.
     if: ${{ !cancelled() && (needs.bypass.result != 'success' || needs.bypass.outputs.can-skip != 'true') }}
     name: Pre-commit Checks
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -99,7 +101,10 @@ jobs:
               f.write('    def __getattr__(self, name): return self\n')
               f.write('    def __call__(self, *a, **k): return self\n')
               f.write('_s = _Stub()\n')
-              f.write('def __getattr__(name): return _s\n')
+              f.write('def __getattr__(name):\n')
+              f.write('    if name.startswith(\"__\"):\n')
+              f.write('        raise AttributeError(name)\n')
+              f.write('    return _s\n')
           "
 
       - name: Run tests

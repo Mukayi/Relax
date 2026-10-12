@@ -116,8 +116,11 @@ git commit -m "feat: describe your change"
 - `docs:` - 文档更改
 - `style:` - 代码风格更改（格式化等）
 - `refactor:` - 代码重构
+- `perf:` - 性能改进
 - `test:` - 添加或更新测试
-- `chore:` - 维护任务
+- `ci:` - CI 配置与工作流更改
+- `build:` - 构建系统或依赖更改
+- `chore:` - 其他维护任务
 
 ### 5. 创建 PR
 

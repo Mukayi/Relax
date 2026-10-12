@@ -116,8 +116,11 @@ Follow [Conventional Commits](https://www.conventionalcommits.org/) for commit m
 - `docs:` - Documentation changes
 - `style:` - Code style changes (formatting, etc.)
 - `refactor:` - Code refactoring
+- `perf:` - Performance improvements
 - `test:` - Adding or updating tests
-- `chore:` - Maintenance tasks
+- `ci:` - CI configuration and workflow changes
+- `build:` - Build system or dependency changes
+- `chore:` - Other maintenance tasks
 
 ### 5. Open a PR
 

@@ -22,6 +22,10 @@ For the selected workflow on the current head, prefer an active run, then a non-
 
 ## Choose the operation
 
+Read failed logs before deciding whether a retry can help. A deterministic code or configuration error needs a fix; evidence of an infrastructure failure or a flaky test can justify a retry. Prefer failed-job or specific-job reruns over restarting unrelated successful work.
+
+Track retries of the same failure on the same PR head. If more than three reruns still fail, stop retrying, collect the head SHA, affected workflow/job, attempt URLs and representative logs, and report the issue to SigureMo for maintainer investigation; send a message only within the user's authorization. Reclassify the failure after a code change rather than treating the old retries as validation of the new head.
+
 Prefer `gh run` or the REST API when the authenticated credential has Actions write access. See [rerun operations](references/rerun.md) for retrying failed jobs, workflows or individual jobs. To cancel a workflow, use `gh run cancel <RUN_ID> --repo redai-studio/Relax` or `POST repos/redai-studio/Relax/actions/runs/<RUN_ID>/cancel`.
 
 Use the narrowest scope that addresses the request. A job rerun includes dependent jobs; workflow cancellation includes sibling matrix jobs. Refresh the PR head immediately before a write and reassess if it changed.
