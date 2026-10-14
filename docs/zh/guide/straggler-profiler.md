@@ -21,8 +21,8 @@ env_vars:
 | `RELAX_STRAGGLER_REPORT_INTERVAL` | int | 10 | 每多少个 rollout 做一次跨 rank 汇聚与判定（一个"窗口"）。一个 rollout 可能包含多个 optimizer step；下文的 ms/step 都是每个 rollout 的累计值。 |
 | `RELAX_STRAGGLER_Z_THRESHOLD` | float | 3.0 | 候选 rank 的 robust z 分数（基于组内中位数 / MAD）门限。 |
 | `RELAX_STRAGGLER_REL_THRESHOLD` | float | 0.10 | 候选 rank 相对组内中位数的最小超出比例。 |
-| `RELAX_STRAGGLER_PERSIST_WINDOWS` | int | 3 | 连续多少个窗口满足条件才告警（所有 reason 都适用），用来过滤 checkpoint、GC 峰等一次性抖动。 |
-| `RELAX_STRAGGLER_RECOVER_WINDOWS` | int | 2 | 已告警的 rank 要连续多少个干净窗口才解除告警，避免告警反复开关；「不确定」的窗口不算干净。 |
+| `RELAX_STRAGGLER_PERSIST_WINDOWS` | int | 3 | 连续多少个窗口满足条件才告警（所有 reason 都适用），用来过滤 checkpoint、GC 峰等一次性抖动；必须 ≥ 1。 |
+| `RELAX_STRAGGLER_RECOVER_WINDOWS` | int | 2 | 已告警的 rank 要连续多少个干净窗口才解除告警，避免告警反复开关；「不确定」的窗口不算干净；必须 ≥ 1。 |
 
 开启后每个 actor 角色的进程启动时打一行 `Straggler profiler enabled: report_interval=… primary=… meta=RankMeta(rank=…, dp=…, tp=…, pp=…, cp=…, ep=…, host=…, device=…)`；critic / reference / `actor_fwd` 不跑训练步，不会被采样。
 
