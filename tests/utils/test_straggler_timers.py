@@ -3,6 +3,7 @@
 
 import pytest
 
+from relax.utils.straggler import timers as timers_module
 from relax.utils.straggler.stats import FIELD_INDEX, FORWARD_ONLY_TIMER_SEGMENTS, MEGATRON_TIMER_SEGMENTS
 from relax.utils.straggler.timers import EventPool, StragglerTimers, _NullTimer, _SegmentTimer
 from tests.utils.straggler_helpers import FakeEvent
@@ -138,3 +139,33 @@ def test_timers_log_and_write_are_explicitly_unsupported():
         timers.log(["forward-compute"])
     with pytest.raises(NotImplementedError):
         timers.write(["forward-compute"], None, 0)
+
+
+@pytest.fixture()
+def captured_warnings(monkeypatch):
+    warnings = []
+    monkeypatch.setattr(timers_module.logger, "warning", lambda msg, *a, **k: warnings.append(msg % a))
+    return warnings
+
+
+def test_known_timer_name_produces_no_warning(captured_warnings):
+    timers = StragglerTimers(_FakeSink(), MEGATRON_TIMER_SEGMENTS)
+    timers("forward-compute")
+    timers("forward-compute")
+    assert captured_warnings == []
+
+
+def test_ignored_timer_name_produces_no_warning(captured_warnings):
+    timers = StragglerTimers(_FakeSink(), MEGATRON_TIMER_SEGMENTS)
+    timers("forward-backward")
+    timers("forward-backward")
+    assert captured_warnings == []
+
+
+def test_unknown_timer_name_warns_exactly_once(captured_warnings):
+    timers = StragglerTimers(_FakeSink(), MEGATRON_TIMER_SEGMENTS)
+    timers("totally-new-timer")
+    timers("totally-new-timer")
+    timers("totally-new-timer")
+    assert len(captured_warnings) == 1
+    assert "totally-new-timer" in captured_warnings[0]

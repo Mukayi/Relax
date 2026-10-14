@@ -112,16 +112,41 @@ class StragglerProfiler:
 
     def step_metrics(self, rollout_id: int, tokens: int) -> dict[str, float] | None:
         """Close this step (all ranks; a Gloo collective every window) and
-        return the scalars of every window whose analysis has finished, for
-        this step's ``log_perf_data``."""
+        return the scalars of the latest window whose analysis has finished,
+        for this step's ``log_perf_data``.
+
+        If several windows are ready at once, each still reaches the timeline
+        and logs, but only the latest one's scalars are returned (one metrics
+        call per step carries one value per key); each superseded window is
+        logged as a WARNING and counted as a profiler error.
+        """
         self.collector.add_tokens(tokens)
         reports = self.collector.end_step(rollout_id, final=rollout_id + 1 == self._args.num_rollout)
+        if len(reports) > 1:
+            logger.warning(
+                "[straggler] rollout %d: %d windows ready at once; only rollouts %d-%d reach the metrics",
+                rollout_id,
+                len(reports),
+                reports[-1].first_rollout,
+                reports[-1].last_rollout,
+            )
+            for dropped in reports[:-1]:
+                self.collector.on_error(
+                    "report",
+                    RuntimeError(
+                        f"scalars of rollouts {dropped.first_rollout}-{dropped.last_rollout} superseded by a later "
+                        "window"
+                    ),
+                )
         metrics: dict[str, float] = {}
         for report in reports:
             try:
-                metrics.update(report_straggler_window(self._args, report))
+                scalars = report_straggler_window(self._args, report)
             except Exception as exc:
                 self.collector.on_error("report", exc)
+                continue
+            if report is reports[-1]:
+                metrics = scalars
         if metrics:
             self._emitted = reports[-1]
             if self._delivered_ms is not None:
@@ -158,15 +183,11 @@ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None
         return None
     if _PROFILER is not None:
         return _PROFILER
-    from megatron.core import mpu
+    from relax.utils.training.train_metric_utils import is_metrics_primary_rank
 
-    # Must match ``log_perf_data``'s primary rank: the window scalars are logged
-    # through it, which drops them on every other rank.
-    is_primary = (
-        mpu.get_tensor_model_parallel_rank() == 0
-        and mpu.is_pipeline_last_stage()
-        and mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-    )
+    # The window scalars are logged through ``log_perf_data``, which drops them
+    # on every other rank.
+    is_primary = is_metrics_primary_rank()
     collector = StragglerCollector(
         rank_meta=local_rank_meta(),
         is_primary=is_primary,

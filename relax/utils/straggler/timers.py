@@ -15,7 +15,16 @@ from __future__ import annotations
 from time import perf_counter
 from typing import Any, Callable, Mapping, Protocol
 
+from relax.utils.logging_utils import get_logger
 from relax.utils.straggler.stats import FIELD_INDEX
+
+
+logger = get_logger(__name__)
+
+# Megatron timer names that wrap a whole schedule step and duplicate individual
+# segment timers; they are deliberately absent from MEGATRON_TIMER_SEGMENTS and
+# must not trigger the unknown-timer warning.
+_IGNORED_TIMER_NAMES: frozenset[str] = frozenset({"forward-backward"})
 
 
 class EventSink(Protocol):
@@ -143,11 +152,27 @@ class StragglerTimers:
 
     def __call__(self, name: str, log_level: int | None = None) -> _SegmentTimer | _NullTimer:
         """Return the timer bound to ``name``; untracked names share a no-op
-        timer and ``log_level`` is ignored."""
+        timer and ``log_level`` is ignored.
+
+        A name that is neither mapped nor in ``_IGNORED_TIMER_NAMES`` triggers
+        a WARNING the first time it is seen so stale or misspelled names are
+        not silently swallowed.
+        """
         timer = self._timers.get(name)
         if timer is None:
             segment = self._name_to_segment.get(name)
-            timer = _SegmentTimer(FIELD_INDEX[segment], self._sink) if segment is not None else self._null
+            if segment is not None:
+                timer = _SegmentTimer(FIELD_INDEX[segment], self._sink)
+            else:
+                timer = self._null
+                if name not in _IGNORED_TIMER_NAMES:
+                    # _timers caches this entry after the first lookup, so the
+                    # warning fires at most once per name per instance.
+                    logger.warning(
+                        "[straggler] unknown Megatron timer %r: not mapped to any segment and not in the ignore list; "
+                        "its time will not be recorded. Add it to MEGATRON_TIMER_SEGMENTS or _IGNORED_TIMER_NAMES.",
+                        name,
+                    )
             self._timers[name] = timer
         return timer
 

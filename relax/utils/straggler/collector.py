@@ -15,6 +15,7 @@ contain several optimizer steps.
 from __future__ import annotations
 
 import gc
+import threading
 from collections import deque
 from dataclasses import dataclass
 from time import perf_counter, time
@@ -123,6 +124,10 @@ class StragglerCollector:
         # offload / clear_memory, etc.).
         self._step_open = False
         self._gc_start: float | None = None
+        # Thread that first calls record_event; only that thread's GC pauses
+        # are attributed to the training window (gc.callbacks fire on the
+        # triggering thread, so a background GC must not corrupt _gc_start).
+        self._train_thread: int | None = None
         self.health = ProfilerHealth(health_config)
         # Plain attribute (not ``health.disabled``) because ``record_event`` checks it on every bracket.
         self._disabled = False
@@ -153,6 +158,8 @@ class StragglerCollector:
         if self._disabled or self._is_capturing():
             return None
         self._step_open = True
+        if self._train_thread is None:
+            self._train_thread = threading.get_ident()
         event = self._pool.acquire()
         event.record()
         return event
@@ -182,6 +189,8 @@ class StragglerCollector:
         self._window.add("tokens", float(tokens))
 
     def _on_gc(self, phase: str, info: dict[str, Any]) -> None:
+        if self._train_thread is not None and threading.get_ident() != self._train_thread:
+            return
         if phase == "start":
             self._gc_start = self._clock() if self._step_open else None
         elif self._gc_start is not None:
@@ -329,7 +338,11 @@ class StragglerCollector:
         if self._worker is None:
             self._handle_job(job)
             return
-        if self._worker.backlog >= self._max_backlog:
+        # A ready notice (job.ready is not None) bypasses the backlog check so
+        # the health/state=2 report always reaches end_step even when the queue
+        # is full.  There is at most one such notice per profiler lifetime, so
+        # the queue stays bounded at max_backlog + 1.
+        if job.ready is None and self._worker.backlog >= self._max_backlog:
             self.on_error(
                 "analyze",
                 RuntimeError(

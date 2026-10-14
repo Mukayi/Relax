@@ -7,8 +7,10 @@ from argparse import Namespace
 import pytest
 
 from relax.utils.straggler import reporter, runtime
+from relax.utils.straggler.detector import WindowReport
 from relax.utils.straggler.runtime import StragglerProfiler, install_straggler_profiler
-from tests.utils.straggler_helpers import bracket, make_collector
+from relax.utils.training import train_metric_utils
+from tests.utils.straggler_helpers import FakeEvent, bracket, make_collector, meta
 
 
 def _args(num_rollout=100):
@@ -119,3 +121,40 @@ def test_timers_are_none_without_a_profiler():
     assert runtime.straggler_timers("train") is None
     with pytest.raises(ValueError):
         runtime._timers_for(_profiler().collector, "eval")
+
+
+def test_only_the_latest_of_several_ready_windows_reaches_the_metrics(monkeypatch):
+    def window(n):
+        return WindowReport(
+            metrics={"straggler/window/last_rollout": float(n)}, alerts=[], rows=[], first_rollout=n, last_rollout=n
+        )
+
+    reported, warnings = [], []
+    monkeypatch.setattr(
+        runtime, "report_straggler_window", lambda args, report: reported.append(report) or dict(report.metrics)
+    )
+    monkeypatch.setattr(runtime.logger, "warning", lambda msg, *a: warnings.append(msg % a))
+    profiler = _profiler(interval=1)
+    monkeypatch.setattr(profiler.collector, "end_step", lambda rollout_id, final=False: [window(0), window(1)])
+
+    metrics = profiler.step_metrics(1, tokens=0)
+    assert metrics == {"straggler/window/last_rollout": 1.0}
+    assert [r.last_rollout for r in reported] == [0, 1], "every window still reaches the timeline"
+    assert len(warnings) == 1 and "2 windows ready at once" in warnings[0]
+    assert profiler.collector.health.errors_total == 1
+    assert profiler._emitted.last_rollout == 1
+
+
+@pytest.mark.parametrize("primary", [True, False])
+def test_install_uses_the_shared_metrics_primary_rank(monkeypatch, primary):
+    monkeypatch.setenv("RELAX_STRAGGLER_PROFILER", "1")
+    monkeypatch.setattr(train_metric_utils, "is_metrics_primary_rank", lambda: primary)
+    monkeypatch.setattr(runtime, "local_rank_meta", lambda: meta(1)[0])
+    monkeypatch.setattr(runtime, "timing_event_factory", lambda: FakeEvent)
+    monkeypatch.setattr(runtime, "stream_capture_check", lambda: runtime._never)
+    monkeypatch.setattr(runtime, "_PROFILER", None)
+    profiler = install_straggler_profiler("actor", _args())
+    try:
+        assert profiler.collector.is_primary is primary
+    finally:
+        profiler.collector.close()

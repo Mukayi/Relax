@@ -3,6 +3,7 @@
 hook."""
 
 import gc
+import threading
 
 import pytest
 
@@ -241,3 +242,54 @@ def test_forward_only_timers_land_in_lp_buckets():
 def test_report_interval_must_be_positive():
     with pytest.raises(ValueError):
         _collector(world=1, interval=0)
+
+
+def test_gc_on_another_thread_does_not_touch_the_training_threads_pause():
+    """``gc.callbacks`` fire on the thread that triggered the collection; one
+    on a worker thread must neither add time nor clobber a training-thread
+    pause."""
+    clock = [0.0]
+    collector = make_collector(world=1, clock=lambda: clock[0])
+    bracket(collector)  # the first bracket fixes the training thread
+    clock[0] = 1.0
+    collector._on_gc("start", {})
+
+    def worker_gc():
+        clock[0] = 2.0
+        collector._on_gc("start", {})
+        clock[0] = 3.0
+        collector._on_gc("stop", {})
+
+    worker = threading.Thread(target=worker_gc)
+    worker.start()
+    worker.join()
+    clock[0] = 6.0
+    collector._on_gc("stop", {})
+    # Checked before end_step, which resets the window at interval=1.
+    assert collector.window.get("gc") == pytest.approx(5000.0)
+
+
+def test_collector_constructed_on_another_thread_uses_bracket_thread():
+    """When the collector is built on a background thread but the training loop
+    runs on main, the main thread should be recognised as the training
+    thread."""
+    clock = [0.0]
+    collector_box = [None]
+
+    def builder():
+        collector_box[0] = make_collector(world=1, clock=lambda: clock[0])
+
+    t = threading.Thread(target=builder)
+    t.start()
+    t.join()
+    collector = collector_box[0]
+
+    # First bracket on the main thread establishes the training thread
+    bracket(collector)
+    clock[0] = 1.0
+    collector._on_gc("start", {})
+    clock[0] = 3.0
+    collector._on_gc("stop", {})
+    # Check before end_step, which would reset the window (interval=1)
+    assert collector.window.get("gc") == pytest.approx(2000.0)
+    collector.close()

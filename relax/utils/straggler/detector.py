@@ -113,6 +113,14 @@ class DetectorConfig:
     # median compute to count.
     wait_abs_frac: float = 0.05
 
+    def __post_init__(self) -> None:
+        # persist_windows=0 would hit a KeyError in the streak lookup;
+        # recover_windows=0 would clear an alert without a clean window.
+        for name in ("persist_windows", "recover_windows"):
+            value = getattr(self, name)
+            if value < 1:
+                raise ValueError(f"straggler {name} must be >= 1, got {value} (RELAX_STRAGGLER_{name.upper()})")
+
 
 @dataclass
 class DetectorState:

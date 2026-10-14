@@ -4,6 +4,7 @@
 import threading
 
 from relax.utils.straggler import collector as collector_module
+from relax.utils.straggler.health import HealthConfig
 from relax.utils.straggler.stats import FIELD_INDEX
 from tests.utils.straggler_helpers import bracket, make_collector
 
@@ -116,4 +117,43 @@ def test_a_failing_on_report_is_counted_and_the_report_still_arrives():
         assert collector.health.errors_total == 1
         assert len(_step(collector, rollout_id=1)) == 1
     finally:
+        collector.close()
+
+
+def test_backlog_drops_ordinary_windows_and_counts_errors(monkeypatch):
+    """Once ``max_backlog`` windows wait (the in-flight one included), new
+    windows are dropped and counted as errors."""
+    gate, started = _gated_analysis(monkeypatch)
+    collector = _collector(max_backlog=2, health_config=HealthConfig(max_errors=100))
+    try:
+        _step(collector, rollout_id=0)  # in flight, blocked on the gate
+        assert started.wait(5)
+        _step(collector, rollout_id=1)  # queued: backlog is now full
+        for rollout_id in (2, 3, 4):
+            _step(collector, rollout_id=rollout_id)  # dropped
+        assert collector.health.errors_total == 3
+        assert collector._worker.backlog == 2
+    finally:
+        gate.set()
+        collector.close()
+
+
+def test_switch_off_notice_is_not_dropped_when_backlog_is_full(monkeypatch):
+    """The switch-off notice (health/state=2) bypasses a full backlog."""
+    gate, started = _gated_analysis(monkeypatch)
+    collector = _collector(max_backlog=2, health_config=HealthConfig(max_errors=3))
+    try:
+        _step(collector, rollout_id=0)  # in flight
+        assert started.wait(5)
+        _step(collector, rollout_id=1)  # backlog full
+        for rollout_id in (2, 3, 4):
+            _step(collector, rollout_id=rollout_id)  # three drops reach max_errors
+        _step(collector, rollout_id=5)  # this close disables and queues the notice
+        assert collector.disabled
+        gate.set()
+        assert collector.flush(timeout=5)
+        states = [r.metrics.get("straggler/health/state") for r in _step(collector, rollout_id=6)]
+        assert 2.0 in states, f"expected health/state=2 in {states}"
+    finally:
+        gate.set()
         collector.close()

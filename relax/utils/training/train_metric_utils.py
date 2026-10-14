@@ -20,6 +20,18 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def is_metrics_primary_rank() -> bool:
+    """The one Megatron rank that logs perf metrics: TP 0, last PP stage, DP
+    (with CP) 0."""
+    from megatron.core import mpu
+
+    return (
+        mpu.get_tensor_model_parallel_rank() == 0
+        and mpu.is_pipeline_last_stage()
+        and mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+    )
+
+
 def log_perf_data_raw(
     rollout_id: int,
     args: Namespace,

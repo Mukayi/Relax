@@ -481,3 +481,27 @@ def test_overhead_is_averaged_per_step_and_dropped_events_are_totalled():
 def test_table_and_meta_size_mismatch_raises():
     with pytest.raises(ValueError):
         analyze_window([_healthy_row()], _meta(2), DetectorConfig(), DetectorState())
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("persist_windows", 0),
+        ("persist_windows", -5),
+        ("recover_windows", 0),
+        ("recover_windows", -1),
+    ],
+)
+def test_detector_config_rejects_non_positive_window_counts(field, value):
+    with pytest.raises(ValueError, match=field):
+        DetectorConfig(**{field: value})
+
+
+def test_detector_config_accepts_minimum_value_of_one_for_both():
+    cfg = DetectorConfig(persist_windows=1, recover_windows=1)
+    assert cfg.persist_windows == 1 and cfg.recover_windows == 1
+
+
+def test_detector_config_defaults_are_unchanged():
+    cfg = DetectorConfig()
+    assert cfg.persist_windows == 3 and cfg.recover_windows == 2
