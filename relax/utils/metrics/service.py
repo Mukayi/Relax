@@ -125,6 +125,9 @@ class MetricsService:
         self.role = role
 
         self.metrics_buffer = MetricsBuffer()
+        # Serializes the blocking backend fan-out in `_report_to_backends`,
+        # which runs on a worker thread rather than the event loop.
+        self._report_lock = threading.Lock()
         self._rollout_handle_task: asyncio.Task[Any] | None = None
         self._sglang_exporter = SGLangMetricsExporter(self._discover_sglang_engines)
         self._adapters = {}
@@ -270,16 +273,45 @@ class MetricsService:
             step = request.step
             metrics = self.metrics_buffer.get_metrics_for_step(step)
 
-            report_results = {}
+            metrics_dict = {}
+            for metric in metrics:
+                metrics_dict[metric["name"]] = metric["value"]
 
+            # The backend fan-out below is blocking: `wandb.log` and
+            # `SummaryWriter.add_scalar` write through to disk, and the timeline
+            # adapter serializes JSON to a file. This service runs as a single
+            # Serve replica, so doing that work on the event loop stalls every
+            # /log_metrics_batch that arrives meanwhile -- the handler itself is
+            # cheap, its neighbours are what get slow. Hand it to a worker
+            # thread instead.
+            report_results = await asyncio.to_thread(self._report_to_backends, step, metrics_dict)
+
+            self.metrics_buffer.clear_step(step)
+            logger.info(f"Reported {len(metrics)} metrics for step {step}")
+            return {
+                "status": "success",
+                "message": f"Reported {len(metrics)} metrics for step {step}",
+                "results": report_results,
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to report step {request.step}: {e}")
+            return {"status": "error", "message": str(e)}
+
+    def _report_to_backends(self, step: int, metrics_dict: Dict[str, Any]) -> Dict[str, str]:
+        """Push one step's metrics out to every configured backend.
+
+        This is the blocking body of :meth:`report_step` and is meant to be run
+        through ``asyncio.to_thread``; awaiting it directly would put the same
+        work back on the event loop. Adapter calls are serialized because none
+        of the backends documents thread safety, and reporting is sequential
+        per step anyway.
+        """
+        report_results: Dict[str, str] = {}
+
+        with self._report_lock:
             # Handle regular metrics reporting
-            if metrics:
-                metrics_dict = {}
-                for metric in metrics:
-                    metric_name = metric["name"]
-                    metric_value = metric["value"]
-                    metrics_dict[metric_name] = metric_value
-
+            if metrics_dict:
                 if self._use_wandb:
                     try:
                         wandb.log(metrics_dict, step=step)
@@ -328,17 +360,7 @@ class MetricsService:
                     report_results["timeline"] = f"error: {e}"
                     logger.exception(f"Failed to dump timeline: {e}")
 
-            self.metrics_buffer.clear_step(step)
-            logger.info(f"Reported {len(metrics)} metrics for step {step}")
-            return {
-                "status": "success",
-                "message": f"Reported {len(metrics)} metrics for step {step}",
-                "results": report_results,
-            }
-
-        except Exception as e:
-            logger.error(f"Failed to report step {request.step}: {e}")
-            return {"status": "error", "message": str(e)}
+        return report_results
 
     async def _discover_sglang_engines(self) -> Dict[str, Any]:
         # MetricsService starts before Rollout. Resolve lazily and retry on

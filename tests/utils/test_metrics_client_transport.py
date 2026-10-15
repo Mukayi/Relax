@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+"""Tests for the MetricsClient transport and the MetricsService report path.
+
+Two properties are covered here that the older tests could not see, because
+they patched the module-level ``requests`` functions and therefore never
+exercised the real transport:
+
+* the client reuses one HTTP connection across calls instead of opening a new
+  one per request, and it ignores ``HTTP_PROXY`` / ``HTTPS_PROXY`` for what is a
+  cluster-local endpoint;
+* the blocking backend fan-out in ``/report_step`` runs off the event loop, so a
+  slow backend does not stall concurrent metric ingestion on the same replica.
+
+The connection-reuse test drives a real HTTP server and counts accepted TCP
+connections, so it fails if the client goes back to a fresh connection per call.
+"""
+
+import asyncio
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
+
+from relax.utils.metrics.client import MetricsClient
+from relax.utils.metrics.service import MetricsService
+
+
+class _CountingHandler(BaseHTTPRequestHandler):
+    """Answer every metrics endpoint with success."""
+
+    protocol_version = "HTTP/1.1"
+
+    def _reply(self) -> None:
+        # Drain the request body first. On a keep-alive connection, bytes left
+        # unread here are parsed as the start of the next request and the server
+        # answers 400 -- which is only reachable because reuse actually happens.
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+        body = b'{"status": "success"}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_POST = _reply
+    do_GET = _reply
+
+    def log_message(self, *args):  # silence the per-request stderr line
+        pass
+
+
+class _CountingHTTPServer(ThreadingHTTPServer):
+    """Counts accepted connections, which is what connection reuse controls."""
+
+    daemon_threads = True
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.accepted = 0
+
+    def get_request(self):
+        conn, addr = super().get_request()
+        self.accepted += 1
+        return conn, addr
+
+
+class _CountingServer:
+    """Threaded HTTP server exposing how many connections were accepted."""
+
+    def __init__(self) -> None:
+        self._server = _CountingHTTPServer(("127.0.0.1", 0), _CountingHandler)
+        self._thread = threading.Thread(target=self._server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+
+    def __enter__(self) -> "_CountingServer":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+    @property
+    def url(self) -> str:
+        host, port = self._server.server_address[:2]
+        return f"http://{host}:{port}/metrics"
+
+    @property
+    def accepted(self) -> int:
+        return self._server.accepted
+
+
+def test_client_reuses_one_connection_across_calls():
+    """Repeat calls must not open a new TCP connection each time.
+
+    Five POSTs plus a GET over one keep-alive session should ride a single
+    connection. A client that calls the module-level ``requests.post`` per
+    request opens one connection per call.
+    """
+    with _CountingServer() as server:
+        client = MetricsClient(server.url)
+        for step in range(5):
+            assert client.log_metrics_batch(step, {"train/loss": float(step)}, immediate=True) is True
+        assert client.health_check().get("status") == "success"
+        accepted = server.accepted
+
+    assert accepted == 1, f"expected one reused connection, the server accepted {accepted}"
+
+
+def test_client_ignores_proxy_environment_for_cluster_local_endpoint(monkeypatch):
+    """A proxy in the environment must not capture the metrics endpoint."""
+    with _CountingServer() as server:
+        monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:3128")
+        monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
+        client = MetricsClient(server.url)
+        # If trust_env were left True, this request would be sent to the proxy
+        # and fail, because nothing is listening there.
+        assert client.log_metrics_batch(1, {"train/loss": 1.0}, immediate=True) is True
+
+
+def test_client_uses_a_session_rather_than_module_level_requests():
+    client = MetricsClient("http://127.0.0.1:1/metrics")
+    assert client._session.trust_env is False
+    with patch("requests.post") as module_post:
+        with patch.object(client._session, "post", return_value=_FakeResponse()) as session_post:
+            client.log_metrics_batch(1, {"a": 1.0}, immediate=True)
+            session_post.assert_called_once()
+            module_post.assert_not_called()
+
+
+class _FakeResponse:
+    status_code = 200
+
+    def json(self):
+        return {"status": "success"}
+
+
+def test_report_step_helper_is_synchronous_so_it_can_run_on_a_thread():
+    """``report_step`` stays async while its blocking body is a plain function.
+
+    ``asyncio.to_thread`` needs a sync callable; a coroutine helper would put
+    the work straight back on the event loop.
+    """
+    cls = MetricsService.func_or_class
+    assert not asyncio.iscoroutinefunction(cls._report_to_backends)
+    assert asyncio.iscoroutinefunction(cls.report_step)
+
+
+def test_slow_backend_does_not_block_concurrent_ingestion():
+    """A slow adapter must not stop the event loop from running other handlers.
+
+    The ticker coroutine interleaves with the report; if the fan-out ran on the
+    loop, the ticker would not advance during it.
+    """
+    cls = MetricsService.func_or_class
+    service = cls.__new__(cls)
+    service._use_wandb = False
+    service._timeline_adapter = None
+    # __init__ needs a Ray Serve context; set only what _report_to_backends reads.
+    service._report_lock = threading.Lock()
+
+    ticks = {"count": 0}
+
+    class SlowAdapter:
+        def log(self, data, step):
+            # Stand-in for SummaryWriter / clearml / a network-mounted dump dir.
+            import time
+
+            time.sleep(0.3)
+
+    service._adapters = {"tensorboard": SlowAdapter()}
+
+    async def scenario():
+        async def ticker():
+            while True:
+                ticks["count"] += 1
+                await asyncio.sleep(0.01)
+
+        ticker_task = asyncio.create_task(ticker())
+        await asyncio.sleep(0.05)
+        until_ticks = ticks["count"]
+
+        results = await asyncio.to_thread(service._report_to_backends, 1, {"train/loss": 0.5})
+        during = ticks["count"] - until_ticks
+        ticker_task.cancel()
+        return results, during
+
+    results, ticks_during_report = asyncio.run(scenario())
+
+    assert results == {"tensorboard": "success"}
+    # ~0.3 s of sleep at a 10 ms period: expect on the order of 25 ticks. The
+    # point is that it is far from zero, not the exact count.
+    assert ticks_during_report > 5, (
+        f"the event loop made only {ticks_during_report} ticks during a 300 ms blocking backend call"
+    )
