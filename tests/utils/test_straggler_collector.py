@@ -8,6 +8,7 @@ import threading
 import pytest
 
 from relax.utils.straggler import collector as collector_module
+from relax.utils.straggler.health import HEALTH_DISABLE
 from relax.utils.straggler.stats import FIELD_INDEX
 from tests.utils.straggler_helpers import bracket, make_collector, meta
 
@@ -293,3 +294,53 @@ def test_collector_constructed_on_another_thread_uses_bracket_thread():
     # Check before end_step, which would reset the window (interval=1)
     assert collector.window.get("gc") == pytest.approx(2000.0)
     collector.close()
+
+
+def test_full_analysis_backlog_drops_the_window_and_counts_an_error():
+    # final=True waits for the queued analysis, so an analysed window is
+    # distinguishable from one that never reached the worker.
+    def close_one_window(max_backlog):
+        collector = _collector(world=1, interval=1, background=True, max_backlog=max_backlog)
+        bracket(collector)
+        return collector, collector.end_step(rollout_id=0, final=True)
+
+    dropped, reports = close_one_window(0)
+    try:
+        assert reports == []
+        assert dropped.health.errors_total == 1
+        # One dropped window is a degradation, not a switch-off: max_errors is 3.
+        assert not dropped.disabled
+        # The window was consumed either way, so the next one starts empty.
+        assert dropped.window.get("num_steps") == 0.0
+    finally:
+        dropped.close()
+
+    # The contrast: with room to spare the same window is analysed and reported.
+    kept, reports = close_one_window(4)
+    try:
+        assert len(reports) == 1
+        assert kept.health.errors_total == 0
+    finally:
+        kept.close()
+
+
+def test_switch_off_notice_reaches_end_step_even_with_a_full_backlog():
+    # A rank asking to switch the profiler off must be heard even when analysed
+    # windows are already queued, otherwise the other ranks keep gathering while
+    # this one has stopped.
+    def gather(values):
+        other = list(values)
+        other[FIELD_INDEX["health"]] = float(HEALTH_DISABLE)
+        return [list(values), other]
+
+    collector = _collector(world=2, interval=1, gather=gather, background=True, max_backlog=0)
+    try:
+        bracket(collector)
+        # final=True waits for the queued analysis, so the notice is in hand.
+        (report,) = collector.end_step(rollout_id=0, final=True)
+        assert report.metrics["straggler/health/state"] == float(HEALTH_DISABLE)
+        assert report.metrics["straggler/health/requested_by"] == 1.0
+        assert "rank 1" in report.note
+        assert collector.disabled
+    finally:
+        collector.close()
