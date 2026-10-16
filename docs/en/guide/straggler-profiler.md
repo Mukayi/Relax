@@ -93,6 +93,26 @@ These scalars go out in the same `tracking_utils.log` call as the `perf/*` metri
 
 With `--timeline-dump-dir` set (the timeline is flushed through the metrics-service adapter, so `--use-metrics-service` must be on as well), every window appends one `straggler/<seg> rank{g}_dp{d}_tp{t}_pp{p}` event per rank per non-zero segment (`pid` = 2³⁰ + global rank, above any real pid; `tid` = segment index). In Perfetto that is one row per rank, so a longer `bwd` bar or a shorter `dp_grad_sync` bar is visible at a glance.
 
+## Coverage
+
+The timings reuse the 22 timer call sites Megatron already has, so they cover the **scheduling plane**:
+
+| Covered | Detail |
+| --- | --- |
+| `fwd` / `bwd` | One micro-batch's forward / backward (whole block, not split into layers) |
+| `pp_recv` / `pp_send` | PP point-to-point (9 upstream names folded into 2 segments; direction and rank pair are not distinguished) |
+| `dp_grad_sync` | DP gradient sync (4 upstream names folded into 1 segment; the CP and DP portions are not separable) |
+| `dp_param_gather` | The distributed optimizer's parameter all-gather |
+| `optim` | The optimizer phases (6 upstream names) |
+
+**Not covered** (no upstream call site exists; adding one is new work):
+
+- **The internals of attention, MoE, head/logits and MTP.** Upstream Megatron has no timer call site inside these modules, so today they are only visible *inside* `fwd` / `bwd` and cannot be attributed separately. Drilling into them needs new call sites and is out of scope for this version.
+- **EP all-to-all** (expert-parallel communication in MoE). It is a "wait for a peer" kind of cost and is currently mixed into the compute segment.
+- **The real compute/communication overlap ratio.** A smaller `dp_grad_sync` does **not** read as "better overlap" — it is the sum of the waiting segments, a proxy, not the overlap ratio itself.
+
+**Known granularity limits** (see `reason` below): ranks of the same TP group wait for each other inside forward and backward, so when one of them slows down the whole group is reported and which one it was cannot be told apart; when every rank slows down at once (whole-machine clock throttle, shared storage stall) nothing is detected.
+
 ## Reading the reason
 
 | reason | Rule | Where to look |
@@ -109,18 +129,29 @@ With `--overlap-grad-reduce` the gradient reduce-scatter is issued bucket by buc
 
 ## When the profiler itself fails
 
-Exceptions in the timer calls, the event read-out, the window gather, the analysis and the log callback are caught and counted; none reaches the training loop. A rank that has caught 3 errors, or has had dropped event pairs or errors in 3 consecutive windows, asks for the profiler to be switched off. The request travels in that rank's window vector (the `health` field), so every rank sees the same gathered table and switches off at the same window; no rank leaves on its own and strands the others in the next gather. Once off, the timer calls are skipped and no more gathers run; the primary rank emits `straggler/health/state = 2` and logs one WARNING naming the requesting rank (the reason is in that rank's log). Training carries on. A failed gather is only visible to the rank it failed on, so that rank stops joining later gathers on its own.
+Exceptions in the timer calls, the event read-out, the window gather, the analysis and the log callback are caught and counted; none reaches the training loop. A rank that has caught 3 errors, or has had dropped event pairs or errors in 3 consecutive windows, asks for the profiler to be switched off. The request travels in that rank's window vector (the `health` field), so every rank sees the same gathered table and switches off at the same window; no rank leaves on its own and strands the others in the next gather. Once off, the timer calls are skipped and no more gathers run; the primary rank emits `straggler/health/state = 2` and logs one WARNING naming the requesting rank (the reason is in that rank's log). Training carries on. A failed gather is only visible to the rank it failed on, so that rank stops joining later gathers on its own. **This is a known limitation of the current version**: the other ranks do not learn that it left, go ahead with the next gather and wait there until the Gloo group times out (30 minutes by default). The replacement (the failed rank keeps joining and reports a “switched off” marker, so every rank switches off in the same window, plus a separate shorter timeout for these gathers) is designed but not implemented yet.
 
 ## Overhead
 
 - One pair of non-blocking `event.record()` calls per Megatron timer call site (events are pooled): one pair per micro-batch for forward and for backward, plus roughly ten pairs per step for gradient sync, parameter all-gather and the optimizer phases.
 - At the end of each step completed events are read lazily with `event.query()` and accumulated into the window vector: `straggler/self_overhead_ms` measures 0.10–0.16 ms/step on 8×A100.
 - One Gloo `all_gather` (21 float64 per rank) every `REPORT_INTERVAL` rollouts, reported as `gather_ms`: < 1 ms/step amortised. The analysis runs on a background thread of the primary rank, reported as `analyze_ms`; it takes no training-thread time and no rank waits for it at the next collective. It is O(n log n) in the stage size: a single-machine CPU micro-benchmark gives 2.4 ms per window at 8 ranks, 10 ms at 512 and 35 ms at 2048.
+- **Traffic volume.** Each rank sends a fixed **168 B** per window (21 float64), **independent of the micro-batch count**; the primary receives `world_size × 168 B` per window (1344 B at 8 ranks). Converting to "per optimizer step" requires saying how many optimizer steps one rollout contains: `168 / (REPORT_INTERVAL × optimizer steps per rollout)`. With the default of one optimizer step per rollout that is 16.8 B/rank; with four it amortises to 4.2 B — **the number only shrinks because it is spread thinner, not because less is sent**. Note also that a window closes **per rollout** (once per rollout, not once per optimizer step), so the ms/step figures are per-rollout totals.
 - Each timer call (start / stop plus two `event.record()`) costs about 30 µs. On an idle GPU of the A100 test machine, replaying Megatron's call sequence with the worst case of 17 timers per step (3 micro-batches): in a kernel-launch-bound loop the timer calls plus the end-of-step readout add 0.80 ms/step of wall time (max 0.97 ms); in a compute-bound loop they add only 0.09 ms.
 - Adding everything up and assuming all of it sits on the critical path gives about 1.2 ms/step typical and 1.9 ms/step worst case, i.e. 0.10 % and 0.17 % of a 1.15 s step. This is a summed upper-bound estimate.
 - End to end: 8×A100, Qwen3-0.6B SFT (DP8, step ≈ 0.95 s — a small model, the case most sensitive to timing overhead), with `--overlap-grad-reduce --overlap-param-gather` and the metrics service off. Comparing separate profiler-on and profiler-off runs is limited by ~1 % run-to-run variation, so the profiler is instead toggled every 10 rollouts within a run, with a second run in the opposite phase, so each 10-step block is measured once on and once off on identical data. After removing spikes by a pre-specified rule (a step above 1.25× its run's median in either run is dropped from both runs, ~4 % of steps), two pairs give +0.06 % (95 % CI −0.25 % to +0.38 %, 56 blocks); an A/A control (profiler off in both runs) measured the same way gives +0.22 % (−0.11 % to +0.55 %), i.e. the method itself has about ±0.3 % noise. Four earlier pairs with overlap off give −0.18 % to +0.07 % under the same rule, applied after the fact. Turning the profiler on does not increase generation-2 GC count.
 - Compute/communication overlap: same recipe with the metrics service on, `torch.profiler` traces of 2 rollouts in an off / on / off-again sequence show 0.1321 / 0.1321 / 0.1387 of NCCL kernel time overlapping compute kernels and identical counts of `cuda*Synchronize` calls and NCCL kernels; with the profiler on, the trace adds the timing event records and elapsed-time reads but no synchronizing calls.
-- Report latency (same run, `REPORT_INTERVAL=10`): the alert lines are logged 4–6 ms after a window closes; the scalars go out with the next rollout's `log_perf_data` and the metrics service acknowledges them about 2.4–2.5 s after the close; the last window of a run goes out immediately (≈ 0.25 s).
+- **Report latency has three segments.** Quoting only the middle one reads as "you know 2.4 s after the window closes", which sounds fast, but the real wait is in front of it:
+
+  ```
+  failure ──(T1)──> flagged ──(T2)──> scalars reach the platform ──(T3)──> a human can query them
+  ```
+
+  | Segment | Meaning | Status |
+  | --- | --- | --- |
+  | **T1** | Failure → flagged. **The longest segment, and it grows linearly with the configuration** | Detection only runs when a window closes (worst case you wait to the end of the window, ~half a window on average), and it must hit `PERSIST_WINDOWS` (default 3) windows in a row. For an injection at step `r` of window `k`, `T1 = (I − r + 1) + (P − 1)·I` rollouts (`I` = `REPORT_INTERVAL`): worst `P·I` = 30, best 21, expectation ≈ 25. ⚠️ Both `I` and `P` must be given for the number to be comparable — dropping `P` from 3 to 1 takes T1 from ≈ 25 rollouts to ≈ 0.5. An "uncertain" window also **breaks** the consecutive-window streak, so when the injection itself makes the window dirty T1 can exceed the formula. **Measured magnitude still to come** |
+  | **T2** | Window close → reported to the platform | Three scalars already cover it (`latency/analyzed_ms` / `emitted_ms` / `prev_delivered_ms`). Measured (same run, `REPORT_INTERVAL=10`): the alert lines are logged 4–6 ms after a window closes; the scalars go out with the next rollout's `log_perf_data` and the metrics service acknowledges them about 2.4–2.5 s after the close; the last window of a run goes out immediately (≈ 0.25 s). ⚠️ The "wait for the next `log_perf_data`" part is **discrete** — it ranges over a whole rollout (≈ 0–241.7 ms), not a continuous small quantity |
+  | **T3** | Platform-queryable | ⏳ **This link does not exist yet**: the service's query endpoint `GET /query_metrics` is still an unimplemented stub. T3 is therefore unmeasurable today and needs a server-side timing point; the hop from the buffer to a human is the platform's call and outside this tool |
 
 ## Where it lives
 
