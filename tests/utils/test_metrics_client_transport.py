@@ -18,11 +18,12 @@ connections, so it fails if the client goes back to a fresh connection per call.
 
 import asyncio
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
 from relax.utils.metrics.client import MetricsClient
-from relax.utils.metrics.service import MetricsService
+from relax.utils.metrics.service import LogMetricsBatchRequest, MetricsBuffer, MetricsService, ReportStepRequest
 
 
 class _CountingHandler(BaseHTTPRequestHandler):
@@ -148,50 +149,106 @@ def test_report_step_helper_is_synchronous_so_it_can_run_on_a_thread():
     assert asyncio.iscoroutinefunction(cls.report_step)
 
 
-def test_slow_backend_does_not_block_concurrent_ingestion():
-    """A slow adapter must not stop the event loop from running other handlers.
+def _service_with_slow_backend(adapter):
+    """A MetricsService whose only backend is ``adapter``.
 
-    The ticker coroutine interleaves with the report; if the fan-out ran on the
-    loop, the ticker would not advance during it.
+    The ``@serve.ingress`` wrapper makes the class unconstructible (its ``__init__``
+    is async and the real one would open wandb / TensorBoard / ClearML), so build it
+    with ``__new__`` and set the attributes the handlers read. ``metrics_buffer`` is
+    the real class, so the handler bodies run their real code.
     """
     cls = MetricsService.func_or_class
     service = cls.__new__(cls)
     service._use_wandb = False
     service._timeline_adapter = None
-    # __init__ needs a Ray Serve context; set only what _report_to_backends reads.
     service._report_lock = threading.Lock()
+    service._adapters = {"tensorboard": adapter}
+    service.metrics_buffer = MetricsBuffer()
+    return service
 
-    ticks = {"count": 0}
 
-    class SlowAdapter:
-        def log(self, data, step):
-            # Stand-in for SummaryWriter / clearml / a network-mounted dump dir.
-            import time
+class _SlowAdapter:
+    """Stand-in for SummaryWriter / clearml / a network-mounted dump dir."""
 
-            time.sleep(0.3)
+    def __init__(self, sleep_s: float) -> None:
+        self.sleep_s = sleep_s
+        self.calls = 0
 
-    service._adapters = {"tensorboard": SlowAdapter()}
+    def log(self, data=None, step=None) -> None:
+        self.calls += 1
+        time.sleep(self.sleep_s)
+
+
+def test_slow_backend_does_not_block_concurrent_ingestion():
+    """A slow report must not delay a ``/log_metrics_batch`` on the same replica.
+
+    This drives the real ``report_step`` coroutine -- the thing that decides whether
+    the fan-out runs on the loop. Calling ``_report_to_backends`` through
+    ``asyncio.to_thread`` instead would test only that the test's own ``to_thread``
+    works, and would pass even if ``report_step`` had no ``await`` at all.
+
+    Two observers run while the report is in flight: a 10 ms ticker, and an ingest
+    that arrives 50 ms in. On a blocked loop neither can run until the 300 ms
+    fan-out returns, so both land at ~300 ms; with the fan-out on a worker thread
+    the ingest completes on its own schedule at ~50 ms.
+    """
+    service = _service_with_slow_backend(_SlowAdapter(0.3))
+    # report_step only enters the fan-out when the step has buffered metrics.
+    service.metrics_buffer.add_metric(step=1, metric_name="perf/step_time", metric_value=1.0)
+
+    ingest_delay_s = 0.05
+    report_sleep_s = 0.3
 
     async def scenario():
+        ticks = 0
+
         async def ticker():
+            nonlocal ticks
             while True:
-                ticks["count"] += 1
                 await asyncio.sleep(0.01)
+                ticks += 1
+
+        async def ingest():
+            await asyncio.sleep(ingest_delay_s)
+            started = time.perf_counter()
+            result = await service.log_metrics_batch(LogMetricsBatchRequest(step=1, metrics={"train/loss": 0.5}))
+            return result, (time.perf_counter() - started) * 1e3
 
         ticker_task = asyncio.create_task(ticker())
         await asyncio.sleep(0.05)
-        until_ticks = ticks["count"]
+        ticks_before = ticks
 
-        results = await asyncio.to_thread(service._report_to_backends, 1, {"train/loss": 0.5})
-        during = ticks["count"] - until_ticks
+        started = time.perf_counter()
+        report_task = asyncio.create_task(service.report_step(ReportStepRequest(step=1)))
+        ingest_task = asyncio.create_task(ingest())
+
+        # Read the tick count while the report is still running: awaiting the report
+        # first would let the loop drain and hide the blockage.
+        while not report_task.done():
+            await asyncio.sleep(0.002)
+        ticks_during = ticks - ticks_before
+
+        report_result = await report_task
+        ingest_result, ingest_ms = await ingest_task
         ticker_task.cancel()
-        return results, during
+        return report_result, ingest_result, ingest_ms, ticks_during, (time.perf_counter() - started) * 1e3
 
-    results, ticks_during_report = asyncio.run(scenario())
+    report_result, ingest_result, ingest_waited_ms, ticks_during, report_ms = asyncio.run(scenario())
 
-    assert results == {"tensorboard": "success"}
-    # ~0.3 s of sleep at a 10 ms period: expect on the order of 25 ticks. The
-    # point is that it is far from zero, not the exact count.
-    assert ticks_during_report > 5, (
-        f"the event loop made only {ticks_during_report} ticks during a 300 ms blocking backend call"
+    assert report_result["results"] == {"tensorboard": "success"}
+    assert ingest_result["status"] == "success"
+    assert report_ms >= report_sleep_s * 1e3 * 0.9, (
+        f"the report finished too fast to have called the backend: {report_ms:.0f} ms"
+    )
+
+    # ~0.3 s of sleep at a 10 ms period: a free loop serves ~30 ticks, a blocked one ~0.
+    assert ticks_during > 10, (
+        f"the event loop made only {ticks_during} ticks during a {report_sleep_s * 1e3:.0f} ms backend call"
+    )
+
+    # The ingest was ready 50 ms in. If it had to wait for the 300 ms fan-out it
+    # lands near 300 ms, so anything below half the sleep proves it did not queue.
+    assert ingest_waited_ms < report_sleep_s * 1e3 / 2, (
+        f"a /log_metrics_batch that was ready {ingest_delay_s * 1e3:.0f} ms into a "
+        f"{report_sleep_s * 1e3:.0f} ms report waited {ingest_waited_ms:.0f} ms -- it queued behind the fan-out"
     )
