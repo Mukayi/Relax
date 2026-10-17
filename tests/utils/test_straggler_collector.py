@@ -344,3 +344,77 @@ def test_switch_off_notice_reaches_end_step_even_with_a_full_backlog():
         assert collector.disabled
     finally:
         collector.close()
+
+
+def test_a_disabled_rank_keeps_joining_the_gather_with_a_health_row():
+    # The other ranks must keep receiving this rank's row, otherwise they block
+    # in a gather it never joins.
+    collector = _collector(world=2, interval=1)
+    try:
+        bracket(collector)
+        collector._disable("test: switched off by the test")
+        assert collector.end_step() == []
+        assert len(collector.gather_calls) == 1
+        row = collector.gather_calls[0]
+        assert row[FIELD_INDEX["health"]] == float(HEALTH_DISABLE)
+        assert [v for k, v in enumerate(row) if k != FIELD_INDEX["health"]] == [0.0] * (len(row) - 1)
+        assert collector.window.get("fwd") == 0.0
+        assert collector.window.get("num_steps") == 0.0
+    finally:
+        collector.close()
+
+
+def test_a_failed_gather_counts_an_error_and_keeps_the_rank_participating():
+    calls = []
+
+    def gather(values):
+        calls.append(list(values))
+        if len(calls) == 1:
+            raise RuntimeError("rank 1 went away")
+        other = list(values)
+        other[FIELD_INDEX["health"]] = float(HEALTH_DISABLE)
+        return [list(values), other]
+
+    collector = _collector(world=2, interval=1, gather=gather)
+    try:
+        # A single failed gather is a degradation, not a switch-off: the next
+        # window still gathers and can learn about its peers.
+        assert collector.end_step() == []
+        assert collector.health.errors_total == 1
+        assert not collector.disabled
+        assert collector.window.get("num_steps") == 0.0, "the failure path must still reset the window"
+
+        (second,) = collector.end_step()
+        assert len(calls) == 2
+        assert calls[0][FIELD_INDEX["health"]] == 0.0
+        assert second.metrics["straggler/health/state"] == float(HEALTH_DISABLE)
+        assert collector.disabled
+    finally:
+        collector.close()
+
+
+def test_a_persistently_failing_gather_switches_the_profiler_off_through_health():
+    # Repeated failures reach HealthConfig.max_errors; the rank then switches
+    # itself off *and* keeps sending its health row, so peers that can still
+    # gather also stop at the same window.
+    calls = []
+
+    def gather(values):
+        calls.append(list(values))
+        raise RuntimeError("gloo group is gone")
+
+    collector = _collector(world=2, interval=1, gather=gather)
+    try:
+        for step in range(3):
+            assert collector.end_step(rollout_id=step) == []
+        assert collector.health.errors_total == 3
+        assert not collector.disabled, "the switch-off is decided when the window closes"
+
+        assert collector.end_step(rollout_id=3) == []
+        assert collector.disabled
+        assert len(calls) == 4
+
+        collector.end_step(rollout_id=4)
+        assert calls[-1][FIELD_INDEX["health"]] == float(HEALTH_DISABLE)
+    finally:
+        collector.close()

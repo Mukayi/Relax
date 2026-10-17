@@ -229,6 +229,7 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_STRAGGLER_REL_THRESHOLD = EnvProperty("RELAX_STRAGGLER_REL_THRESHOLD", float, 0.10)
     RELAX_STRAGGLER_PERSIST_WINDOWS = EnvProperty("RELAX_STRAGGLER_PERSIST_WINDOWS", int, 3)
     RELAX_STRAGGLER_RECOVER_WINDOWS = EnvProperty("RELAX_STRAGGLER_RECOVER_WINDOWS", int, 2)
+    RELAX_STRAGGLER_GATHER_TIMEOUT_S = EnvProperty("RELAX_STRAGGLER_GATHER_TIMEOUT_S", float, 60.0)
 
     # ------------- DeepSeek-V4 MXFP4 QAT -------------
     # Used only by relax.models.deepseek_v4.provider.model_provider;

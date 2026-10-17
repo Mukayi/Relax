@@ -108,12 +108,14 @@ def test_one_rank_asking_to_disable_turns_the_profiler_off_on_every_rank():
     assert len(reports) == 1 and reports[0].metrics["straggler/health/state"] == HEALTH_DISABLE
     assert reports[0].metrics["straggler/health/requested_by"] == 1.0
     assert "rank 1" in reports[0].note
-    # Off means off: no more collectives, no events, no GC hook, pool whole again.
+    # Off means no more events and no GC hook, pool whole again; it still joins
+    # every gather, with a row that repeats the switch-off request.
     assert len(gc.callbacks) == before - 1
     bracket(collector)
     assert collector.pending_events == 0 and len(collector._pool) == 4
     assert collector.end_step(rollout_id=5) == []
-    assert len(collector.gather_calls) == 1
+    assert len(collector.gather_calls) == 2
+    assert collector.gather_calls[1][FIELD_INDEX["health"]] == float(HEALTH_DISABLE)
 
 
 def test_non_primary_rank_disables_too_but_returns_no_report():
@@ -127,13 +129,19 @@ def test_non_primary_rank_disables_too_but_returns_no_report():
     assert collector.disabled
 
 
-def test_gather_failure_disables_locally_without_raising():
+def test_gather_failure_degrades_and_a_persistent_one_disables_without_raising():
+    # One failed gather is counted, not fatal: the rank keeps gathering so the
+    # failure can still be reported to its peers. The health code is computed
+    # when the *next* window closes, so the switch-off follows one window later.
     def gather(values):
         raise RuntimeError("gloo timeout")
 
-    collector = _collector(gather=gather)
+    collector = _collector(gather=gather, health_config=HealthConfig(max_errors=1, max_degraded_windows=100))
     bracket(collector)
     assert collector.end_step(rollout_id=0) == []
+    assert not collector.disabled
+    assert collector.health.errors_total == 1
+    assert collector.end_step(rollout_id=1) == []
     assert collector.disabled
     assert "gather" in collector.health.disabled_reason
 

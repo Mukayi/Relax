@@ -152,6 +152,8 @@ def test_install_uses_the_shared_metrics_primary_rank(monkeypatch, primary):
     monkeypatch.setattr(runtime, "local_rank_meta", lambda: meta(1)[0])
     monkeypatch.setattr(runtime, "timing_event_factory", lambda: FakeEvent)
     monkeypatch.setattr(runtime, "stream_capture_check", lambda: runtime._never)
+    # The gather group is a collective; its creation is covered separately.
+    monkeypatch.setattr(runtime, "init_straggler_gather_group", lambda timeout_s: None)
     monkeypatch.setattr(runtime, "_PROFILER", None)
     profiler = install_straggler_profiler("actor", _args())
     try:

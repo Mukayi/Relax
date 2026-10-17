@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Mapping
 
+from relax.utils.straggler.health import HEALTH_DISABLE
+
 
 # Compute-stream time (ms, summed over the window) per coarse segment. The
 # first block is fed by Megatron's own ``config.timers`` call sites (see
@@ -44,6 +46,21 @@ STATUS_FIELDS: tuple[str, ...] = ("unread", "errors", "health")
 FIELDS: tuple[str, ...] = GPU_SEGMENTS + CPU_FIELDS + COUNT_FIELDS + STATUS_FIELDS
 FIELD_INDEX: Mapping[str, int] = {name: index for index, name in enumerate(FIELDS)}
 NUM_FIELDS: int = len(FIELDS)
+
+
+def disabled_row() -> list[float]:
+    """The vector a switched-off rank keeps sending: all zeros except the
+    ``health`` field, which asks every rank to switch the profiler off.
+
+    Same length and shape as a normal window, so the gather is unchanged; a
+    rank that stops recording time must still join it, or the remaining ranks
+    block until the group times out.
+    """
+
+    values = [0.0] * NUM_FIELDS
+    values[FIELD_INDEX["health"]] = float(HEALTH_DISABLE)
+    return values
+
 
 # Segments whose sum is "time this rank spent computing on its own" versus
 # "time this rank spent waiting for a peer". Used by the detector.

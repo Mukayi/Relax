@@ -23,6 +23,7 @@ env_vars:
 | `RELAX_STRAGGLER_REL_THRESHOLD` | float | 0.10 | 候选 rank 相对组内中位数的最小超出比例。 |
 | `RELAX_STRAGGLER_PERSIST_WINDOWS` | int | 3 | 连续多少个窗口满足条件才告警（所有 reason 都适用），用来过滤 checkpoint、GC 峰等一次性抖动；必须 ≥ 1。 |
 | `RELAX_STRAGGLER_RECOVER_WINDOWS` | int | 2 | 已告警的 rank 要连续多少个干净窗口才解除告警，避免告警反复开关；「不确定」的窗口不算干净；必须 ≥ 1。 |
+| `RELAX_STRAGGLER_GATHER_TIMEOUT_S` | float | 60.0 | profiler 专用 Gloo 组的超时（秒）。单次 gather 是几毫秒的 CPU 小张量汇聚；这个值只限制「有 rank 已经消失」时其余 rank 阻塞多久。 |
 
 开启后每个 actor 角色的进程启动时打一行 `Straggler profiler enabled: report_interval=… primary=… meta=RankMeta(rank=…, dp=…, tp=…, pp=…, cp=…, ep=…, host=…, device=…)`；critic / reference / `actor_fwd` 不跑训练步，不会被采样。
 
@@ -133,7 +134,9 @@ closed; their time lands in the next window
 
 ## 分析器自身出错时
 
-计时调用、读事件、窗口 gather、判定、日志回调里的异常都被捕获并计数，不会抛进训练循环。某个 rank 累计 3 次异常，或连续 3 个窗口有丢弃的事件对或异常，就请求关闭分析器。这个请求放在该 rank 的窗口向量里（`health` 字段）一起 gather，所以所有 rank 看到同一张表，在同一个窗口一起关闭，不会有 rank 单独退出而让其他 rank 卡在下一次 gather 里。关闭后计时调用直接跳过、不再 gather，primary 发出一组 `straggler/health/state = 2` 并打一条 WARNING 说明是哪个 rank 请求的（具体原因在那个 rank 的日志里）；训练照常继续。gather 本身失败时只有本 rank 知道，它就地停止参与后续 gather。**这是当前的已知限制**：该 rank 退出后，其余 rank 并不知道，会照常发起下一次 gather 并一直等到 Gloo 组超时（默认 30 分钟）为止。取代方案（失败 rank 继续加入并上报一个「已关闭」标记，让所有 rank 在同一窗口一起退出；以及给这类 gather 单独设置更短的超时）在设计中，尚未实现。
+计时调用、读事件、窗口 gather、判定、日志回调里的异常都被捕获并计数，不会抛进训练循环。某个 rank 累计 3 次异常，或连续 3 个窗口有丢弃的事件对或异常，就请求关闭分析器。这个请求放在该 rank 的窗口向量里（`health` 字段）一起 gather，所以所有 rank 看到同一张表，在同一个窗口一起关闭，不会有 rank 单独退出而让其他 rank 卡在下一次 gather 里。关闭后计时调用直接跳过，但该 rank **仍然参与每次窗口 gather**：它发一个长度为 `NUM_FIELDS` 的全零行，只把 `health` 写成 2，因此集合通信的形状不变，关闭状态也会持续传给还没看到的 rank。
+
+gather 本身失败时只有本 rank 知道。现在的处理是**不退出集合通信**：失败被计数，本次窗口照常重置，下一次窗口仍发一行（正常行或上面的空行）。持续失败达到上限后该 rank 本地关闭并开始发空行，其余 rank 在下一个能完成的 gather 里读到 `health = 2`，在同一个窗口一起关闭。为了让「某 rank 进程真的消失」这种发不出任何东西的情形有界，profiler 在安装时给这类 gather 单独建一个 Gloo 组，超时由 `RELAX_STRAGGLER_GATHER_TIMEOUT_S`（默认 60 s）控制，不影响通用 Gloo 组和训练路径的超时。**已知限制**：单次 gather 会因为组超时而阻塞到该超时；如果整个组都失联，所有 rank 都只能各自本地关闭，没有跨 rank 的传播。
 
 ## 开销
 

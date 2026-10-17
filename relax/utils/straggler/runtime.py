@@ -51,15 +51,42 @@ def _never() -> bool:
     return False
 
 
+_STALL_GATHER_GROUP: Any = None
+
+
+def init_straggler_gather_group(timeout_s: float) -> None:
+    """Create the profiler's dedicated Gloo group, with a timeout far shorter
+    than the training one.
+
+    The generic Gloo group is shared with weight sync and other paths, so its
+    timeout cannot be lowered for this; a straggler gather is ``world × 168 B``
+    of CPU copies (milliseconds), and a rank that vanished must not park the
+    rest of the job for ``--distributed-timeout-minutes``. Every member of the
+    default group must call this in the same order, so it runs on all ranks of
+    the actor group before any gather.
+    """
+    global _STALL_GATHER_GROUP
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    if _STALL_GATHER_GROUP is None:
+        _STALL_GATHER_GROUP = dist.new_group(backend="gloo", timeout=timedelta(seconds=timeout_s))
+
+
+def get_straggler_gather_group() -> Any:
+    if _STALL_GATHER_GROUP is None:
+        raise RuntimeError("the straggler Gloo group has not been initialized; call install_straggler_profiler first")
+    return _STALL_GATHER_GROUP
+
+
 def gloo_all_gather(values: list[float]) -> list[list[float]]:
-    """All-gather one CPU vector over Relax's Gloo group (ranks == global
+    """All-gather one CPU vector over the straggler Gloo group (ranks == global
     ranks)."""
     import torch
     import torch.distributed as dist
 
-    from relax.utils.distributed_utils import get_gloo_group
-
-    group = get_gloo_group()
+    group = get_straggler_gather_group()
     local = torch.tensor(values, dtype=torch.float64)
     gathered = [torch.empty_like(local) for _ in range(dist.get_world_size(group))]
     dist.all_gather(gathered, local, group=group)
@@ -69,9 +96,7 @@ def gloo_all_gather(values: list[float]) -> list[list[float]]:
 def gloo_all_gather_objects(obj: Any) -> list[Any]:
     import torch.distributed as dist
 
-    from relax.utils.distributed_utils import get_gloo_group
-
-    group = get_gloo_group()
+    group = get_straggler_gather_group()
     gathered: list[Any] = [None] * dist.get_world_size(group)
     dist.all_gather_object(gathered, obj, group=group)
     return gathered
@@ -184,6 +209,10 @@ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None
     if _PROFILER is not None:
         return _PROFILER
     from relax.utils.training.train_metric_utils import is_metrics_primary_rank
+
+    # Every rank of the actor group reaches this call in the same order, which
+    # is what ``dist.new_group`` requires.
+    init_straggler_gather_group(Envs.RELAX_STRAGGLER_GATHER_TIMEOUT_S)
 
     # The window scalars are logged through ``log_perf_data``, which drops them
     # on every other rank.
