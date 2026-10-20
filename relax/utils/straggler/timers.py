@@ -169,8 +169,9 @@ class StragglerTimers:
                     # _timers caches this entry after the first lookup, so the
                     # warning fires at most once per name per instance.
                     logger.warning(
-                        "[straggler] unknown Megatron timer %r: not mapped to any segment and not in the ignore list; "
-                        "its time will not be recorded. Add it to MEGATRON_TIMER_SEGMENTS or _IGNORED_TIMER_NAMES.",
+                        "[straggler] unknown Megatron timer %r: not mapped to a segment, so its time is not "
+                        "recorded. Add it to MEGATRON_TIMER_SEGMENTS, or to the ignored names if it should stay "
+                        "unmapped.",
                         name,
                     )
             self._timers[name] = timer

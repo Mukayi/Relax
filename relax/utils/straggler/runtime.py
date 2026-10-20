@@ -163,21 +163,22 @@ class StragglerProfiler:
                         "window"
                     ),
                 )
-        metrics: dict[str, float] = {}
+        metrics: dict[str, float] | None = None
+        emitted: WindowReport | None = None
         for report in reports:
             try:
                 scalars = report_straggler_window(self._args, report)
             except Exception as exc:
                 self.collector.on_error("report", exc)
                 continue
-            if report is reports[-1]:
-                metrics = scalars
-        if metrics:
-            self._emitted = reports[-1]
-            if self._delivered_ms is not None:
-                # A report cannot carry its own delivery time, so each carries the previous one's.
-                metrics["straggler/latency/prev_delivered_ms"] = self._delivered_ms
-        return metrics or None
+            emitted, metrics = report, scalars
+        if metrics is None:
+            return None
+        self._emitted = emitted
+        if self._delivered_ms is not None:
+            # A report cannot carry its own delivery time, so each carries the previous one's.
+            metrics["straggler/latency/prev_delivered_ms"] = self._delivered_ms
+        return metrics
 
     def delivered(self, rollout_id: int) -> None:
         """Log close-to-delivered latency once the ``log_perf_data`` that

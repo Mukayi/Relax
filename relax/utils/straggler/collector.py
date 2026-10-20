@@ -247,14 +247,12 @@ class StragglerCollector:
         analyze.
 
         All ranks must call this at the same logical step (it contains a
-        collective) and a switched-off rank keeps calling it too: it stops
-        recording time but still joins every gather with a row that carries its
-        ``health`` code, so the other ranks learn that it is off instead of
-        blocking in a gather it never joins. Never raises: profiler failures
-        are counted by ``self.health``. Returns the reports that are ready on
-        the primary rank (empty elsewhere and between windows). On the
-        ``final`` step of a run it waits (bounded) for the pending analyses,
-        since no later call would pick them up.
+        collective), including a switched-off one: it stops recording time but
+        still joins every gather with a row carrying its ``health`` code. Never
+        raises: profiler failures are counted by ``self.health``. Returns the
+        reports that are ready on the primary rank (empty elsewhere and between
+        windows). On the ``final`` step of a run it waits (bounded) for the
+        pending analyses, since no later call would pick them up.
         """
         try:
             self.drain()
@@ -274,74 +272,96 @@ class StragglerCollector:
     def _close_window(self) -> None:
         closed_wall = self._wall()
         errors, code = self.health.close_window(self._window.get("dropped"))
-        if self._disabled:
-            # Already switched off (locally, or because a peer's row asked for
-            # it): keep asking in every window so a rank that has not seen the
-            # request yet does, but do not repeat the local warning.
-            code = HEALTH_DISABLE
-        elif code >= HEALTH_DISABLE:
-            logger.warning(
-                "[straggler] rank %d asks to switch the profiler off: %s",
-                self.rank_meta.rank,
-                self.health.request_reason(),
-            )
+        code = self._health_code(code)
         self._window.set("unread", float(len(self._pending)))
         self._window.set("errors", errors)
         self._window.set("health", code)
         try:
             started = self._clock()
-            try:
-                if self._all_meta is None:
-                    self._all_meta = list(self._gather_objects(self.rank_meta))
-                table = self._gather(disabled_row() if self._disabled else self._window.as_list())
-            except Exception as exc:
-                # Keep participating: the next window's row carries this rank's
-                # health, which eventually asks every rank to switch off. A
-                # group that is really broken is bounded by the dedicated
-                # short-timeout Gloo group, not by this early return. Once
-                # health gives up (repeated failures) the rank also stops
-                # recording locally, so a broken group cannot burn timer cost
-                # for the rest of the run; it still joins every gather.
-                self.on_error("gather", exc)
-                if code >= HEALTH_DISABLE and not self._disabled:
-                    self._disable(f"the window gather kept failing ({type(exc).__name__}: {exc})")
+            table = self._gather_window(code)
+            if table is None:
                 return
             gathered = self._clock()
-
-            requesting = [
-                self._all_meta[i].rank for i, row in enumerate(table) if row[_HEALTH_INDEX] >= HEALTH_DISABLE
-            ]
-            if requesting and not self._disabled:
-                note = (
-                    f"rank {requesting[0]} asked to switch the profiler off"
-                    + (f" (with {len(requesting) - 1} more)" if len(requesting) > 1 else "")
-                    + "; the reason is in that rank's log"
-                )
-                if self.is_primary:
-                    notice = WindowReport(
-                        metrics={
-                            "straggler/health/state": float(HEALTH_DISABLE),
-                            "straggler/health/requested_by": float(requesting[0]),
-                            "straggler/health/errors": float(sum(row[_ERRORS_INDEX] for row in table)),
-                        },
-                        alerts=[],
-                        rows=[],
-                        note=note,
-                    )
-                    self._submit(self._job(None, closed_wall=closed_wall, ready=notice))
-                self._disable(note)
+            if self._handle_switch_off(table, closed_wall):
                 return
-
-            # A switched-off primary has already stopped its worker; there is
-            # nothing to analyse, and submitting would never drain.
+            # A switched-off primary has already stopped its worker, so there
+            # is nothing to analyse.
             if self.is_primary and not self._disabled:
                 self._submit(self._job(table, closed_wall=closed_wall, gather_ms=(gathered - started) * 1e3))
         finally:
-            # Every path must reset the window: a rank that keeps gathering
-            # would otherwise close (and gather) on every step from here on.
-            self._window.reset()
-            self.window_start_wall = self._wall()
-            self._window_first_rollout = None
+            self._reset_window()
+
+    def _health_code(self, code: float) -> float:
+        """Return this window's ``health`` code, logging a new local switch-off
+        request once.
+
+        A rank that is already off keeps asking in every window, so a peer that
+        has not seen the request yet still does.
+        """
+        if self._disabled:
+            return HEALTH_DISABLE
+        if code >= HEALTH_DISABLE:
+            logger.warning(
+                "[straggler] rank %d asks to switch the profiler off: %s",
+                self.rank_meta.rank,
+                self.health.request_reason(),
+            )
+        return code
+
+    def _gather_window(self, code: float) -> list[list[float]] | None:
+        """Gather this window's row on every rank, or ``None`` if it failed.
+
+        A failure is counted and the next window tries again: leaving the
+        collective would strand the other ranks in a gather this one never
+        joins. The dedicated short-timeout group bounds a group that is really
+        broken, and once health gives up the rank also stops recording, so a
+        failed group cannot keep costing timer time for the rest of the run.
+        """
+        try:
+            if self._all_meta is None:
+                self._all_meta = list(self._gather_objects(self.rank_meta))
+            return self._gather(disabled_row() if self._disabled else self._window.as_list())
+        except Exception as exc:
+            self.on_error("gather", exc)
+            if code >= HEALTH_DISABLE and not self._disabled:
+                self._disable(f"the window gather kept failing ({type(exc).__name__}: {exc})")
+            return None
+
+    def _handle_switch_off(self, table: list[list[float]], closed_wall: float) -> bool:
+        """Switch off when a gathered row asks for it; ``True`` when it did.
+
+        On the primary rank the notice joins the analysis queue, so it stays in
+        window order with the reports around it.
+        """
+        requesting = [self._all_meta[i].rank for i, row in enumerate(table) if row[_HEALTH_INDEX] >= HEALTH_DISABLE]
+        if not requesting or self._disabled:
+            return False
+        note = (
+            f"rank {requesting[0]} asked to switch the profiler off"
+            + (f" (with {len(requesting) - 1} more)" if len(requesting) > 1 else "")
+            + "; the reason is in that rank's log"
+        )
+        if self.is_primary:
+            notice = WindowReport(
+                metrics={
+                    "straggler/health/state": float(HEALTH_DISABLE),
+                    "straggler/health/requested_by": float(requesting[0]),
+                    "straggler/health/errors": float(sum(row[_ERRORS_INDEX] for row in table)),
+                },
+                alerts=[],
+                rows=[],
+                note=note,
+            )
+            self._submit(self._job(None, closed_wall=closed_wall, ready=notice))
+        self._disable(note)
+        return True
+
+    def _reset_window(self) -> None:
+        """Start the next window; every close path has to reach this, or the
+        window would close (and gather) again on every following step."""
+        self._window.reset()
+        self.window_start_wall = self._wall()
+        self._window_first_rollout = None
 
     def _job(self, table: list[list[float]] | None, **kwargs: Any) -> _WindowJob:
         first = self._window_first_rollout
@@ -359,9 +379,9 @@ class StragglerCollector:
             self._handle_job(job)
             return
         # A ready notice (job.ready is not None) bypasses the backlog check so
-        # the health/state=2 report always reaches end_step even when the queue
-        # is full.  There is at most one such notice per profiler lifetime, so
-        # the queue stays bounded at max_backlog + 1.
+        # the health/state=2 report reaches end_step even when the queue is
+        # full. There is at most one such notice per profiler lifetime, so the
+        # queue stays bounded at max_backlog + 1.
         if job.ready is None and self._worker.backlog >= self._max_backlog:
             self.on_error(
                 "analyze",

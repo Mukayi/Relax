@@ -56,7 +56,6 @@ def disabled_row() -> list[float]:
     rank that stops recording time must still join it, or the remaining ranks
     block until the group times out.
     """
-
     values = [0.0] * NUM_FIELDS
     values[FIELD_INDEX["health"]] = float(HEALTH_DISABLE)
     return values
