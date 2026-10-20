@@ -70,7 +70,7 @@ closed; their time lands in the next window
 
 ### 指标（与 `perf/*` 同一 step key，进 TensorBoard / WandB / ClearML）
 
-这些标量随训练线程下一次 `log_perf_data` 的 `perf/*` 在同一次 `tracking_utils.log` 里发出，不额外发请求：开启 `--use-metrics-service` 时，每次 log 都是训练线程上的一次同步 HTTP 请求。判定在后台线程上跑，所以一个窗口的标量通常随下一个 rollout 的 `perf/*` 发出；`straggler/window/{first,last}_rollout` 标明它属于哪个窗口。运行的最后一个 rollout 会等最后一个窗口判定完再发。
+这些标量随训练线程下一次 `log_perf_data` 的 `perf/*` 在同一次 `tracking_utils.log` 里发出，不额外发请求：开启 `--use-metrics-service` 时，每次 log 都是训练线程上的一次同步 HTTP 请求。判定在后台线程上跑，所以一个窗口的标量通常随下一个 rollout 的 `perf/*` 发出；`straggler/window/{first,last}_rollout` 标明它属于哪个窗口。运行的最后一个 rollout 会等最后一个窗口判定完再发。如果后台判定落后，同一步里有多个窗口同时判定完成（正常运行中不会出现），每个窗口照常写 timeline 和日志，但只有最新窗口的标量进指标（同一次 log 每个 key 只能带一个值）；被覆盖的每个窗口打一条 WARNING `… windows ready at once; only rollouts …-… reach the metrics`，并计一次分析器自身异常（见下文「分析器自身出错时」）。
 
 | 指标 | 含义 |
 |------|------|

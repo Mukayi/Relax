@@ -70,7 +70,7 @@ An uncertain window counts neither way: it breaks candidate streaks and is not a
 
 ### Metrics (same step key as `perf/*`; TensorBoard / WandB / ClearML)
 
-These scalars go out in the same `tracking_utils.log` call as the `perf/*` metrics of the training thread's next `log_perf_data`, never in a request of their own: with `--use-metrics-service` every log call is a synchronous HTTP request on the training thread. Because the analysis runs on a background thread, a window's scalars normally ride along with the next rollout's `perf/*`; `straggler/window/{first,last}_rollout` say which window they belong to. The last rollout of a run waits for the last window's analysis before logging.
+These scalars go out in the same `tracking_utils.log` call as the `perf/*` metrics of the training thread's next `log_perf_data`, never in a request of their own: with `--use-metrics-service` every log call is a synchronous HTTP request on the training thread. Because the analysis runs on a background thread, a window's scalars normally ride along with the next rollout's `perf/*`; `straggler/window/{first,last}_rollout` say which window they belong to. The last rollout of a run waits for the last window's analysis before logging. If the analysis falls behind and several windows finish in the same step (this does not happen in normal runs), each window still reaches the timeline and the log, but only the latest window's scalars reach the metrics (one log call carries one value per key); each superseded window logs a WARNING `… windows ready at once; only rollouts …-… reach the metrics` and counts as one profiler error (see *When the profiler itself fails*).
 
 | Metric | Meaning |
 |--------|---------|
