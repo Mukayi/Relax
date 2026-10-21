@@ -2,27 +2,30 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Tests for the MetricsClient transport and the MetricsService report path.
 
-Two properties are covered here that the older tests could not see, because
-they patched the module-level ``requests`` functions and therefore never
-exercised the real transport:
+Covered here, and not by the older tests (they patched the module-level
+``requests`` functions and therefore never exercised the real transport):
 
 * the client reuses one HTTP connection across calls instead of opening a new
   one per request, and it ignores ``HTTP_PROXY`` / ``HTTPS_PROXY`` for what is a
   cluster-local endpoint;
 * the blocking backend fan-out in ``/report_step`` runs off the event loop, so a
   slow backend does not stall concurrent metric ingestion on the same replica;
-* a metric ingested while that fan-out runs is kept for the next report of the
-  step, and goes out exactly once.
+* a metric ingested while that fan-out runs, and the batch of a request that is
+  cancelled, each go out exactly once.
 
 The connection-reuse test drives a real HTTP server and counts accepted TCP
 connections, so it fails if the client goes back to a fresh connection per call.
 """
 
 import asyncio
+import contextlib
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
+
+import pytest
 
 from relax.utils.metrics.client import MetricsClient
 from relax.utils.metrics.service import LogMetricsBatchRequest, MetricsBuffer, MetricsService, ReportStepRequest
@@ -151,7 +154,7 @@ def test_report_step_helper_is_synchronous_so_it_can_run_on_a_thread():
     the work straight back on the event loop.
     """
     cls = MetricsService.func_or_class
-    assert not asyncio.iscoroutinefunction(cls._report_to_backends)
+    assert not asyncio.iscoroutinefunction(cls._report_buffered_step)
     assert asyncio.iscoroutinefunction(cls.report_step)
 
 
@@ -318,3 +321,40 @@ def test_a_report_that_raises_keeps_its_batch_for_the_next_report():
 
     assert result["status"] == "error"
     assert [m["name"] for m in service.metrics_buffer.get_metrics_for_step(1)] == ["perf/step_time"]
+
+
+@pytest.mark.parametrize("cancelled_while", ["queued", "running"])
+def test_a_cancelled_report_neither_loses_nor_repeats_its_batch(cancelled_while):
+    """Serve cancels the handler when the client disconnects.
+
+    Work still queued then never runs and leaves the batch buffered; work
+    already running reports it to the end.
+    """
+    adapter = _GatedAdapter()
+    service = _service_with_slow_backend(adapter)
+    service.metrics_buffer.add_metric(step=1, metric_name="perf/step_time", metric_value=1.0)
+    worker_free = threading.Event()
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        # One worker: holding it keeps the report queued, and the next report
+        # cannot start before the cancelled one is done.
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        if cancelled_while == "queued":
+            loop.run_in_executor(None, worker_free.wait, 5)
+        report = asyncio.create_task(service.report_step(ReportStepRequest(step=1)))
+        await asyncio.sleep(0)
+        # Blocking the loop is fine here: the worker does not need it.
+        if cancelled_while == "running":
+            assert adapter.entered.wait(5), "the report never reached the backend"
+        report.cancel()
+        worker_free.set()
+        adapter.release.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await report
+        await service.report_step(ReportStepRequest(step=1))
+
+    asyncio.run(scenario())
+
+    assert adapter.received == [{"perf/step_time": 1.0}]
+    assert not service.metrics_buffer.has_metrics_for_step(1)

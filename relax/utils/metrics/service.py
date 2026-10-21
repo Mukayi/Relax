@@ -6,7 +6,7 @@ import threading
 from argparse import Namespace
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import wandb
 from fastapi import FastAPI, Request
@@ -287,15 +287,6 @@ class MetricsService:
     async def report_step(self, request: ReportStepRequest) -> Dict[str, Any]:
         try:
             step = request.step
-            # Take the batch before the await below: a /log_metrics_batch that
-            # lands while the backends run must stay buffered for the next report
-            # of this step instead of being cleared unreported.
-            metrics = self.metrics_buffer.take_step(step)
-
-            metrics_dict = {}
-            for metric in metrics:
-                metrics_dict[metric["name"]] = metric["value"]
-
             # The backend fan-out below is blocking: `wandb.log` and
             # `SummaryWriter.add_scalar` write through to disk, and the timeline
             # adapter serializes JSON to a file. This service runs as a single
@@ -303,16 +294,12 @@ class MetricsService:
             # /log_metrics_batch that arrives meanwhile -- the handler itself is
             # cheap, its neighbours are what get slow. Hand it to a worker
             # thread instead.
-            try:
-                report_results = await asyncio.to_thread(self._report_to_backends, step, metrics_dict)
-            except Exception:
-                self.metrics_buffer.restore_step(step, metrics)
-                raise
+            count, report_results = await asyncio.to_thread(self._report_buffered_step, step)
 
-            logger.info(f"Reported {len(metrics)} metrics for step {step}")
+            logger.info(f"Reported {count} metrics for step {step}")
             return {
                 "status": "success",
-                "message": f"Reported {len(metrics)} metrics for step {step}",
+                "message": f"Reported {count} metrics for step {step}",
                 "results": report_results,
             }
 
@@ -320,14 +307,30 @@ class MetricsService:
             logger.error(f"Failed to report step {request.step}: {e}")
             return {"status": "error", "message": str(e)}
 
+    def _report_buffered_step(self, step: int) -> Tuple[int, Dict[str, str]]:
+        """Take and report ``step``'s buffered metrics on a worker thread.
+
+        Taking the batch here, not before the ``await`` in :meth:`report_step`,
+        ties it to the work that reports it: if Serve cancels the request (the
+        client disconnected) while the work is still queued, the work never
+        runs and the batch stays buffered; once the work runs, it reports the
+        batch to the end. Metrics that arrive meanwhile wait for the step's
+        next report.
+        """
+        metrics = self.metrics_buffer.take_step(step)
+        metrics_dict = {metric["name"]: metric["value"] for metric in metrics}
+        try:
+            return len(metrics), self._report_to_backends(step, metrics_dict)
+        except Exception:
+            self.metrics_buffer.restore_step(step, metrics)
+            raise
+
     def _report_to_backends(self, step: int, metrics_dict: Dict[str, Any]) -> Dict[str, str]:
         """Push one step's metrics out to every configured backend.
 
-        This is the blocking body of :meth:`report_step` and is meant to be run
-        through ``asyncio.to_thread``; awaiting it directly would put the same
-        work back on the event loop. Adapter calls are serialized because none
-        of the backends documents thread safety, and reporting is sequential
-        per step anyway.
+        Runs on the worker thread, from :meth:`_report_buffered_step`. Adapter
+        calls are serialized because none of the backends documents thread
+        safety, and reporting is sequential per step anyway.
         """
         report_results: Dict[str, str] = {}
 
