@@ -136,12 +136,12 @@ closed; their time lands in the next window
 
 计时调用、读事件、窗口 gather、判定、日志回调里的异常都被捕获并计数，不会抛进训练循环。某个 rank 累计 3 次异常，或连续 3 个窗口有丢弃的事件对或异常，就请求关闭分析器。这个请求放在该 rank 的窗口向量里（`health` 字段）一起 gather，所以所有 rank 看到同一张表，在同一个窗口一起关闭，不会有 rank 单独退出而让其他 rank 卡在下一次 gather 里。关闭后计时调用直接跳过，但该 rank **仍然参与每次窗口 gather**：它发一个长度为 `NUM_FIELDS` 的全零行，只把 `health` 写成 2，因此集合通信的形状不变，关闭状态也会持续传给还没看到的 rank。
 
-gather 本身失败时只有本 rank 知道。现在的处理是**不退出集合通信**：失败被计数，本次窗口照常重置，下一次窗口仍发一行（正常行或上面的空行）。持续失败达到上限后该 rank 本地关闭并开始发空行，其余 rank 在下一个能完成的 gather 里读到 `health = 2`，在同一个窗口一起关闭。首个窗口的元数据汇聚只做一次、不重试：其余 rank 拿到元数据后每个窗口只做数值 gather，失败的 rank 单独重试会和它们的集合通信错位，所以它照常发这一窗口的行并把 `health` 写成 2，所有 rank 在这个窗口一起关闭。为了让「某 rank 进程真的消失」这种发不出任何东西的情形有界，profiler 在安装时给这类 gather 单独建一个 Gloo 组，超时由 `RELAX_STRAGGLER_GATHER_TIMEOUT_S`（默认 60 s）控制，不影响通用 Gloo 组和训练路径的超时。**已知限制**：单次 gather 会因为组超时而阻塞到该超时；如果整个组都失联，所有 rank 都只能各自本地关闭，没有跨 rank 的传播。
+gather 本身失败时只有本 rank 知道。现在的处理是**不退出集合通信**：失败被计数，本次窗口照常重置，下一次窗口仍发一行（正常行或上面的空行）。持续失败达到上限后该 rank 本地关闭并开始发空行，其余 rank 在下一个能完成的 gather 里读到 `health = 2`，在同一个窗口一起关闭。首个窗口的元数据汇聚只做一次、不重试：其余 rank 拿到元数据后每个窗口只做数值 gather，失败的 rank 单独重试会和它们的集合通信错位，所以它照常发这一窗口的行并把 `health` 写成 2，所有 rank 在这个窗口一起关闭。元数据汇聚本身只有一次集合通信，每个 rank 发一个 1 KiB 的定长字节行：本地序列化元数据失败、或元数据超长的 rank 照常参与，只是发一个空行，所有 rank 收到后看到同一个缺失的条目，同样在这个窗口一起关闭。为了让「某 rank 进程真的消失」这种发不出任何东西的情形有界，profiler 在安装时给这类 gather 单独建一个 Gloo 组，超时由 `RELAX_STRAGGLER_GATHER_TIMEOUT_S`（默认 60 s）控制，不影响通用 Gloo 组和训练路径的超时。**已知限制**：单次 gather 会因为组超时而阻塞到该超时；如果整个组都失联，所有 rank 都只能各自本地关闭，没有跨 rank 的传播。
 
 ## 开销
 
 - 每个 Megatron 计时点一对非阻塞的 `event.record()`（事件从池里复用）；每步末尾用 `event.query()` 惰性读取已完成的事件，不调用 `cuda.synchronize()`，耗时记在 `straggler/self_overhead_ms`。
-- 每 `REPORT_INTERVAL` 个 rollout 一次 Gloo `all_gather`，耗时记在 `straggler/gather_ms`。每个 rank 每窗口贡献 168 B（21 个 float64），与 micro-batch 数无关；由于是 `all_gather`，每个 rank 都会拿到 `N × 168 B` 的完整表，全作业每窗口合计接收 `N × (N−1) × 168 B`（不含 Gloo 协议开销）。首个窗口另有一次元数据汇聚。
+- 每 `REPORT_INTERVAL` 个 rollout 一次 Gloo `all_gather`，耗时记在 `straggler/gather_ms`。每个 rank 每窗口贡献 168 B（21 个 float64），与 micro-batch 数无关；由于是 `all_gather`，每个 rank 都会拿到 `N × 168 B` 的完整表，全作业每窗口合计接收 `N × (N−1) × 168 B`（不含 Gloo 协议开销）。首个窗口另有一次元数据汇聚，每个 rank 1 KiB。
 - 判定在 primary 的后台线程上跑，耗时记在 `straggler/analyze_ms`，复杂度 O(n log n)（n = 同 stage rank 数）：8 个 rank 每窗口几毫秒，2048 个 rank 的 CPU 基准约 35 ms。
 - 在 8×A100、Qwen3-0.6B DP8（step 约 1 s）上，逐项相加的最坏上界约 1.9 ms/step（约 0.19%），端到端开 / 关对比与 0 无法区分；开启后不新增同步调用，NCCL 与计算 kernel 的重叠比例不变。测量方法和各组数据见 [RFC #362](https://github.com/redai-studio/Relax/issues/362)。
 

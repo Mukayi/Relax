@@ -93,13 +93,47 @@ def gloo_all_gather(values: list[float]) -> list[list[float]]:
     return [row.tolist() for row in gathered]
 
 
+# A pickled RankMeta, behind a 4-byte length; even a 253-character FQDN host
+# leaves it well under this.
+_META_ROW_BYTES = 1024
+
+
 def gloo_all_gather_objects(obj: Any) -> list[Any]:
+    """All-gather one small picklable object per rank as one fixed-size byte
+    row.
+
+    ``dist.all_gather_object`` pickles before its first collective, so a rank
+    whose pickling fails would skip the size and payload gathers its peers
+    issue. Here every rank issues the same single collective whatever fails
+    locally: a rank that cannot encode its object sends an empty row, and every
+    rank then raises for the same missing entry.
+    """
+    import pickle
+
+    import torch
     import torch.distributed as dist
 
     group = get_straggler_gather_group()
-    gathered: list[Any] = [None] * dist.get_world_size(group)
-    dist.all_gather_object(gathered, obj, group=group)
-    return gathered
+    local = torch.zeros(_META_ROW_BYTES, dtype=torch.uint8)
+    gathered = [torch.empty_like(local) for _ in range(dist.get_world_size(group))]
+    encode_error = None
+    try:
+        data = pickle.dumps(obj)
+        if len(data) > _META_ROW_BYTES - 4:
+            raise ValueError(f"{len(data)} B of rank metadata does not fit the {_META_ROW_BYTES} B row")
+        row = local.numpy()
+        row[:4] = list(len(data).to_bytes(4, "little"))
+        row[4 : 4 + len(data)] = list(data)
+    except Exception as exc:
+        local.zero_()
+        encode_error = exc
+    dist.all_gather(gathered, local, group=group)
+    rows = [row.numpy() for row in gathered]
+    lengths = [int.from_bytes(row[:4].tobytes(), "little") for row in rows]
+    missing = [rank for rank, length in enumerate(lengths) if length == 0]
+    if missing:
+        raise RuntimeError(f"rank(s) {missing} sent no metadata") from encode_error
+    return [pickle.loads(row[4 : 4 + length].tobytes()) for row, length in zip(rows, lengths)]
 
 
 def local_rank_meta() -> RankMeta:

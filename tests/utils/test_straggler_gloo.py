@@ -13,7 +13,12 @@ import pytest
 torch = pytest.importorskip("torch")
 
 
-def _rank_worker(rank, world_size, init_file, out_dir):
+class _Unpicklable(str):
+    def __reduce__(self):
+        raise MemoryError("injected while pickling, before any collective")
+
+
+def _rank_worker(rank, world_size, init_file, out_dir, failure):
     import torch.distributed as dist
 
     from relax.utils.straggler import runtime
@@ -39,13 +44,14 @@ def _rank_worker(rank, world_size, init_file, out_dir):
         def gather_objects(obj):
             calls.append("objects")
             gathered = runtime.gloo_all_gather_objects(obj)
-            if rank == 0 and calls.count("objects") == 1:
+            if failure == "decode" and rank == 0:
                 # Like a MemoryError while decoding: the collectives are done on every rank, only rank 0 fails.
                 raise MemoryError("injected after the metadata collectives")
             return gathered
 
+        host = {"pickle": _Unpicklable("host"), "oversized": "h" * 2000}.get(failure, "") if rank == 0 else ""
         collector = StragglerCollector(
-            rank_meta=RankMeta(rank=rank, dp=rank, tp=0, pp=0),
+            rank_meta=RankMeta(rank=rank, dp=rank, tp=0, pp=0, host=host),
             is_primary=rank == 0,
             report_interval=1,
             event_factory=FakeEvent,
@@ -68,10 +74,13 @@ def _rank_worker(rank, world_size, init_file, out_dir):
     not torch.distributed.is_available() or not torch.distributed.is_gloo_available(),
     reason="torch.distributed with Gloo is required",
 )
-def test_a_metadata_failure_on_one_rank_keeps_every_rank_on_the_same_collectives(tmp_path):
+@pytest.mark.parametrize("failure", ["pickle", "oversized", "decode"])
+def test_a_metadata_failure_on_one_rank_keeps_every_rank_on_the_same_collectives(tmp_path, failure):
+    """Rank 0 fails to pickle its metadata (before any collective), has too
+    much of it, or fails after the collectives."""
     import torch.multiprocessing as mp
 
-    mp.spawn(_rank_worker, args=(2, str(tmp_path / "gloo"), str(tmp_path)), nprocs=2, join=True)
+    mp.spawn(_rank_worker, args=(2, str(tmp_path / "gloo"), str(tmp_path), failure), nprocs=2, join=True)
     ranks = [json.loads((tmp_path / f"rank{rank}.json").read_text()) for rank in range(2)]
     assert ranks[0]["calls"] == ranks[1]["calls"] == ["objects", "row", "row", "row"]
     # Without the metadata table rank 0 cannot be analysed, so it asks everyone to switch off in that same window.
