@@ -70,7 +70,7 @@ closed; their time lands in the next window
 
 ### 指标（与 `perf/*` 同一 step key，进 TensorBoard / WandB / ClearML）
 
-这些标量随训练线程下一次 `log_perf_data` 的 `perf/*` 在同一次 `tracking_utils.log` 里发出，不额外发请求：开启 `--use-metrics-service` 时，每次 log 都是训练线程上的一次同步 HTTP 请求。判定在后台线程上跑，所以一个窗口的标量通常随下一个 rollout 的 `perf/*` 发出；`straggler/window/{first,last}_rollout` 标明它属于哪个窗口。运行的最后一个 rollout 会等最后一个窗口判定完再发。如果后台判定落后，同一步里有多个窗口同时判定完成（正常运行中不会出现），每个窗口照常写 timeline 和日志，但只有最新窗口的标量进指标（同一次 log 每个 key 只能带一个值）；被覆盖的每个窗口打一条 WARNING `… windows ready at once; only rollouts …-… reach the metrics`，并计一次分析器自身异常（见下文「分析器自身出错时」）。
+这些标量随训练线程下一次 `log_perf_data` 的 `perf/*` 在同一次 `tracking_utils.log` 里发出，不额外发请求：开启 `--use-metrics-service` 时，每次 log 都是训练线程上的一次同步 HTTP 请求。判定在后台线程上跑，所以一个窗口的标量通常随下一个 rollout 的 `perf/*` 发出；`straggler/window/{first,last}_rollout` 标明它属于哪个窗口。运行的最后一个 rollout 会等最后一个窗口判定完再发。如果后台判定落后，同一步里有多个窗口同时判定完成（正常运行中不会出现），每个窗口照常写 timeline 和日志，但只有其中最新一个上报成功的窗口的标量进指标（同一次 log 每个 key 只能带一个值）；被它覆盖的每个窗口打一条 WARNING `… windows ready at once; only rollouts …-… reach the metrics`，并计一次分析器自身异常；上报失败的窗口只按这次失败计一次（见下文「分析器自身出错时」）。
 
 | 指标 | 含义 |
 |------|------|
@@ -136,7 +136,7 @@ closed; their time lands in the next window
 
 计时调用、读事件、窗口 gather、判定、日志回调里的异常都被捕获并计数，不会抛进训练循环。某个 rank 累计 3 次异常，或连续 3 个窗口有丢弃的事件对或异常，就请求关闭分析器。这个请求放在该 rank 的窗口向量里（`health` 字段）一起 gather，所以所有 rank 看到同一张表，在同一个窗口一起关闭，不会有 rank 单独退出而让其他 rank 卡在下一次 gather 里。关闭后计时调用直接跳过，但该 rank **仍然参与每次窗口 gather**：它发一个长度为 `NUM_FIELDS` 的全零行，只把 `health` 写成 2，因此集合通信的形状不变，关闭状态也会持续传给还没看到的 rank。
 
-gather 本身失败时只有本 rank 知道。现在的处理是**不退出集合通信**：失败被计数，本次窗口照常重置，下一次窗口仍发一行（正常行或上面的空行）。持续失败达到上限后该 rank 本地关闭并开始发空行，其余 rank 在下一个能完成的 gather 里读到 `health = 2`，在同一个窗口一起关闭。为了让「某 rank 进程真的消失」这种发不出任何东西的情形有界，profiler 在安装时给这类 gather 单独建一个 Gloo 组，超时由 `RELAX_STRAGGLER_GATHER_TIMEOUT_S`（默认 60 s）控制，不影响通用 Gloo 组和训练路径的超时。**已知限制**：单次 gather 会因为组超时而阻塞到该超时；如果整个组都失联，所有 rank 都只能各自本地关闭，没有跨 rank 的传播。
+gather 本身失败时只有本 rank 知道。现在的处理是**不退出集合通信**：失败被计数，本次窗口照常重置，下一次窗口仍发一行（正常行或上面的空行）。持续失败达到上限后该 rank 本地关闭并开始发空行，其余 rank 在下一个能完成的 gather 里读到 `health = 2`，在同一个窗口一起关闭。首个窗口的元数据汇聚只做一次、不重试：其余 rank 拿到元数据后每个窗口只做数值 gather，失败的 rank 单独重试会和它们的集合通信错位，所以它照常发这一窗口的行并把 `health` 写成 2，所有 rank 在这个窗口一起关闭。为了让「某 rank 进程真的消失」这种发不出任何东西的情形有界，profiler 在安装时给这类 gather 单独建一个 Gloo 组，超时由 `RELAX_STRAGGLER_GATHER_TIMEOUT_S`（默认 60 s）控制，不影响通用 Gloo 组和训练路径的超时。**已知限制**：单次 gather 会因为组超时而阻塞到该超时；如果整个组都失联，所有 rank 都只能各自本地关闭，没有跨 rank 的传播。
 
 ## 开销
 
