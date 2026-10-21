@@ -15,8 +15,8 @@ from typing import Any, Callable
 
 from relax.utils.logging_utils import get_logger
 from relax.utils.straggler.collector import StragglerCollector
-from relax.utils.straggler.detector import DetectorConfig, RankMeta, WindowReport
-from relax.utils.straggler.reporter import log_straggler_delivery, log_straggler_window, report_straggler_window
+from relax.utils.straggler.detector import DetectorConfig, RankMeta
+from relax.utils.straggler.reporter import log_straggler_window, report_straggler_window
 from relax.utils.straggler.timers import StragglerTimers
 
 
@@ -125,15 +125,13 @@ def local_rank_meta() -> RankMeta:
 class StragglerProfiler:
     """One collector plus the per-step reporting around ``log_perf_data``.
 
-    ``step_metrics`` and ``delivered`` never raise: a failing reporter is
-    counted by the collector's health like any other profiler failure.
+    ``step_metrics`` never raises: a failing reporter is counted by the
+    collector's health like any other profiler failure.
     """
 
     def __init__(self, collector: StragglerCollector, args: Any) -> None:
         self.collector = collector
         self._args = args
-        self._emitted: WindowReport | None = None
-        self._delivered_ms: float | None = None
 
     def step_metrics(self, rollout_id: int, tokens: int) -> dict[str, float] | None:
         """Close this step (all ranks; a Gloo collective every window) and
@@ -164,32 +162,12 @@ class StragglerProfiler:
                     ),
                 )
         metrics: dict[str, float] | None = None
-        emitted: WindowReport | None = None
         for report in reports:
             try:
-                scalars = report_straggler_window(self._args, report)
+                metrics = report_straggler_window(self._args, report)
             except Exception as exc:
                 self.collector.on_error("report", exc)
-                continue
-            emitted, metrics = report, scalars
-        if metrics is None:
-            return None
-        self._emitted = emitted
-        if self._delivered_ms is not None:
-            # A report cannot carry its own delivery time, so each carries the previous one's.
-            metrics["straggler/latency/prev_delivered_ms"] = self._delivered_ms
         return metrics
-
-    def delivered(self, rollout_id: int) -> None:
-        """Log close-to-delivered latency once the ``log_perf_data`` that
-        carried the last scalars has returned."""
-        report, self._emitted = self._emitted, None
-        if report is None:
-            return
-        try:
-            self._delivered_ms = log_straggler_delivery(self._args, report, rollout_id)
-        except Exception as exc:
-            self.collector.on_error("report", exc)
 
 
 _PROFILER: StragglerProfiler | None = None

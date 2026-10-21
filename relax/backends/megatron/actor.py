@@ -2799,8 +2799,6 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.straggler is not None:
             extra = self.straggler.step_metrics(rollout_id, int(sum(total_lengths)))
         log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter, extra_metrics=extra)
-        if self.straggler is not None:
-            self.straggler.delivered(rollout_id)
 
     @timer
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:

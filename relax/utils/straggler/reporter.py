@@ -9,7 +9,6 @@ lines.
 
 from __future__ import annotations
 
-from time import time
 from typing import Any
 
 from relax.utils.logging_utils import get_logger
@@ -86,45 +85,21 @@ def _ms_after_close(report: WindowReport, wall: float) -> float:
     return (wall - report.closed_wall) * 1e3
 
 
-def report_straggler_window(args: Any, report: WindowReport, now: float | None = None) -> dict[str, float]:
+def report_straggler_window(args: Any, report: WindowReport) -> dict[str, float]:
     """Emit timeline events for one window and return its scalars for the
     step's ``log_perf_data`` (primary rank, training thread).
 
     That step can be later than the window, hence ``straggler/window/*``.
     """
-    report.emitted_wall = time() if now is None else now
     metrics = report.metrics
     metrics["straggler/window/first_rollout"] = float(report.first_rollout)
     metrics["straggler/window/last_rollout"] = float(report.last_rollout)
     if report.closed_wall > 0.0:
         metrics["straggler/latency/analyzed_ms"] = _ms_after_close(report, report.analyzed_wall)
-        metrics["straggler/latency/emitted_ms"] = _ms_after_close(report, report.emitted_wall)
     if getattr(args, "timeline_dump_dir", None) and not _switched_off(report):
         # Flushed, and stamped with the step, by the ``log_perf_data`` that follows.
         Timer().records.extend(_timeline_events(report))
     return metrics
-
-
-def log_straggler_delivery(args: Any, report: WindowReport, rollout_id: int, now: float | None = None) -> float:
-    """Log how long one window took to reach the tracking backend and return
-    close-to-delivered in ms.
-
-    Call it once the ``log_perf_data`` that carried the report's scalars has
-    returned: with ``--use-metrics-service`` the metrics service has then
-    acknowledged them; with TensorBoard / WandB the writer has accepted them.
-    """
-    delivered_ms = _ms_after_close(report, time() if now is None else now)
-    logger.info(
-        "[straggler] step=%d window rollouts %d-%d: closed -> analyzed +%.1f ms (alerts logged), emitted +%.1f ms, "
-        "delivered +%.1f ms",
-        compute_rollout_step(args, rollout_id),
-        report.first_rollout,
-        report.last_rollout,
-        _ms_after_close(report, report.analyzed_wall),
-        _ms_after_close(report, report.emitted_wall),
-        delivered_ms,
-    )
-    return delivered_ms
 
 
 def log_straggler_window(args: Any, report: WindowReport) -> None:

@@ -6,7 +6,7 @@ from argparse import Namespace
 
 import pytest
 
-from relax.utils.straggler import reporter, runtime
+from relax.utils.straggler import runtime
 from relax.utils.straggler.detector import WindowReport
 from relax.utils.straggler.runtime import StragglerProfiler, install_straggler_profiler
 from relax.utils.training import train_metric_utils
@@ -32,20 +32,6 @@ def test_scalars_arrive_when_a_window_closes_and_carry_its_rollout_range():
     metrics = _step(profiler, 1)
     assert metrics["straggler/window/first_rollout"] == 0.0 and metrics["straggler/window/last_rollout"] == 1.0
     assert metrics["straggler/tokens/median"] == pytest.approx(1000.0)
-
-
-def test_delivery_is_logged_and_carried_by_the_next_report(monkeypatch):
-    lines = []
-    monkeypatch.setattr(reporter.logger, "info", lambda msg, *a: lines.append(msg % a))
-    profiler = _profiler(interval=1)
-    first = _step(profiler, 0)
-    assert "straggler/latency/prev_delivered_ms" not in first
-    profiler.delivered(0)
-    assert any("delivered +" in line for line in lines)
-    assert _step(profiler, 1)["straggler/latency/prev_delivered_ms"] >= 0.0
-    profiler.delivered(1)
-    profiler.delivered(1)  # nothing left to deliver: no second line
-    assert sum("delivered +" in line for line in lines) == 2
 
 
 def test_a_failing_reporter_is_counted_and_never_raises(monkeypatch):
@@ -142,7 +128,6 @@ def test_only_the_latest_of_several_ready_windows_reaches_the_metrics(monkeypatc
     assert [r.last_rollout for r in reported] == [0, 1], "every window still reaches the timeline"
     assert len(warnings) == 1 and "2 windows ready at once" in warnings[0]
     assert profiler.collector.health.errors_total == 1
-    assert profiler._emitted.last_rollout == 1
 
 
 @pytest.mark.parametrize("primary", [True, False])
