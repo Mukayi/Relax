@@ -347,6 +347,16 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
     def bound_device_id(self, dev):
         self.group.bound_device_id = dev
 
+    # torch>=2.13 property; the base-class accessor would act on this wrapper's
+    # own ProcessGroup, which has no backend, and raise.
+    @property
+    def use_pg_for_symm_mem_rendezvous(self):
+        return self.group.use_pg_for_symm_mem_rendezvous
+
+    @use_pg_for_symm_mem_rendezvous.setter
+    def use_pg_for_symm_mem_rendezvous(self, value):
+        self.group.use_pg_for_symm_mem_rendezvous = value
+
 
 def _should_skip_reload_and_destroy() -> bool:
     """Whether destroy/reload of process groups should be skipped on this
