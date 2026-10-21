@@ -120,6 +120,7 @@ class StragglerCollector:
         self._clock = clock
         self._is_capturing = is_capturing
         self._all_meta: list[RankMeta] | None = None
+        self._meta_gathered = False
         # True from the first bracket of a step until ``end_step``; GC pauses are
         # only attributed to the step while it is set (not during train_wait,
         # offload / clear_memory, etc.).
@@ -311,15 +312,32 @@ class StragglerCollector:
     def _gather_window(self, code: float) -> list[list[float]] | None:
         """Gather this window's row on every rank, or ``None`` if it failed.
 
-        A failure is counted and the next window tries again: leaving the
-        collective would strand the other ranks in a gather this one never
-        joins. The dedicated short-timeout group bounds a group that is really
-        broken, and once health gives up the rank also stops recording, so a
-        failed group cannot keep costing timer time for the rest of the run.
+        Every rank issues the same collectives whatever failed locally, or the
+        gathers of different ranks would pair up wrongly: the metadata gather
+        runs once, in the first window, and every window gathers one row. A
+        rank left without the metadata cannot retry it (that object gather
+        would be its alone), so its row asks every rank to switch off at this
+        window. A failed row gather is counted and the next window tries again;
+        the dedicated short-timeout group bounds a group that is really broken,
+        and once health gives up the rank also stops recording, so a failed
+        group cannot keep costing timer time for the rest of the run.
         """
-        try:
-            if self._all_meta is None:
+        if not self._meta_gathered:
+            self._meta_gathered = True
+            try:
                 self._all_meta = list(self._gather_objects(self.rank_meta))
+            except Exception as exc:
+                self.on_error("gather", exc)
+                logger.warning(
+                    "[straggler] rank %d asks to switch the profiler off: the rank metadata gather failed (%s: %s)",
+                    self.rank_meta.rank,
+                    type(exc).__name__,
+                    exc,
+                )
+        if self._all_meta is None:
+            code = HEALTH_DISABLE
+            self._window.set("health", code)
+        try:
             return self._gather(disabled_row() if self._disabled else self._window.as_list())
         except Exception as exc:
             self.on_error("gather", exc)
@@ -333,7 +351,8 @@ class StragglerCollector:
         On the primary rank the notice joins the analysis queue, so it stays in
         window order with the reports around it.
         """
-        requesting = [self._all_meta[i].rank for i, row in enumerate(table) if row[_HEALTH_INDEX] >= HEALTH_DISABLE]
+        # Rows are in gather-group rank order, which is the global rank.
+        requesting = [i for i, row in enumerate(table) if row[_HEALTH_INDEX] >= HEALTH_DISABLE]
         if not requesting or self._disabled:
             return False
         note = (

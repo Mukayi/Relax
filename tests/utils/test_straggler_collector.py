@@ -393,6 +393,32 @@ def test_a_failed_gather_counts_an_error_and_keeps_the_rank_participating():
         collector.close()
 
 
+def test_a_failed_metadata_gather_is_not_retried_and_the_row_asks_to_switch_off():
+    # The peers that did get the metadata are gathering rows from now on, so a
+    # retried object gather would be a collective only this rank issues.
+    meta_calls, rows = [], []
+
+    def gather_objects(obj):
+        meta_calls.append(obj)
+        raise MemoryError("decoding the gathered metadata failed")
+
+    def gather(values):
+        rows.append(list(values))
+        return [list(values), list(values)]
+
+    collector = make_collector(world=2, interval=1, gather=gather, gather_objects=gather_objects)
+    try:
+        bracket(collector)
+        (notice,) = collector.end_step(rollout_id=0)
+        assert len(rows) == 1 and rows[0][FIELD_INDEX["health"]] == float(HEALTH_DISABLE)
+        assert collector.disabled
+        assert notice.metrics["straggler/health/requested_by"] == 0.0
+        assert collector.end_step(rollout_id=1) == []
+        assert len(meta_calls) == 1 and len(rows) == 2
+    finally:
+        collector.close()
+
+
 def test_a_persistently_failing_gather_switches_the_profiler_off_through_health():
     # Repeated failures reach HealthConfig.max_errors; the rank then switches
     # itself off *and* keeps sending its health row, so peers that can still
