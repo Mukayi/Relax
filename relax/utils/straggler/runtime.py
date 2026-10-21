@@ -9,6 +9,7 @@ so the rest of the package runs (and is tested) on CPU with fakes.
 
 from __future__ import annotations
 
+import pickle
 import socket
 from functools import partial
 from typing import Any, Callable
@@ -93,47 +94,41 @@ def gloo_all_gather(values: list[float]) -> list[list[float]]:
     return [row.tolist() for row in gathered]
 
 
-# A pickled RankMeta, behind a 4-byte length; even a 253-character FQDN host
-# leaves it well under this.
+# A pickled RankMeta is under 400 B even with a 253-character host name.
 _META_ROW_BYTES = 1024
 
 
 def gloo_all_gather_objects(obj: Any) -> list[Any]:
-    """All-gather one small picklable object per rank as one fixed-size byte
-    row.
+    """All-gather one small picklable object per rank as a fixed-size byte row.
 
     ``dist.all_gather_object`` pickles before its first collective, so a rank
-    whose pickling fails would skip the size and payload gathers its peers
-    issue. Here every rank issues the same single collective whatever fails
-    locally: a rank that cannot encode its object sends an empty row, and every
-    rank then raises for the same missing entry.
+    whose pickling fails would skip the collectives its peers issue. Here every
+    rank issues the same single collective whatever fails locally: a rank that
+    cannot encode its object sends an all-zero row, and every rank raises after
+    the gather.
     """
-    import pickle
-
     import torch
     import torch.distributed as dist
 
     group = get_straggler_gather_group()
     local = torch.zeros(_META_ROW_BYTES, dtype=torch.uint8)
     gathered = [torch.empty_like(local) for _ in range(dist.get_world_size(group))]
-    encode_error = None
+    error = None
     try:
         data = pickle.dumps(obj)
-        if len(data) > _META_ROW_BYTES - 4:
+        if len(data) > _META_ROW_BYTES:
             raise ValueError(f"{len(data)} B of rank metadata does not fit the {_META_ROW_BYTES} B row")
-        row = local.numpy()
-        row[:4] = list(len(data).to_bytes(4, "little"))
-        row[4 : 4 + len(data)] = list(data)
+        local[: len(data)] = torch.frombuffer(bytearray(data), dtype=torch.uint8)
     except Exception as exc:
-        local.zero_()
-        encode_error = exc
+        error = exc
     dist.all_gather(gathered, local, group=group)
-    rows = [row.numpy() for row in gathered]
-    lengths = [int.from_bytes(row[:4].tobytes(), "little") for row in rows]
-    missing = [rank for rank, length in enumerate(lengths) if length == 0]
+    if error is not None:
+        raise error
+    missing = [rank for rank, row in enumerate(gathered) if not row.any()]
     if missing:
-        raise RuntimeError(f"rank(s) {missing} sent no metadata") from encode_error
-    return [pickle.loads(row[4 : 4 + length].tobytes()) for row, length in zip(rows, lengths)]
+        raise RuntimeError(f"ranks {missing} sent no metadata")
+    # pickle.loads ignores the zero padding after the pickled bytes.
+    return [pickle.loads(row.numpy().tobytes()) for row in gathered]
 
 
 def local_rank_meta() -> RankMeta:

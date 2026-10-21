@@ -76,8 +76,6 @@ def _rank_worker(rank, world_size, init_file, out_dir, failure):
 )
 @pytest.mark.parametrize("failure", ["pickle", "oversized", "decode"])
 def test_a_metadata_failure_on_one_rank_keeps_every_rank_on_the_same_collectives(tmp_path, failure):
-    """Rank 0 fails to pickle its metadata (before any collective), has too
-    much of it, or fails after the collectives."""
     import torch.multiprocessing as mp
 
     mp.spawn(_rank_worker, args=(2, str(tmp_path / "gloo"), str(tmp_path), failure), nprocs=2, join=True)
