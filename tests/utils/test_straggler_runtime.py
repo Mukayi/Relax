@@ -130,6 +130,44 @@ def test_only_the_latest_of_several_ready_windows_reaches_the_metrics(monkeypatc
     assert profiler.collector.health.errors_total == 1
 
 
+def _ready_windows(monkeypatch, profiler, rollouts, failing):
+    """Make ``step_metrics`` see the windows of ``rollouts`` ready at once,
+    with the reporter failing on ``failing``; returns the WARNING lines."""
+
+    def report(args, window):
+        if window.last_rollout == failing:
+            raise RuntimeError("timeline broke")
+        return dict(window.metrics)
+
+    def window(n):
+        return WindowReport(
+            metrics={"straggler/window/last_rollout": float(n)}, alerts=[], rows=[], first_rollout=n, last_rollout=n
+        )
+
+    warnings = []
+    monkeypatch.setattr(runtime, "report_straggler_window", report)
+    monkeypatch.setattr(runtime.logger, "warning", lambda msg, *a: warnings.append(msg % a))
+    monkeypatch.setattr(profiler.collector, "end_step", lambda rollout_id, final=False: [window(n) for n in rollouts])
+    return warnings
+
+
+def test_a_failing_latest_window_falls_back_to_the_previous_one_and_counts_one_error(monkeypatch):
+    profiler = _profiler(interval=1)
+    warnings = _ready_windows(monkeypatch, profiler, rollouts=[1, 2], failing=2)
+    for errors in (1, 2):
+        assert profiler.step_metrics(2, tokens=0) == {"straggler/window/last_rollout": 1.0}
+        assert profiler.collector.health.errors_total == errors, "only the failing window is lost"
+    assert warnings == [], "the returned window superseded nothing"
+
+
+def test_the_superseded_warning_names_the_window_that_is_returned(monkeypatch):
+    profiler = _profiler(interval=1)
+    warnings = _ready_windows(monkeypatch, profiler, rollouts=[0, 1, 2], failing=2)
+    assert profiler.step_metrics(2, tokens=0) == {"straggler/window/last_rollout": 1.0}
+    assert len(warnings) == 1 and "only rollouts 1-1 reach the metrics" in warnings[0]
+    assert profiler.collector.health.errors_total == 2, "window 0 superseded, window 2 failed"
+
+
 @pytest.mark.parametrize("primary", [True, False])
 def test_install_uses_the_shared_metrics_primary_rank(monkeypatch, primary):
     monkeypatch.setenv("RELAX_STRAGGLER_PROFILER", "1")

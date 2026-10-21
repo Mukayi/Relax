@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 from relax.utils.logging_utils import get_logger
 from relax.utils.straggler.collector import StragglerCollector
-from relax.utils.straggler.detector import DetectorConfig, RankMeta
+from relax.utils.straggler.detector import DetectorConfig, RankMeta, WindowReport
 from relax.utils.straggler.reporter import log_straggler_window, report_straggler_window
 from relax.utils.straggler.timers import StragglerTimers
 
@@ -139,21 +139,35 @@ class StragglerProfiler:
         for this step's ``log_perf_data``.
 
         If several windows are ready at once, each still reaches the timeline
-        and logs, but only the latest one's scalars are returned (one metrics
-        call per step carries one value per key); each superseded window is
-        logged as a WARNING and counted as a profiler error.
+        and logs, but only the scalars of the latest one whose reporter
+        succeeded are returned (one metrics call per step carries one value per
+        key). Each window it supersedes is logged as a WARNING and counted as a
+        profiler error; a window whose reporter fails is counted once, as that
+        failure.
         """
         self.collector.add_tokens(tokens)
         reports = self.collector.end_step(rollout_id, final=rollout_id + 1 == self._args.num_rollout)
-        if len(reports) > 1:
+        metrics: dict[str, float] | None = None
+        returned: WindowReport | None = None
+        superseded: list[WindowReport] = []
+        for report in reports:
+            try:
+                scalars = report_straggler_window(self._args, report)
+            except Exception as exc:
+                self.collector.on_error("report", exc)
+                continue
+            if returned is not None:
+                superseded.append(returned)
+            returned, metrics = report, scalars
+        if superseded:
             logger.warning(
                 "[straggler] rollout %d: %d windows ready at once; only rollouts %d-%d reach the metrics",
                 rollout_id,
                 len(reports),
-                reports[-1].first_rollout,
-                reports[-1].last_rollout,
+                returned.first_rollout,
+                returned.last_rollout,
             )
-            for dropped in reports[:-1]:
+            for dropped in superseded:
                 self.collector.on_error(
                     "report",
                     RuntimeError(
@@ -161,12 +175,6 @@ class StragglerProfiler:
                         "window"
                     ),
                 )
-        metrics: dict[str, float] | None = None
-        for report in reports:
-            try:
-                metrics = report_straggler_window(self._args, report)
-            except Exception as exc:
-                self.collector.on_error("report", exc)
         return metrics
 
 
