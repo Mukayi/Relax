@@ -152,10 +152,11 @@ def test_report_step_helper_is_synchronous_so_it_can_run_on_a_thread():
 def _service_with_slow_backend(adapter):
     """A MetricsService whose only backend is ``adapter``.
 
-    The ``@serve.ingress`` wrapper makes the class unconstructible (its ``__init__``
-    is async and the real one would open wandb / TensorBoard / ClearML), so build it
-    with ``__new__`` and set the attributes the handlers read. ``metrics_buffer`` is
-    the real class, so the handler bodies run their real code.
+    The ``@serve.ingress`` wrapper makes the class unconstructible (its
+    ``__init__`` is async and the real one would open wandb / TensorBoard /
+    ClearML), so build it with ``__new__`` and set the attributes the handlers
+    read. ``metrics_buffer`` is the real class, so the handler bodies run their
+    real code.
     """
     cls = MetricsService.func_or_class
     service = cls.__new__(cls)
@@ -180,7 +181,8 @@ class _SlowAdapter:
 
 
 def test_slow_backend_does_not_block_concurrent_ingestion():
-    """A slow report must not delay a ``/log_metrics_batch`` on the same replica.
+    """A slow report must not delay a ``/log_metrics_batch`` on the same
+    replica.
 
     This drives the real ``report_step`` coroutine -- the thing that decides whether
     the fan-out runs on the loop. Calling ``_report_to_backends`` through
