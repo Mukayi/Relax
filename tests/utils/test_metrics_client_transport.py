@@ -115,8 +115,12 @@ def test_client_reuses_one_connection_across_calls():
 def test_client_ignores_proxy_environment_for_cluster_local_endpoint(monkeypatch):
     """A proxy in the environment must not capture the metrics endpoint."""
     with _CountingServer() as server:
-        monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:3128")
-        monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
+        # urllib prefers the lowercase names, and a NO_PROXY that covers
+        # 127.0.0.1 would bypass the proxy anyway, so set and clear both cases.
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            monkeypatch.setenv(name, "http://proxy.invalid:3128")
+        for name in ("NO_PROXY", "no_proxy"):
+            monkeypatch.delenv(name, raising=False)
         client = MetricsClient(server.url)
         # If trust_env were left True, this request would be sent to the proxy
         # and fail, because nothing is listening there.
