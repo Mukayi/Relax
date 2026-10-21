@@ -10,7 +10,9 @@ exercised the real transport:
   one per request, and it ignores ``HTTP_PROXY`` / ``HTTPS_PROXY`` for what is a
   cluster-local endpoint;
 * the blocking backend fan-out in ``/report_step`` runs off the event loop, so a
-  slow backend does not stall concurrent metric ingestion on the same replica.
+  slow backend does not stall concurrent metric ingestion on the same replica;
+* a metric ingested while that fan-out runs is kept for the next report of the
+  step, and goes out exactly once.
 
 The connection-reuse test drives a real HTTP server and counts accepted TCP
 connections, so it fails if the client goes back to a fresh connection per call.
@@ -239,6 +241,8 @@ def test_slow_backend_does_not_block_concurrent_ingestion():
 
     assert report_result["results"] == {"tensorboard": "success"}
     assert ingest_result["status"] == "success"
+    # The ingest landed after the report took its batch, so it waits for the next one.
+    assert [m["name"] for m in service.metrics_buffer.get_metrics_for_step(1)] == ["train/loss"]
     assert report_ms >= report_sleep_s * 1e3 * 0.9, (
         f"the report finished too fast to have called the backend: {report_ms:.0f} ms"
     )
@@ -254,3 +258,59 @@ def test_slow_backend_does_not_block_concurrent_ingestion():
         f"a /log_metrics_batch that was ready {ingest_delay_s * 1e3:.0f} ms into a "
         f"{report_sleep_s * 1e3:.0f} ms report waited {ingest_waited_ms:.0f} ms -- it queued behind the fan-out"
     )
+
+
+class _GatedAdapter:
+    """Records what it is sent and holds the first call until released."""
+
+    def __init__(self) -> None:
+        self.received = []
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def log(self, data=None, step=None) -> None:
+        self.received.append(dict(data))
+        if len(self.received) == 1:
+            self.entered.set()
+            assert self.release.wait(5), "the test never released the backend"
+
+
+def test_a_metric_ingested_during_a_report_goes_out_with_the_next_report_once():
+    """The batch is taken before the fan-out, so a metric that arrives during
+    it is neither cleared unreported nor sent twice."""
+    adapter = _GatedAdapter()
+    service = _service_with_slow_backend(adapter)
+    service.metrics_buffer.add_metric(step=1, metric_name="perf/step_time", metric_value=1.0)
+
+    async def scenario():
+        report = asyncio.create_task(service.report_step(ReportStepRequest(step=1)))
+        assert await asyncio.to_thread(adapter.entered.wait, 5), "the report never reached the backend"
+        ingest = await service.log_metrics_batch(LogMetricsBatchRequest(step=1, metrics={"train/loss": 0.5}))
+        adapter.release.set()
+        first = await report
+        second = await service.report_step(ReportStepRequest(step=1))
+        third = await service.report_step(ReportStepRequest(step=1))
+        return ingest, first, second, third
+
+    ingest, first, second, third = asyncio.run(scenario())
+
+    assert ingest["status"] == "success"
+    assert first["results"] == {"tensorboard": "success"}
+    assert second["results"] == {"tensorboard": "success"}
+    assert third["results"] == {}
+    assert adapter.received == [{"perf/step_time": 1.0}, {"train/loss": 0.5}]
+    assert not service.metrics_buffer.has_metrics_for_step(1)
+
+
+def test_a_report_that_raises_keeps_its_batch_for_the_next_report():
+    service = _service_with_slow_backend(_GatedAdapter())
+    service.metrics_buffer.add_metric(step=1, metric_name="perf/step_time", metric_value=1.0)
+
+    def fail(step, metrics_dict):
+        raise RuntimeError("backend thread failed")
+
+    service._report_to_backends = fail
+    result = asyncio.run(service.report_step(ReportStepRequest(step=1)))
+
+    assert result["status"] == "error"
+    assert [m["name"] for m in service.metrics_buffer.get_metrics_for_step(1)] == ["perf/step_time"]

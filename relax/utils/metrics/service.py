@@ -90,6 +90,22 @@ class MetricsBuffer:
             if step in self._buffer:
                 del self._buffer[step]
 
+    def take_step(self, step: int) -> List[Dict[str, Any]]:
+        """Remove and return the metrics buffered for ``step``.
+
+        Metrics added afterwards start a new batch for the same step.
+        """
+        with self._lock:
+            return self._buffer.pop(step, [])
+
+    def restore_step(self, step: int, metrics: List[Dict[str, Any]]):
+        """Put a batch from :meth:`take_step` back ahead of anything added
+        since."""
+        if not metrics:
+            return
+        with self._lock:
+            self._buffer[step][:0] = metrics
+
     def has_metrics_for_step(self, step: int) -> bool:
         with self._lock:
             return step in self._buffer and len(self._buffer[step]) > 0
@@ -271,7 +287,10 @@ class MetricsService:
     async def report_step(self, request: ReportStepRequest) -> Dict[str, Any]:
         try:
             step = request.step
-            metrics = self.metrics_buffer.get_metrics_for_step(step)
+            # Take the batch before the await below: a /log_metrics_batch that
+            # lands while the backends run must stay buffered for the next report
+            # of this step instead of being cleared unreported.
+            metrics = self.metrics_buffer.take_step(step)
 
             metrics_dict = {}
             for metric in metrics:
@@ -284,9 +303,12 @@ class MetricsService:
             # /log_metrics_batch that arrives meanwhile -- the handler itself is
             # cheap, its neighbours are what get slow. Hand it to a worker
             # thread instead.
-            report_results = await asyncio.to_thread(self._report_to_backends, step, metrics_dict)
+            try:
+                report_results = await asyncio.to_thread(self._report_to_backends, step, metrics_dict)
+            except Exception:
+                self.metrics_buffer.restore_step(step, metrics)
+                raise
 
-            self.metrics_buffer.clear_step(step)
             logger.info(f"Reported {len(metrics)} metrics for step {step}")
             return {
                 "status": "success",
