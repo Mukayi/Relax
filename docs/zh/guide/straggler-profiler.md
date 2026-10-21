@@ -41,16 +41,16 @@ latest to grad-sync rank 0 by 13.4 ms (peers idle 45.9 ms), pp_stage_imbalance 1
 有告警时，某 rank 的 reason 变化的那个窗口打一条 WARNING，之后每个仍有告警的窗口打一张 INFO per-rank 表。每种 reason 都要连续 `PERSIST_WINDOWS` 个窗口才成立，要连续 `RECOVER_WINDOWS` 个干净窗口才解除（解除时再打一条 WARNING：`rank 5 (…) recovered from slow_device after 2 clean windows`）：
 
 ```text
-[straggler] step=14 rank 0 (rank0_dp0_tp0_pp0, host=…, gpu=0) reaches the DP grad-sync 433.0 ms/step
-after its DP peers (peers idle 451.4 ms/step = 44% of their compute, z=8.9) for 3 windows;
-its own GPU compute is 0.99x peers, gc 1.8 ms, cpu/gpu fwd 1.26x -> late_arrival (host-side stall)
-[straggler] step=14 per-rank window (ms/step):
- rank | tag               | host | device | self_ms | wait_ms | late_ms | tokens  | ms_per_ktok | gc_ms | reason
-    0 | rank0_dp0_tp0_pp0 | …    |      0 |  1021.2 |    26.1 |   433.0 | 15610.8 |        65.4 |   1.8 | late_arrival
-    1 | rank1_dp1_tp0_pp0 | …    |      1 |  1083.4 |   404.3 |    54.7 | 15534.4 |        69.7 |   2.2 | none
+[straggler] step=29 rank 3 (rank3_dp3_tp0_pp0, host=…, gpu=3) reaches the DP grad-sync 195.6 ms/step
+after its DP peers (peers idle 201.4 ms/step = 21% of their compute, z=120.1) for 3 windows;
+its own GPU forward is 0.99x peers, gc 1.8 ms, cpu/gpu fwd 1.55x -> late_arrival (host-side stall)
+[straggler] step=29 per-rank window (ms/step):
+ rank | tag               | host | device | self_ms | wait_ms | late_ms | tokens  | ms_per_ktok | gc_ms | reason       | uncertain
+    0 | rank0_dp0_tp0_pp0 | …    |      0 |   941.0 |     6.4 |     0.4 | 14802.1 |        63.6 |   1.8 | none         |
+    3 | rank3_dp3_tp0_pp0 | …    |      3 |   743.6 |     5.8 |   195.6 | 14592.7 |        51.0 |   1.8 | late_arrival |
 ```
 
-这条告警来自原型的第一个真实作业（见下文 `late_arrival`）；此后 `its own GPU …` 一项已从自身时间之比改为 forward 之比（`its own GPU forward is …x peers`）。
+表里只列出 rank 0 和 rank 3，实际每个 rank 一行。
 
 某个 rank 的窗口不足以下结论时，它被标为「不确定」并给出原因（原因变化时打一条 WARNING），而不是默默当作正常：
 
@@ -128,7 +128,7 @@ closed; their time lands in the next window
 | `upstream_wait` | 自身正常，但 `pp_recv` 显著高于同 stage 中未被判为慢或晚到的 rank，且超出量 ≥ 该 stage 中位自身时间的 5%；因为等 PP 而晚到梯度同步的 rank 也归为这一类 | 看上游 stage 被 flag 的 rank，或 `pp_stage_imbalance`（层划分不均） |
 | `late_arrival` | 自身 GPU 时间正常，但它的 `bwd + dp_grad_sync` 显著**短于**同 DP 组其他 rank——一次集合通信对所有人同时结束，最后到的那个 rank 等得最少，其他人的这段时间里都含着等它的时间 | GPU 之间的 CPU 侧空隙：数据取用、同步 I/O / HTTP、GIL、launch gap；对该 rank `py-spy dump --pid <pid>` 最直接 |
 
-`late_arrival` 容易被漏掉：只看 GPU 时间的规则抓不到它。它在原型的第一个真实作业里就出现了——rank 0 的 GPU 时间和大家一样，却每步晚 0.4–1.5 s 到梯度同步，原因是 primary rank 在训练线程上同步发送日志指标的 HTTP 请求。
+`late_arrival` 容易被漏掉：只看 GPU 时间的规则抓不到它。该 rank 的 GPU 时间和大家一样，只是每步晚到梯度同步；常见原因是训练线程上的同步阻塞，例如 primary rank 在训练线程上用同步 HTTP 请求上报指标。
 
 开启 `--overlap-grad-reduce` 时，梯度 reduce-scatter 在 backward 中按 bucket 发出，同 DP 组其他 rank 等最慢 rank 的时间落在各自的 `bwd` 里，`dp_grad_sync` 只剩很短的尾段。所以晚到按 `bwd + dp_grad_sync` 比较（开不开 overlap，这段时间都在梯度同步完成时结束），慢 rank 除了自身时间还单独比较 forward（forward 里没有 DP 集合通信）。在等的 rank 自身时间也会变长，所以 `late_arrival` 告警报的是该 rank 的 forward 与其他 rank 之比，而不是自身时间之比。
 

@@ -41,16 +41,16 @@ latest to grad-sync rank 0 by 13.4 ms (peers idle 45.9 ms), pp_stage_imbalance 1
 When there are alerts, the window in which a rank's reason changes logs one WARNING, and every window that still has alerts logs an INFO per-rank table. Every reason needs `PERSIST_WINDOWS` consecutive windows to be raised and `RECOVER_WINDOWS` consecutive clean windows to clear (the clearing logs another WARNING: `rank 5 (…) recovered from slow_device after 2 clean windows`):
 
 ```text
-[straggler] step=14 rank 0 (rank0_dp0_tp0_pp0, host=…, gpu=0) reaches the DP grad-sync 433.0 ms/step
-after its DP peers (peers idle 451.4 ms/step = 44% of their compute, z=8.9) for 3 windows;
-its own GPU compute is 0.99x peers, gc 1.8 ms, cpu/gpu fwd 1.26x -> late_arrival (host-side stall)
-[straggler] step=14 per-rank window (ms/step):
- rank | tag               | host | device | self_ms | wait_ms | late_ms | tokens  | ms_per_ktok | gc_ms | reason
-    0 | rank0_dp0_tp0_pp0 | …    |      0 |  1021.2 |    26.1 |   433.0 | 15610.8 |        65.4 |   1.8 | late_arrival
-    1 | rank1_dp1_tp0_pp0 | …    |      1 |  1083.4 |   404.3 |    54.7 | 15534.4 |        69.7 |   2.2 | none
+[straggler] step=29 rank 3 (rank3_dp3_tp0_pp0, host=…, gpu=3) reaches the DP grad-sync 195.6 ms/step
+after its DP peers (peers idle 201.4 ms/step = 21% of their compute, z=120.1) for 3 windows;
+its own GPU forward is 0.99x peers, gc 1.8 ms, cpu/gpu fwd 1.55x -> late_arrival (host-side stall)
+[straggler] step=29 per-rank window (ms/step):
+ rank | tag               | host | device | self_ms | wait_ms | late_ms | tokens  | ms_per_ktok | gc_ms | reason       | uncertain
+    0 | rank0_dp0_tp0_pp0 | …    |      0 |   941.0 |     6.4 |     0.4 | 14802.1 |        63.6 |   1.8 | none         |
+    3 | rank3_dp3_tp0_pp0 | …    |      3 |   743.6 |     5.8 |   195.6 | 14592.7 |        51.0 |   1.8 | late_arrival |
 ```
 
-This alert is from the prototype's first real job (see `late_arrival` below); the `its own GPU …` item has since changed from the own-time ratio to the forward ratio (`its own GPU forward is …x peers`).
+The table is cut down to ranks 0 and 3; the real one has a row per rank.
 
 A rank whose window cannot support a verdict is reported as uncertain with a cause (one WARNING when the cause changes) instead of silently passing as healthy:
 
@@ -124,7 +124,7 @@ The timings reuse the 22 timer call sites Megatron already has, so they cover th
 | `upstream_wait` | Own time normal but `pp_recv` well above the same-stage ranks that are neither flagged nor late, by at least 5 % of the stage's median own time; a rank that reaches the gradient sync late because it waits on PP is classed here too | The flagged rank on the upstream stage, or `pp_stage_imbalance` (uneven layer split) |
 | `late_arrival` | Own GPU time normal, but its `bwd + dp_grad_sync` is much *shorter* than its DP peers' — a collective finishes for everyone at once, so the last rank to arrive waits least and everyone else's time contains the wait for it | Host-side gaps between kernels: data fetch, synchronous I/O / HTTP, GIL, launch gaps. `py-spy dump --pid <pid>` on that rank is the quickest confirmation |
 
-`late_arrival` is easy to miss: any rule that only looks at GPU time cannot see it. It showed up in the very first real job the prototype ran on — rank 0's GPU time matched its peers, yet it reached every gradient sync 0.4–1.5 s late because the primary rank was posting logging metrics over synchronous HTTP on the training thread.
+`late_arrival` is easy to miss: any rule that only looks at GPU time cannot see it. The rank's GPU time matches its peers; it just reaches every gradient sync late. A common cause is a blocking call on the training thread, such as the primary rank posting metrics over synchronous HTTP.
 
 With `--overlap-grad-reduce` the gradient reduce-scatter is issued bucket by bucket during backward, so the wait for the slowest rank lands in every DP peer's `bwd` and only a short tail is left in `dp_grad_sync`. That is why late arrival is compared on `bwd + dp_grad_sync` (which ends when the gradient sync completes, with or without the overlap), and why slow ranks are also compared on forward alone (forward has no DP collective). The waiting peers' own time grows too, so a `late_arrival` alert quotes the rank's forward against its peers, not its own time.
 
