@@ -38,7 +38,8 @@ class EventSink(Protocol):
     def push(self, segment_index: int, phase_index: int, start_event: Any, end_event: Any, cpu_ms: float) -> None:
         """Hand over one completed bracket for later, lazy readout;
         ``phase_index`` is a PP phase field, a gradient sync's position in
-        ``GRAD_SYNC_TIMERS``, -1, or a module bracket's layer number."""
+        ``GRAD_SYNC_TIMERS``, -1, or a module bracket's layer number (negated
+        for an MTP layer)."""
 
     def discard_event(self, event: Any) -> None:
         """Return an event whose bracket could not be completed."""

@@ -83,6 +83,10 @@ class _Layer(nn.Module):
         return checkpoint(self._body, x, use_reentrant=True) if self.recompute else self._body(x)
 
 
+class _MtpLayer(_Layer):
+    is_mtp_layer = True
+
+
 def _run(model, x):
     model(x).sum().backward()
 
@@ -123,6 +127,14 @@ def test_forward_and_backward_brackets_follow_the_execution_order_and_leave_grad
     timers.detach()
     _run(model, x)
     assert len(sink.pushed) == 8
+
+
+def test_an_mtp_layer_is_recorded_apart_from_the_decoder_layer_with_the_same_number():
+    model = nn.Sequential(_Layer(1), _MtpLayer(1))
+    sink = _Sink()
+    ModuleTimers([model], sink).attach()
+    _run(model, torch.randn(2, 4, requires_grad=True))
+    assert sink.names[:4] == [("attn_fwd", 1), ("mlp_fwd", 1), ("attn_fwd", -1), ("mlp_fwd", -1)]
 
 
 def test_a_block_whose_input_needs_no_gradient_has_no_backward_bracket():

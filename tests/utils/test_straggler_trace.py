@@ -209,6 +209,16 @@ def test_brackets_without_a_micro_batch_number_are_named_without_one():
     assert named == {"F": {"tokens": 300}, "B": {}, "attn fwd L1": {"layer": 1}}
 
 
+def test_an_mtp_layer_is_named_apart_from_the_decoder_layer_with_the_same_number():
+    modules = [_module("attn_fwd", 1, 1, 4), _module("attn_fwd", -1, 5, 8)]
+    trace, _ = build_trace([_trace(_FIRST_STAGE + modules)], _meta(1))
+    named = {e["name"]: e["args"] for e in _slices(trace, 0) if "layer" in e.get("args", {})}
+    assert named == {
+        "attn fwd L1": {"layer": 1, "micro_batch": 0},
+        "attn fwd MTP L1": {"layer": 1, "mtp": True, "micro_batch": 0},
+    }
+
+
 def test_without_pp_there_is_no_bubble_estimate():
     trace, metrics = build_trace([_trace(_FIRST_STAGE[:4])], _meta(1))
     assert _meta_name(trace, 0)["name"] == "pp0 dp0 tp0 · rank 0"

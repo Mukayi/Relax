@@ -14,8 +14,8 @@ pipeline sit next to each other. Within a row the slices nest by time:
   names;
 * level 3 (modules, only at the ``modules`` level): inside ``F{i}`` / ``B{i}``,
   the forward / backward of the attention and the MLP (``moe``) of every
-  layer, e.g. ``attn fwd L3``; a forward inside a ``B{i}`` is an activation
-  recompute.
+  layer, e.g. ``attn fwd L3`` (``attn fwd MTP L1`` for an MTP layer); a
+  forward inside a ``B{i}`` is an activation recompute.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ logger = get_logger(__name__)
 # Above any real pid (kernel.pid_max <= 2**22) so the straggler rows never merge
 # with a live process's track in Perfetto.
 TIMELINE_PID_BASE = 1 << 30
-# Segment, PP phase field (-1) or a module's layer number, micro-batch (-1),
+# Segment, phase slot (see ``EventSink.push``; -1 if none), micro-batch (-1),
 # tokens (-1), start and end in ms after the rank's anchor event.
 RECORD_WIDTH = 6
 FILE_PREFIX = "straggler_trace_rollout"
@@ -197,8 +197,9 @@ def _module_events(
         outer = (
             outers[j] if j < len(outers) and outers[j].start <= module.start <= module.end <= outers[j].end else None
         )
-        name = f"{_MODULE_NAMES[module.segment]} L{module.phase}"
-        args: dict[str, Any] = {"layer": module.phase}
+        layer, mtp = abs(module.phase), module.phase < 0
+        name = f"{_MODULE_NAMES[module.segment]} {'MTP ' if mtp else ''}L{layer}"
+        args: dict[str, Any] = {"layer": layer, "mtp": True} if mtp else {"layer": layer}
         if outer is not None:
             if outer.micro_batch >= 0:
                 args["micro_batch"] = outer.micro_batch

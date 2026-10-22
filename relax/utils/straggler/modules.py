@@ -28,8 +28,9 @@ class ModuleTimers:
     ``model_chunks``, bracketed into ``sink`` (the collector) while attached.
 
     A layer is any module with ``self_attention``, ``mlp`` and ``layer_number``
-    (Megatron's ``TransformerLayer``, including the one inside an MTP layer);
-    identity placeholders are skipped.
+    (Megatron's ``TransformerLayer``, including the one inside an MTP layer,
+    whose numbers start at 1 again and are recorded negated); identity
+    placeholders are skipped.
     """
 
     def __init__(self, model_chunks: Iterable[Any], sink: EventSink) -> None:
@@ -40,12 +41,13 @@ class ModuleTimers:
                 layer = getattr(module, "layer_number", None)
                 if layer is None:
                     continue
+                layer = -int(layer) if getattr(module, "is_mtp_layer", False) else int(layer)
                 for name in ("self_attention", "mlp"):
                     block = getattr(module, name, None)
                     if block is None or type(block).__name__ in _SKIPPED_BLOCKS:
                         continue
                     kind = "attn" if name == "self_attention" else ("moe" if "MoE" in type(block).__name__ else "mlp")
-                    self._blocks.append((block, kind, int(layer)))
+                    self._blocks.append((block, kind, layer))
         self._handles: list[Any] = []
 
     @property
