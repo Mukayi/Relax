@@ -14,7 +14,8 @@ contain several optimizer steps.
 With tracing on, the first step of every window after the first is also
 placed on a real time axis (see ``trace``): it starts with one device
 synchronize and an anchor event, its brackets keep their offsets from that
-anchor, and the window close gathers every rank's sample to the primary rank.
+anchor, and the window close gathers every rank's sample to the primary rank:
+once tracing is on, in every window, with ``None`` from a rank without one.
 At the ``modules`` level that step also carries module brackets (see
 ``modules``), whose hooks exist only while it runs.
 """
@@ -22,6 +23,7 @@ At the ``modules`` level that step also carries module brackets (see
 from __future__ import annotations
 
 import gc
+import math
 import threading
 from array import array
 from collections import deque
@@ -151,6 +153,7 @@ class StragglerCollector:
         trace: bool = False,
         synchronize: Callable[[], None] = lambda: None,
         gather_to: GatherToFn | None = None,
+        primary_rank: int | None = None,
         trace_sink: TraceSink | None = None,
         max_trace_brackets: int = 4096,
         max_module_brackets: int = 16384,
@@ -192,6 +195,9 @@ class StragglerCollector:
         self._level_request = level_request
         self._synchronize = synchronize
         self._gather_to = gather_to
+        # Where samples go, the same on every rank (``runtime`` agrees on it at install); ``None``: no samples.
+        self._primary_rank = primary_rank
+        self._sample_gather = trace and gather_to is not None and primary_rank is not None
         self._trace_sink = trace_sink
         self._max_trace_brackets = max_trace_brackets
         self._max_module_brackets = max_module_brackets
@@ -201,7 +207,6 @@ class StragglerCollector:
         self._trace_next = False
         self._trace: _TraceCapture | None = None
         self._trace_done: RankTrace | None = None
-        self._primary_rank: int | None = None
         # Primary rank only: the wall-clock span of the step traced last, until
         # the runtime hands over the CPU events in it.
         self._cpu_span: tuple[float, float] | None = None
@@ -488,12 +493,13 @@ class StragglerCollector:
         try:
             started = self._clock()
             table = self._gather_window(code)
+            gathered = self._clock()
+            # Before anything reads the table, so a rank whose table is missing joins it like its peers.
+            traces = self._gather_traces() if self._sample_gather else None
             if table is None:
                 return
-            gathered = self._clock()
             if self._handle_switch_off(table, closed_wall):
                 return
-            traces = self._gather_traces() if level >= 2 and not self._disabled else None
             # A switched-off primary has already stopped its worker, so there
             # is nothing to analyse; a paused window recorded nothing.
             if self.is_primary and not self._disabled:
@@ -502,6 +508,7 @@ class StragglerCollector:
                     self._submit(self._job(None, closed_wall=closed_wall, ready=paused))
                 else:
                     gather_ms = (gathered - started) * 1e3
+                    traces = traces if level >= 2 else None
                     self._submit(
                         self._job(table, closed_wall=closed_wall, gather_ms=gather_ms, traces=traces, level=level)
                     )
@@ -549,9 +556,12 @@ class StragglerCollector:
         return {"level": self.level, "rollout": self._window_last_rollout, "health": self.health.state}
 
     def _gather_traces(self) -> list[RankTrace | None] | None:
-        """Hand this window's sample to the primary rank: every rank joins the
-        gather in the same window, with ``None`` when it has no complete
-        sample.
+        """Hand this window's sample to the primary rank.
+
+        Every rank joins in every window, with ``None`` when it has no complete
+        sample (paused, below the detail level, switched off), so a rank that
+        failed to read the table, and missed a level switch or switch-off
+        because of it, still issues the same gathers as its peers.
 
         Returns the gathered list on the primary rank, ``None`` elsewhere or on
         failure.
@@ -564,10 +574,8 @@ class StragglerCollector:
         if sample is not None:
             sample.cpu_events = self._cpu_events
         self._cpu_events = []
-        if self._primary_rank is None:
-            return None
         try:
-            return self._gather_to(sample, self._primary_rank)
+            return self._gather_to(None if self._disabled else sample, self._primary_rank)
         except Exception as exc:
             self.on_error("trace", exc)
             return None
@@ -600,13 +608,14 @@ class StragglerCollector:
         window. A failed row gather is counted and the next window tries again;
         the dedicated short-timeout group bounds a group that is really broken,
         and once health gives up the rank also stops recording, so a failed
-        group cannot keep costing timer time for the rest of the run.
+        group cannot keep costing timer time for the rest of the run. A table
+        with a NaN row (a rank that could not build its row) is skipped on
+        every rank alike.
         """
         if not self._meta_gathered:
             self._meta_gathered = True
             try:
                 self._all_meta = list(self._gather_objects(self.rank_meta))
-                self._primary_rank = next((meta.rank for meta in self._all_meta if meta.primary), None)
             except Exception as exc:
                 self.on_error("gather", exc)
                 logger.warning(
@@ -619,12 +628,14 @@ class StragglerCollector:
             code = HEALTH_DISABLE
             self._window.set("health", code)
         try:
-            return self._gather(disabled_row() if self._disabled else self._window.as_list())
+            table = self._gather(disabled_row() if self._disabled else self._window.as_list())
         except Exception as exc:
             self.on_error("gather", exc)
             if code >= HEALTH_DISABLE and not self._disabled:
                 self._disable(f"the window gather kept failing ({type(exc).__name__}: {exc})")
             return None
+        # The rank that sent it raised and counts the failure itself.
+        return None if any(math.isnan(row[_HEALTH_INDEX]) for row in table) else table
 
     def _handle_switch_off(self, table: list[list[float]], closed_wall: float) -> bool:
         """Switch off when a gathered row asks for it; ``True`` when it did.
@@ -662,7 +673,7 @@ class StragglerCollector:
         self._window.reset()
         self.window_start_wall = self._wall()
         self._window_first_rollout = None
-        self._trace_next = self.level >= 2 and not self._disabled and self._primary_rank is not None
+        self._trace_next = self._sample_gather and self.level >= 2 and not self._disabled
 
     def _job(self, table: list[list[float]] | None, **kwargs: Any) -> _WindowJob:
         first = self._window_first_rollout

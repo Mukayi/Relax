@@ -312,6 +312,7 @@ def _tracing_collector(world=2, interval=2, trace=True, primary=True, level=2, *
         trace=trace,
         synchronize=synchronize,
         gather_to=gather_to,
+        primary_rank=0 if primary else None,
         trace_sink=sink,
         level=level,
         **kwargs,
@@ -370,13 +371,51 @@ def test_a_sample_still_in_flight_at_the_close_is_dropped():
     assert len(collector._pool) == 2
 
 
-@pytest.mark.parametrize(("trace", "primary", "level"), [(False, True, 2), (True, False, 2), (True, True, 1)])
-def test_nothing_is_sampled_without_tracing_a_primary_rank_or_the_detail_level(trace, primary, level):
+@pytest.mark.parametrize(
+    ("trace", "primary", "level", "gathers"), [(False, True, 2, 0), (True, False, 2, 0), (True, True, 1, 2)]
+)
+def test_nothing_is_sampled_without_tracing_a_primary_rank_or_the_detail_level(trace, primary, level, gathers):
     collector, calls = _tracing_collector(trace=trace, primary=primary, level=level)
     for rollout_id in range(4):
         bracket(collector)
         collector.end_step(rollout_id=rollout_id)
-    assert calls == {"sync": 0, "gathered": [], "sunk": []}
+    # Below the detail level a tracing run still joins the sample gather of every window, with nothing to send.
+    assert calls == {"sync": 0, "gathered": [(None, 0)] * gathers, "sunk": []}
+
+
+def test_a_rank_that_loses_its_table_still_joins_the_sample_gather_and_takes_the_level_a_window_later():
+    readouts = iter([True, False, True])
+
+    def gather(values):
+        rows = [list(values), list(values)]
+        if len(calls["gathered"]) >= 1:
+            # From the second window on, the primary's row asks for coarse.
+            rows[0][FIELD_INDEX["control"]] = 2.0
+        if not next(readouts):
+            raise MemoryError("injected while reading the gathered rows")
+        return rows
+
+    collector, calls = _tracing_collector(interval=1, gather=gather)
+    levels = []
+    for rollout_id in range(3):
+        bracket(collector)
+        collector.end_step(rollout_id=rollout_id)
+        levels.append(collector.level)
+    assert len(calls["gathered"]) == 3, "one sample gather per window, the failed one included"
+    assert levels == [2, 2, 1]
+    assert collector.health.errors_total == 1
+
+
+def test_a_window_with_a_nan_row_is_skipped_like_a_failed_gather():
+    def gather(values):
+        return [list(values), [float("nan")] * len(values)]
+
+    collector, calls = _tracing_collector(interval=1, gather=gather)
+    for rollout_id in range(2):
+        bracket(collector)
+        assert collector.end_step(rollout_id=rollout_id) == []
+    assert len(calls["gathered"]) == 2 and calls["sunk"] == []
+    assert not collector.disabled and collector.health.errors_total == 0
 
 
 def test_a_paused_rank_records_nothing_and_its_windows_are_not_analyzed():

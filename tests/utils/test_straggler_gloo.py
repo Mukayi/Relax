@@ -4,6 +4,7 @@ every rank has to issue the same collectives in the same order."""
 
 from __future__ import annotations
 
+import itertools
 import json
 from datetime import timedelta
 
@@ -70,7 +71,7 @@ def _rank_worker(rank, world_size, init_file, out_dir, failure):
         dist.destroy_process_group()
 
 
-def _trace_worker(rank, world_size, init_file, out_dir):
+def _trace_worker(rank, world_size, init_file, out_dir, failure):
     import torch.distributed as dist
 
     from relax.utils.straggler import runtime
@@ -88,6 +89,18 @@ def _trace_worker(rank, world_size, init_file, out_dir):
     try:
         runtime.init_straggler_gather_group(timeout_s=10)
         calls, sunk = [], []
+        window = itertools.count(1)
+
+        def gather(values):
+            failing = failure if rank == 0 and next(window) == 2 else None
+            if failing == "pack":
+                # torch.tensor cannot take the row: rank 0 sends NaN and raises after the collective.
+                return runtime.gloo_all_gather([*values[:-1], object()])
+            gathered = runtime.gloo_all_gather(values)
+            if failing == "readout":
+                # Like Tensor.tolist() failing: the collective is done on every rank, only rank 0 has no table.
+                raise MemoryError("injected after the row collective")
+            return gathered
 
         def gather_to(sample, dst):
             calls.append(dst)
@@ -102,21 +115,22 @@ def _trace_worker(rank, world_size, init_file, out_dir):
             is_primary=rank == 1,
             report_interval=1,
             event_factory=FakeEvent,
-            gather=runtime.gloo_all_gather,
+            gather=gather,
             gather_objects=runtime.gloo_all_gather_objects,
             is_capturing=lambda: False,
             register_gc_callback=False,
             background=False,
             trace=True,
             gather_to=gather_to,
+            primary_rank=runtime.gloo_primary_rank(rank == 1),
             trace_sink=sink,
             level=2,
         )
-        for rollout_id in range(3):
+        for rollout_id in range(4):
             bracket(collector)
             collector.end_step(rollout_id=rollout_id)
         with open(f"{out_dir}/rank{rank}.json", "w") as f:
-            json.dump({"calls": calls, "sunk": sunk}, f)
+            json.dump({"calls": calls, "sunk": sunk, "errors": collector.health.errors_total}, f)
     finally:
         dist.destroy_process_group()
 
@@ -125,15 +139,26 @@ def _trace_worker(rank, world_size, init_file, out_dir):
     not torch.distributed.is_available() or not torch.distributed.is_gloo_available(),
     reason="torch.distributed with Gloo is required",
 )
-def test_every_rank_hands_its_sample_to_the_primary_rank_in_the_same_window(tmp_path):
+@pytest.mark.parametrize(
+    ("failure", "sunk", "errors"),
+    [
+        (None, [[None, None], [6, 6], [6, 6], [6, 6]], [0, 0]),
+        # Rank 0 loses the second window's table after the collective; rank 1 still analyses that window.
+        ("readout", [[None, None], [6, 6], [6, 6], [6, 6]], [1, 0]),
+        # Rank 0 cannot send its second row; both ranks skip that window.
+        ("pack", [[None, None], [6, 6], [6, 6]], [1, 0]),
+    ],
+)
+def test_every_rank_hands_its_sample_to_the_primary_rank_in_the_same_window(tmp_path, failure, sunk, errors):
     import torch.multiprocessing as mp
 
-    mp.spawn(_trace_worker, args=(2, str(tmp_path / "gloo"), str(tmp_path)), nprocs=2, join=True)
+    mp.spawn(_trace_worker, args=(2, str(tmp_path / "gloo"), str(tmp_path), failure), nprocs=2, join=True)
     ranks = [json.loads((tmp_path / f"rank{rank}.json").read_text()) for rank in range(2)]
-    assert ranks[0]["calls"] == ranks[1]["calls"] == [1, 1, 1]
+    assert ranks[0]["calls"] == ranks[1]["calls"] == [1, 1, 1, 1]
     # The first window has no sample; each later one brings one bracket per rank to rank 1 only.
-    assert ranks[1]["sunk"] == [[None, None], [6, 6], [6, 6]]
+    assert ranks[1]["sunk"] == sunk
     assert ranks[0]["sunk"] == []
+    assert [r["errors"] for r in ranks] == errors
 
 
 @pytest.mark.skipif(

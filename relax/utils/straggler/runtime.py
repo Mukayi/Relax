@@ -96,15 +96,39 @@ def get_straggler_gather_group() -> Any:
 
 def gloo_all_gather(values: list[float]) -> list[list[float]]:
     """All-gather one CPU vector over the straggler Gloo group (ranks == global
-    ranks)."""
+    ranks).
+
+    Every rank issues the collective whatever fails locally: a rank that cannot
+    build its tensor sends NaN in every slot and raises after the gather, and
+    the collector skips a window with such a row on every rank.
+    """
     import torch
     import torch.distributed as dist
 
     group = get_straggler_gather_group()
-    local = torch.tensor(values, dtype=torch.float64)
+    error = None
+    try:
+        local = torch.tensor(values, dtype=torch.float64)
+    except Exception as exc:
+        error, local = exc, torch.full((len(values),), float("nan"), dtype=torch.float64)
     gathered = [torch.empty_like(local) for _ in range(dist.get_world_size(group))]
     dist.all_gather(gathered, local, group=group)
+    if error is not None:
+        raise error
     return [row.tolist() for row in gathered]
+
+
+def gloo_primary_rank(is_primary: bool) -> int | None:
+    """The primary rank's global rank, the same on every rank: one
+    ``all_reduce`` over the straggler Gloo group; ``None`` without a
+    primary."""
+    import torch
+    import torch.distributed as dist
+
+    value = torch.tensor([dist.get_rank() if is_primary else -1], dtype=torch.int64)
+    dist.all_reduce(value, op=dist.ReduceOp.MAX, group=get_straggler_gather_group())
+    rank = int(value.item())
+    return rank if rank >= 0 else None
 
 
 # A pickled RankMeta is under 400 B even with a 253-character host name.
@@ -302,6 +326,8 @@ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None
     # on every other rank.
     is_primary = is_metrics_primary_rank()
     traces_to = trace_dir(args)
+    # Only a tracing run gathers samples; every rank takes this branch alike, so the all-reduce is collective.
+    primary_rank = gloo_primary_rank(is_primary) if traces_to else None
     poller: LevelPoller | None = None
     collector = StragglerCollector(
         rank_meta=replace(local_rank_meta(), primary=is_primary),
@@ -321,6 +347,7 @@ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None
         trace=bool(traces_to),
         synchronize=device_synchronize(),
         gather_to=gloo_gather_objects_to,
+        primary_rank=primary_rank,
         trace_sink=partial(write_window_trace, traces_to, Envs.RELAX_STRAGGLER_TRACE_KEEP) if traces_to else None,
         level=initial_level(bool(traces_to)),
         # Read at window closes; the poller is created below, once there is a collector to report.

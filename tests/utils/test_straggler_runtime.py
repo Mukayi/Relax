@@ -191,6 +191,7 @@ def test_the_primary_hands_its_cpu_events_to_the_sample_after_the_traced_step(mo
         level=2,
         gather_objects=lambda obj: [replace(meta(1)[0], primary=True)],
         gather_to=lambda sample, dst: samples.append(sample) or [sample],
+        primary_rank=0,
     )
     for rollout_id in range(4):
         _step(profiler, rollout_id)
