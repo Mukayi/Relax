@@ -88,7 +88,7 @@ closed; their time lands in the next window
 | `straggler/pp_stage_imbalance` | 各 PP stage 计算时间中位数的 `max/min`，与是否有慢 rank 无关。 |
 | `straggler/{pp_wait_fill,pp_wait_up,pp_wait_down,pp_wait_drain}/{max_ms,max_rank}` | 训练阶段的 `pp_recv` 按非交错 1F1B 的阶段拆开（ms/step）后的最大值和对应 rank：`fill` 是填充阶段等上游激活，`up` / `down` 是稳态阶段等上游激活 / 下游梯度，`drain` 是排空阶段等下游梯度。均衡的流水线在稳态不空等，所以 `up + down` 超出传输时间的部分就是多出来的气泡。上游 rank 在一步开头停顿时，整条流水线被往后推，体现在下游 stage 的 `fill` 上，稳态不变。只在开 PP 时输出；交错调度（VPP）的收发只计入 `pp_recv`。 |
 | `straggler/pp_bubble/ratio` | `pp_recv` 占该 rank 已计时训练时间（自身计算 + 等待 + `pp_send`）的比例，取各 PP stage 中位数的最大值；只在开 PP 时输出。 |
-| `straggler/micro_batch/{fwd_max_ms,fwd_max_rank,fwd_argmax,fwd_argmax_tokens,fwd_min_ms,bwd_max_ms,bwd_max_rank,tokens_max,tokens_min}` | 本窗口内单个训练 micro-batch 的极值（不按步平均）：最慢的前向及其 rank、它是所在 rollout 的第几个前向（从 0 起，VPP 下为 −1）及其 token 数（拿不到时为 −1）、最快的前向、最慢的反向及其 rank，以及单个 micro-batch 的最大 / 最小 token 数（没有 token 数时不输出）。 |
+| `straggler/micro_batch/{fwd_max_ms,fwd_max_rank,fwd_argmax,fwd_argmax_tokens,fwd_min_ms,bwd_max_ms,bwd_max_rank,tokens_max,tokens_min}` | 本窗口内单个训练 micro-batch 的极值（不按步平均）：最慢的前向及其 rank、它在所在 rollout 里的 micro-batch 序号（从 0 起；VPP 与 `combined_1f1b` 同时开启时为 −1）及其 token 数（拿不到时为 −1）、最快的前向、最慢的反向及其 rank，以及单个 micro-batch 的最大 / 最小 token 数（没有 token 数时不输出）。 |
 | `straggler/gc/{median_ms,max_ms}` | Python GC 停顿。 |
 | `straggler/flagged/count`、`straggler/flagged/rank`（无则 −1）、`straggler/flagged/reason` | 告警状态。reason 编码：0 none、1 slow_device、2 data_imbalance、3 upstream_wait、4 cpu_bound、5 late_arrival。 |
 | `straggler/waiting/count` | 本窗口因上游 PP stage 慢而在等待的 rank 数。它们是被拖慢的，不是慢 rank，不计入 `flagged`。 |
@@ -113,14 +113,14 @@ closed; their time lands in the next window
 | 层 | 内容 |
 | --- | --- |
 | 第 1 层（PP） | `busy`：连续的计算和通信；`bubble fill` / `up` / `down` / `drain`：PP 等待，按 1F1B 阶段命名，`waits_for` 写明在等上一个还是下一个 stage；`untimed`：超过 0.5 ms 且没有任何计时覆盖的时间（CPU 侧停顿） |
-| 第 2 层（fwd / bwd） | `busy` 里的 `F{i}` / `B{i}`（`i` 是 micro-batch 序号，VPP 下没有序号，记为 `F` / `B`；前向带 token 数）、`send`、`grad sync`（DP 梯度同步，即 Megatron 的 `all-grads-sync`；其他梯度同步用 Megatron 的计时器名，例如 `embedding-grads-all-reduce`）、`param gather`、`optimizer`；log-prob 阶段为 `lp F{i}` 等 |
-| 第 3 层（模块） | 只在 `modules` 级别出现：`F{i}` / `B{i}` 里每个 transformer 层的 attention 和 MLP（MoE 层记为 `moe`）的前向、反向，例如 `attn fwd L3`、`moe bwd L3`，参数带 `layer` 和 `micro_batch`（VPP 下没有 `micro_batch`）；MTP 层的层号从 1 重新开始，记为 `attn fwd MTP L1` 等，参数另带 `mtp`；出现在 `B{i}` 里的前向是激活重计算，记为 `… (recompute)`；log-prob 阶段为 `lp attn fwd L3` 等 |
+| 第 2 层（fwd / bwd） | `busy` 里的 `F{i}` / `B{i}`（`i` 是 micro-batch 序号，VPP 下另带模型块，记为 `F{i} chunk {c}`；前向带 token 数）、`send`、`grad sync`（DP 梯度同步，即 Megatron 的 `all-grads-sync`；其他梯度同步用 Megatron 的计时器名，例如 `embedding-grads-all-reduce`）、`param gather`、`optimizer`；log-prob 阶段为 `lp F{i}` 等 |
+| 第 3 层（模块） | 只在 `modules` 级别出现：`F{i}` / `B{i}` 里每个 transformer 层的 attention 和 MLP（MoE 层记为 `moe`）的前向、反向，例如 `attn fwd L3`、`moe bwd L3`，参数带 `layer` 和 `micro_batch`（VPP 下另带 `model_chunk`）；MTP 层的层号从 1 重新开始，记为 `attn fwd MTP L1` 等，参数另带 `mtp`；出现在 `B{i}` 里的前向是激活重计算，记为 `… (recompute)`；log-prob 阶段为 `lp attn fwd L3` 等 |
 
 primary 自身的 CPU 侧计时（`Timer` 事件，例如 `actor_train` 和每个 micro-batch 的 `get_data_batch_*`，不含调用栈）单独一行 `primary CPU`；采样步结束时还没结束的计时不包括在内。
 
 | 指标 | 含义 |
 |------|------|
-| `straggler/trace/ranks`、`straggler/trace/lost` | 提供了 trace 的 rank 数；丢失的计时数（队列满被丢弃，或超出每步 4096 条普通计时、8192 条模块计时的上限；模块计时最多占计时队列的一半，被挤掉时只计在这里，不计入 `dropped_events`） |
+| `straggler/trace/ranks`、`straggler/trace/lost` | 提供了 trace 的 rank 数；丢失的计时数（队列满被丢弃，或超出每步 4096 条普通计时、8192 条模块计时的上限；模块计时单独排队，最多占队列容量的一半，队列满时先被挤掉；被挤掉的模块计时只计在这里，不计入 `dropped_events`） |
 | `straggler/trace/module_brackets` | trace 中模块计时的条数，各 rank 求和（仅 `modules` 级别） |
 | `straggler/trace/align_spread_ms` | 同一 DP 组 DP 梯度同步（`all-grads-sync`）的结束时刻在各 rank 墙钟上的最大差值，即跨卡对齐误差 |
 | `straggler/trace/bubble_excess_ms_max`、`straggler/trace/bubble_excess_rank` | 实测 PP 等待超出均衡 1F1B 气泡的最大值及其 rank |
@@ -130,7 +130,7 @@ primary 自身的 CPU 侧计时（`Timer` 事件，例如 `actor_train` 和每�
 - 每个窗口多一次 GPU 同步（采样步开头）和一次只发往 primary 的 gather（每条计时 24 B）；生成和写文件在 primary 的后台线程完成。在 8 卡 A100、Qwen3-0.6B TP1×PP4×DP2（步时约 1.6 s）上实测，训练线程每个窗口多约 2 ms（同步约 0.4 ms、gather 约 1.3 ms、读取时间偏移约 0.3 ms），按默认 10 个 rollout 一个窗口折算，每步约 0.01%。有 trace 目录、但级别为 `coarse` 或 `paused` 时，每个窗口仍有这次 gather，每个 rank 只发一个空条目。
 - `modules` 级别只在采样步挂 hook，所有 rank 相同。同一配置下实测（每个 stage 7 层，每个 rank 每步约 250 条模块计时）：采样步的前向长 3–10%（小模型受 kernel 发射限制，hook 的 CPU 开销会显现出来），反向不变，步时仍在步间波动范围内；每个窗口读取模块计时多约 3.5 ms。窗口统计里包含这些略长的前向。CUDA graph 捕获期间不计时，被捕获的层没有模块切片。
 - 跨卡对齐依赖各 rank 的墙钟（`time.time()`），跨机器时受 NTP 精度影响，误差见 `align_spread_ms`。
-- 阶段命名和气泡推算只适用于非交错 1F1B；VPP 和 `combined_1f1b` 下只看第 2 层。VPP 下 `F` / `B` 和模块切片都没有 micro-batch 序号：交错调度里第 n 次调用不一定是第 n 个 micro-batch，Megatron 的反向调用也不带 micro-batch 和模型块的信息。窗口只有 1 个 rollout 时，采样步可能在窗口结束时还没读完，这个窗口就没有 trace。
+- 阶段命名和气泡推算只适用于非交错 1F1B。VPP 下的 micro-batch 序号和模型块按 Megatron 的交错调度表（`get_schedule_table`）由调用顺序换算：一次 forward-backward 里的第 k 次前向对应表中第 k 项，第 k 次反向对应同一项、模型块倒序。`combined_1f1b` 把前向和反向合并执行，VPP 下不编号。窗口只有 1 个 rollout 时，采样步可能在窗口结束时还没读完，这个窗口就没有 trace。
 
 ### 运行中切换级别
 
