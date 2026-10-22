@@ -109,9 +109,9 @@ class _WindowJob:
 @dataclass
 class _TraceCapture:
     """The sampled step being read out: its anchor event and wall-clock time,
-    the sequence numbers of its first pair and one past its last (set when the
-    step ends), its brackets so far (``modules`` of them module brackets) and
-    how many were lost."""
+    the sequence numbers of its first window pair and one past its last (set
+    when the step ends), its brackets so far (``modules`` of them module
+    brackets) and how many were lost."""
 
     anchor: Any
     wall: float
@@ -182,14 +182,15 @@ class StragglerCollector:
         self.detector_state = DetectorState()
         self._pool = EventPool(pool_size, event_factory)
         self._max_pending = max_pending
-        # (segment, PP phase field or -1, start event, end event, CPU ms, micro-batch or -1, tokens or -1);
-        # tokens only for a training forward.
+        # Window brackets: (segment, PP phase field or -1, start event, end event, CPU ms, micro-batch or -1,
+        # tokens or -1); tokens only for a training forward.
         self._pending: deque[tuple[int, int, Any, Any, float, int, float]] = deque()
-        # Pairs ever pushed and ever popped (folded or dropped): the sequence number of the queue head.
+        # Window pairs ever pushed and ever popped (folded or dropped): the sequence number of the queue head.
         self._pushed = 0
         self._popped = 0
-        # Module brackets in the queue: at most half of it, so the window's own brackets always have room.
-        self._queued_modules = 0
+        # Module brackets of the sampled step: (segment, layer, start event, end event). They share
+        # ``max_pending`` with the window brackets, take at most half of it and exist only while a sample is read out.
+        self._modules: deque[tuple[int, int, Any, Any]] = deque()
         # Brackets of each numbered segment pushed in this step, and the token
         # count reported for the training forward bracket that is open (-1 when none was).
         self._step_numbers = dict.fromkeys(_NUMBERED, 0)
@@ -290,33 +291,40 @@ class StragglerCollector:
         """Queue one bracket for ``drain``; when the queue is full drop the
         oldest pair, so a rank that stops draining cannot grow without bound.
 
-        A dropped window bracket counts in ``dropped``; a dropped module
-        bracket only in the sample's ``lost``. A module bracket that finds the
-        queue full, or half of it taken by module brackets, is dropped itself,
-        so module brackets never cost the window one of its own.
+        Module brackets give way to window brackets: one that finds the queue
+        full, or half of it taken by module brackets, is dropped itself, and a
+        window bracket that finds the queue full drops the oldest module
+        bracket before it drops a window bracket. A dropped window bracket
+        counts in ``dropped``; a dropped module bracket only in the sample's
+        ``lost``.
 
         A fwd / bwd / log-prob fwd bracket takes the next micro-batch number of
         its segment in the step (none under interleaved PP); a training forward
         also takes the token count reported while it was open.
         """
-        module = segment_index >= NUM_FIELDS
-        full = len(self._pending) >= self._max_pending
-        if module and (full or 2 * self._queued_modules >= self._max_pending):
+        trace = self._trace
+        full = len(self._pending) + len(self._modules) >= self._max_pending
+        if segment_index >= NUM_FIELDS:
+            if trace is not None and not full and 2 * len(self._modules) < self._max_pending:
+                self._modules.append((segment_index, phase_index, start_event, end_event))
+                return
             self._pool.release(start_event)
             self._pool.release(end_event)
-            if self._trace is not None:
-                self._trace.lost += 1
+            if trace is not None:
+                trace.lost += 1
             return
-        if full:
-            old_segment, _, old_start, old_end, _, _, _ = self._pending.popleft()
+        if full and trace is not None and self._modules:
+            _, _, old_start, old_end = self._modules.popleft()
             self._pool.release(old_start)
             self._pool.release(old_end)
-            if old_segment >= NUM_FIELDS:
-                self._queued_modules -= 1
-            else:
-                self._window.add_index(_DROPPED_INDEX, 1.0)
-            if self._trace is not None and self._trace.covers(self._popped):
-                self._trace.lost += 1
+            trace.lost += 1
+        elif full:
+            _, _, old_start, old_end, _, _, _ = self._pending.popleft()
+            self._pool.release(old_start)
+            self._pool.release(old_end)
+            self._window.add_index(_DROPPED_INDEX, 1.0)
+            if trace is not None and trace.covers(self._popped):
+                trace.lost += 1
             self._popped += 1
         micro_batch = self._step_numbers.get(segment_index, -1)
         tokens = -1.0
@@ -327,7 +335,6 @@ class StragglerCollector:
             if not self._number_micro_batches:
                 micro_batch = -1
         self._pending.append((segment_index, phase_index, start_event, end_event, cpu_ms, micro_batch, tokens))
-        self._queued_modules += module
         self._pushed += 1
 
     def _begin_trace(self) -> None:
@@ -376,20 +383,20 @@ class StragglerCollector:
 
     @property
     def pending_events(self) -> int:
-        return len(self._pending)
+        return len(self._pending) + len(self._modules)
 
     @property
     def window(self) -> WindowStats:
         return self._window
 
     def drain(self) -> int:
-        """Fold completed event pairs from the front of the queue into the
-        window; stop at the first pair that is still in flight.
+        """Fold completed event pairs from the front of each queue into the
+        window or the sample; stop at the first pair that is still in flight.
 
         Pairs are queued in stream order, so an incomplete pair implies every
-        later pair is incomplete too. Each pair is popped only after it has
-        been folded, so an exception leaves the queue consistent and no event
-        is released twice. Returns the number of pairs folded.
+        later pair of its queue is incomplete too. Each pair is popped only
+        after it has been folded, so an exception leaves the queues consistent
+        and no event is released twice. Returns the number of pairs folded.
         """
         started = self._clock()
         folded = 0
@@ -400,18 +407,15 @@ class StragglerCollector:
             segment_index, phase_index, start_event, end_event, cpu_ms, micro_batch, tokens = pending[0]
             if not (end_event.query() and start_event.query()):
                 break
-            # A module bracket goes into the trace only; its phase slot holds the layer number.
-            module = segment_index >= NUM_FIELDS
-            ms = 0.0 if module else start_event.elapsed_time(end_event)
+            ms = start_event.elapsed_time(end_event)
             # Read before anything is folded, so a failing readout leaves no partial update.
             traced = trace is not None and trace.covers(self._popped)
             if traced:
                 offsets = (trace.anchor.elapsed_time(start_event), trace.anchor.elapsed_time(end_event))
-            if not module:
-                window.add_index(segment_index, ms)
-                # Only a PP wait's phase is a field; a gradient sync's names its timer, for the trace.
-                if segment_index == _PP_RECV_INDEX and phase_index >= 0:
-                    window.add_index(phase_index, ms)
+            window.add_index(segment_index, ms)
+            # Only a PP wait's phase is a field; a gradient sync's names its timer, for the trace.
+            if segment_index == _PP_RECV_INDEX and phase_index >= 0:
+                window.add_index(phase_index, ms)
             if segment_index == _FWD_INDEX:
                 window.add_index(_CPU_FWD_INDEX, cpu_ms)
                 window.add_index(_NUM_FWD_INDEX, 1.0)
@@ -427,20 +431,30 @@ class StragglerCollector:
                 window.max_index(_MB_BWD_MAX_INDEX, ms)
                 window.min_index(_MB_BWD_MIN_INDEX, ms)
             if traced:
-                if module:
-                    kept = trace.modules < self._max_module_brackets
-                else:
-                    kept = len(trace.records) // RECORD_WIDTH - trace.modules < self._max_trace_brackets
-                if kept:
+                if len(trace.records) // RECORD_WIDTH - trace.modules < self._max_trace_brackets:
                     trace.records.extend((segment_index, phase_index, micro_batch, tokens, *offsets))
-                    trace.modules += module
                 else:
                     trace.lost += 1
             pending.popleft()
-            self._queued_modules -= module
             self._pool.release(start_event)
             self._pool.release(end_event)
             self._popped += 1
+            folded += 1
+        modules = self._modules
+        while modules and trace is not None:
+            segment_index, layer, start_event, end_event = modules[0]
+            if not (end_event.query() and start_event.query()):
+                break
+            offsets = (trace.anchor.elapsed_time(start_event), trace.anchor.elapsed_time(end_event))
+            if trace.modules < self._max_module_brackets:
+                # The phase slot holds the layer number.
+                trace.records.extend((segment_index, layer, -1, -1.0, *offsets))
+                trace.modules += 1
+            else:
+                trace.lost += 1
+            modules.popleft()
+            self._pool.release(start_event)
+            self._pool.release(end_event)
             folded += 1
         self._finish_trace()
         window.add("overhead", (self._clock() - started) * 1e3)
@@ -449,11 +463,26 @@ class StragglerCollector:
     def _finish_trace(self) -> None:
         """Hand the sampled step over once every pair of it has been read."""
         trace = self._trace
-        if trace is None or trace.end is None or self._popped < trace.end:
+        if trace is None or trace.end is None or self._popped < trace.end or self._modules:
             return
         self._pool.release(trace.anchor)
         self._trace = None
         self._trace_done = RankTrace(wall=trace.wall, records=trace.records, lost=trace.lost)
+
+    def _drop_trace(self) -> None:
+        """Abandon the sampled step and its module brackets."""
+        if self._trace is None:
+            return
+        self._pool.release(self._trace.anchor)
+        self._trace = None
+        self._release_all(self._modules)
+
+    def _release_all(self, queue: deque) -> None:
+        """Empty ``queue`` and return its events to the pool."""
+        while queue:
+            _, _, start_event, end_event, *_ = queue.popleft()
+            self._pool.release(start_event)
+            self._pool.release(end_event)
 
     @property
     def disabled(self) -> bool:
@@ -582,10 +611,8 @@ class StragglerCollector:
         Returns the gathered list on the primary rank, ``None`` elsewhere or on
         failure.
         """
-        if self._trace is not None:
-            # Still in flight at the close (only with very short windows): dropped.
-            self._pool.release(self._trace.anchor)
-            self._trace = None
+        # A sample still in flight at the close (only with very short windows) is dropped.
+        self._drop_trace()
         sample, self._trace_done = self._trace_done, None
         if sample is not None:
             sample.cpu_events = self._cpu_events
@@ -772,14 +799,8 @@ class StragglerCollector:
             return
         self._disabled = True
         self.health.disable(reason)
-        while self._pending:
-            _, _, start_event, end_event, _, _, _ = self._pending.popleft()
-            self._pool.release(start_event)
-            self._pool.release(end_event)
-        self._queued_modules = 0
-        if self._trace is not None:
-            self._pool.release(self._trace.anchor)
-            self._trace = None
+        self._release_all(self._pending)
+        self._drop_trace()
         self._detach_modules()
         self.close()
         logger.warning(

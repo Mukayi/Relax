@@ -349,6 +349,17 @@ def _tracing_collector(world=2, interval=2, trace=True, primary=True, level=2, *
     return collector, calls
 
 
+def _recording_gather():
+    """A window gather that keeps this rank's rows and returns two copies."""
+    rows = []
+
+    def gather(values):
+        rows.append(list(values))
+        return [list(values)] * 2
+
+    return rows, gather
+
+
 def _rows(sample):
     values = list(sample.records)
     return [values[i : i + RECORD_WIDTH] for i in range(0, len(values), RECORD_WIDTH)]
@@ -503,12 +514,7 @@ def _module_bracket(collector, layer):
 
 
 def test_the_modules_level_hooks_only_the_sampled_step_and_keeps_module_brackets_out_of_the_window():
-    gathered = []
-
-    def gather(values):
-        gathered.append(list(values))
-        return [list(values)] * 2
-
+    gathered, gather = _recording_gather()
     collector, calls = _tracing_collector(level=3, gather=gather, max_trace_brackets=1, max_module_brackets=1)
     hooks = collector.module_timers = _ModuleHooks()
     after_step = []
@@ -546,6 +552,7 @@ def test_a_module_bracket_finding_the_queue_full_is_dropped_instead_of_a_window_
 
 def test_module_brackets_take_at_most_half_the_queue_and_make_room_without_counting_as_dropped():
     collector, _ = _tracing_collector(level=3, interval=1, max_pending=4)
+    collector.end_step(rollout_id=0)
     for layer in (1, 2, 3):
         _module_bracket(collector, layer)
     assert collector.pending_events == 2, "the third module bracket found half the queue taken"
@@ -558,6 +565,43 @@ def test_module_brackets_take_at_most_half_the_queue_and_make_room_without_count
     collector.drain()
     _module_bracket(collector, 4)
     assert collector.pending_events == 1
+
+
+def test_a_window_bracket_pushes_out_a_module_bracket_queued_after_older_window_brackets():
+    rows, gather = _recording_gather()
+    collector, calls = _tracing_collector(level=3, interval=1, max_pending=4, gather=gather)
+    collector.end_step(rollout_id=0)
+    bracket(collector, "forward-recv")
+    _module_bracket(collector, 1)
+    _module_bracket(collector, 2)
+    bracket(collector, "forward-compute")
+    bracket(collector, "backward-compute")
+    collector.end_step(rollout_id=1)
+    assert (rows[-1][FIELD_INDEX["dropped"]], rows[-1][FIELD_INDEX["unread"]]) == (0.0, 0.0)
+    sample, _ = calls["gathered"][-1]
+    records = [(int(r[0]), int(r[1])) for r in _rows(sample)]
+    assert [segment for segment, _ in records] == [
+        FIELD_INDEX["pp_recv"],
+        FIELD_INDEX["fwd"],
+        FIELD_INDEX["bwd"],
+        MODULE_INDEX["attn_fwd"],
+    ]
+    assert records[-1][1] == 2 and sample.lost == 1
+
+
+def test_module_brackets_in_flight_at_the_close_do_not_count_as_unread():
+    rows, gather = _recording_gather()
+    collector, calls = _tracing_collector(level=3, interval=1, gather=gather)
+    collector.end_step(rollout_id=0)
+    bracket(collector)
+    start = collector.record_event()
+    end = collector.record_event()
+    end.done = False
+    collector.push(MODULE_INDEX["attn_fwd"], 1, start, end, 0.0)
+    collector.end_step(rollout_id=1)
+    assert rows[-1][FIELD_INDEX["unread"]] == 0.0
+    # The sample is dropped, its module bracket with it.
+    assert calls["gathered"][-1][0] is None and collector.pending_events == 0
 
 
 @pytest.mark.parametrize(
