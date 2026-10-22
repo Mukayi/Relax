@@ -25,7 +25,7 @@ env_vars:
 | `RELAX_STRAGGLER_RECOVER_WINDOWS` | int | 2 | Consecutive clean windows before a flagged rank's alert clears, so alerts do not flap; uncertain windows are not clean; must be at least 1. |
 | `RELAX_STRAGGLER_GATHER_TIMEOUT_S` | float | 60.0 | Timeout in seconds of the profiler's dedicated Gloo group. A gather is a few milliseconds of small CPU tensors; this only bounds how long the remaining ranks block once a rank has disappeared. |
 
-Each actor-role process logs `Straggler profiler enabled: report_interval=… primary=… trace_dir=… meta=RankMeta(rank=…, dp=…, tp=…, pp=…, cp=…, ep=…, host=…, device=…, primary=…)` at start-up (`trace_dir=-` means no sampled-step trace, see *Sampled-step trace* below). Critic / reference / `actor_fwd` actors never run training steps and are not profiled.
+Each actor-role process logs `Straggler profiler enabled: report_interval=… primary=… level=… control=… trace_dir=… meta=RankMeta(rank=…, dp=…, tp=…, pp=…, cp=…, ep=…, host=…, device=…, primary=…)` at start-up (`trace_dir=-` means no sampled-step trace, see *Sampled-step trace* below). Critic / reference / `actor_fwd` actors never run training steps and are not profiled.
 
 ## What you get
 
@@ -89,6 +89,7 @@ These scalars go out in the same `tracking_utils.log` call as the `perf/*` metri
 | `straggler/uncertain/count`, `straggler/uncertain/rank` (−1 if none), `straggler/uncertain/cause` | Number of uncertain ranks, the first one and its cause. Cause codes: 0 none, 1 dropped_events, 2 unread_events, 3 profiler_errors, 4 no_peers, 5 missing_tokens, 6 no_wait_reference. |
 | `straggler/recovered/count` | Ranks whose alert cleared in this window. |
 | `straggler/window/first_rollout`, `straggler/window/last_rollout` | The window these scalars belong to (they are usually emitted one rollout later). |
+| `straggler/control/level` | The window's level: 0 paused, 1 coarse, 2 detail (see *Switching the level while training*). |
 | `straggler/latency/analyzed_ms` | Milliseconds from the window close (before the gather) to the end of its analysis, when the alert lines are logged. |
 | `straggler/health/state`, `straggler/health/errors`, `straggler/health/degraded_ranks` | The profiler's own health: worst state across ranks (0 active, 1 degraded, 2 disabled), errors caught in the window, and ranks currently degraded. |
 | `straggler/self_overhead_ms`, `straggler/gather_ms`, `straggler/analyze_ms`, `straggler/dropped_events`, `straggler/unread_events` | The tool's own cost: CPU time per step spent draining events; gather time per window on the primary rank (the first window also includes one metadata gather); analysis time per window on the background thread; event pairs dropped because the queue was full (normally 0); event pairs still unread when the window closed (normally 0). |
@@ -118,9 +119,25 @@ The primary rank's own CPU-side timers (`Timer` events such as `actor_train` and
 
 Cost and limits:
 
-- One extra device synchronize per window (at the start of the sampled step) and one gather to the primary rank only (24 B per bracket); building and writing the file happen on the primary's background thread.
+- One extra device synchronize per window (at the start of the sampled step) and one gather to the primary rank only (24 B per bracket); building and writing the file happen on the primary's background thread. Measured on 8×A100 with Qwen3-0.6B TP1×PP4×DP2 (step ≈ 1.6 s): about 2 ms more per detail window on the training thread (synchronize ≈ 0.4 ms, gather ≈ 1.3 ms, offset readout ≈ 0.3 ms), about 0.01 % per step with the default 10-rollout window.
 - Ranks are aligned by their wall clocks (`time.time()`), so across machines NTP accuracy applies; `align_spread_ms` shows the error.
 - Phase names and the bubble estimate assume non-interleaved 1F1B; with VPP or `combined_1f1b` read level 2 only. With one-rollout windows the sampled step may still be in flight when the window closes, and that window has no sample.
+
+### Switching the level while training
+
+| Level | Meaning |
+| --- | --- |
+| 0 `paused` | No timer bracket is recorded; windows still gather (status only) but are not analyzed, alert streaks are frozen, and the only scalar is `straggler/control/level` |
+| 1 `coarse` | The window statistics and verdicts above |
+| 2 `detail` | Plus the sampled-step trace; needs a trace directory (see above) and runs as `coarse` without one |
+
+`RELAX_STRAGGLER_LEVEL` sets the start level (default: 2 with a trace directory, 1 otherwise). With `--use-metrics-service`, the primary rank asks the metrics service for a level every `RELAX_STRAGGLER_CONTROL_POLL_S` seconds (5 by default) from a daemon thread. While training runs, open `http://<head node>:<Serve HTTP port>/metrics/straggler` in a browser and press a button, or:
+
+```bash
+curl -X POST http://<head>:<port>/metrics/straggler/control -H 'Content-Type: application/json' -d '{"level": 0}'
+```
+
+The requested level goes into the `control` field of the primary rank's row, reaches every rank with the next window gather, and every rank switches from the next window on, so a change takes effect at most one window plus one poll interval later; the page shows the level in effect and when the primary last polled. Once the profiler has switched itself off after errors (see *When the profiler itself fails*) it no longer follows requests; without the metrics service the level stays at its start value. The endpoints have no authentication and, like the other metrics-service endpoints, belong inside the cluster. The training processes open no port of their own: the page and the endpoints live on the Ray Serve HTTP server Relax starts (head node, port 8000), which the primary rank polls; to reach it from outside the cluster, forward that port yourself.
 
 ## Coverage
 
@@ -165,7 +182,7 @@ A failed gather is only visible to the rank it failed on. It does not leave the 
 ## Overhead
 
 - One pair of non-blocking `event.record()` calls per Megatron timer call site (events are pooled). At the end of each step completed events are read lazily with `event.query()`, never `cuda.synchronize()`; the cost is reported as `straggler/self_overhead_ms`.
-- One Gloo `all_gather` every `REPORT_INTERVAL` rollouts, reported as `straggler/gather_ms`. Each rank contributes 264 B per window (33 float64), independent of the micro-batch count; because this is an `all_gather`, every rank materializes the full `N × 264 B` table, and the whole job receives `N × (N−1) × 264 B` per window (excluding Gloo protocol overhead). The first window also has a separate metadata gather of 1 KiB per rank.
+- One Gloo `all_gather` every `REPORT_INTERVAL` rollouts, reported as `straggler/gather_ms`. Each rank contributes 272 B per window (34 float64), independent of the micro-batch count; because this is an `all_gather`, every rank materializes the full `N × 272 B` table, and the whole job receives `N × (N−1) × 272 B` per window (excluding Gloo protocol overhead). The first window also has a separate metadata gather of 1 KiB per rank.
 - The analysis runs on a background thread of the primary rank, reported as `straggler/analyze_ms`. It is O(n log n) in the stage size: a few milliseconds per window at 8 ranks, about 35 ms at 2048 ranks in a CPU benchmark.
 - On 8×A100 with Qwen3-0.6B DP8 (step ≈ 1 s), the summed worst-case upper bound is about 1.9 ms/step (≈ 0.19 %), and end-to-end on/off comparisons are indistinguishable from zero; turning it on adds no synchronizing calls and leaves the NCCL/compute kernel overlap unchanged. The method and all measurements are in [RFC #362](https://github.com/redai-studio/Relax/issues/362).
 
@@ -185,5 +202,6 @@ The alert line is logged as soon as the analysis finishes (`straggler/latency/an
 - `relax/utils/straggler/health.py`: the profiler's own health (active → degraded → disabled).
 - `relax/utils/straggler/reporter.py`: metrics / timeline output (training thread) and log output (background thread).
 - `relax/utils/straggler/trace.py`: the sampled-step trace: lays every rank's brackets out as nested slices and writes the Perfetto JSON (on the primary's background thread).
+- `relax/utils/straggler/control.py`: switching the level while training runs: the metrics-service side state, the primary rank's polling thread and the control page.
 - `relax/utils/straggler/runtime.py`: the only module that touches the accelerator (through `relax.utils.device`, so CUDA and NPU alike), the process groups or Megatron's parallel state; `StragglerProfiler` does the per-step reporting around `log_perf_data`.
-- Wiring: `relax/backends/megatron/model.py` (`config.timers = straggler_timers(...)` at three sites) and `relax/backends/megatron/actor.py` (`install_straggler_profiler`, per-step `_log_perf_data`).
+- Wiring: `relax/backends/megatron/model.py` (`config.timers = straggler_timers(...)` at three sites), `relax/backends/megatron/actor.py` (`install_straggler_profiler`, per-step `_log_perf_data`) and `relax/utils/metrics/service.py` (the control page and the `/straggler/*` endpoints).

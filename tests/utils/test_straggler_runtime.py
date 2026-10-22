@@ -127,6 +127,19 @@ def test_micro_batch_tokens_reach_the_profiler_only_as_host_lists(monkeypatch):
     assert noted == [350, 7]
 
 
+@pytest.mark.parametrize(
+    ("env", "trace_on", "expected"), [(None, True, 2), (None, False, 1), ("0", True, 0), ("1", True, 1)]
+)
+def test_the_start_level_comes_from_the_env_or_from_whether_traces_can_be_written(
+    monkeypatch, env, trace_on, expected
+):
+    if env is None:
+        monkeypatch.delenv("RELAX_STRAGGLER_LEVEL", raising=False)
+    else:
+        monkeypatch.setenv("RELAX_STRAGGLER_LEVEL", env)
+    assert runtime.initial_level(trace_on) == expected
+
+
 def test_traces_go_to_the_env_dir_or_under_the_timeline_dir(monkeypatch):
     monkeypatch.delenv("RELAX_STRAGGLER_TRACE_DIR", raising=False)
     assert runtime.trace_dir(Namespace(timeline_dump_dir=None)) == ""
@@ -163,6 +176,7 @@ def test_the_primary_hands_its_cpu_events_to_the_sample_after_the_traced_step(mo
         interval=2,
         world=1,
         trace=True,
+        level=2,
         gather_objects=lambda obj: [replace(meta(1)[0], primary=True)],
         gather_to=lambda sample, dst: samples.append(sample) or [sample],
     )

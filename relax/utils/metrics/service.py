@@ -9,8 +9,8 @@ from collections.abc import Awaitable, Callable
 from typing import Any, Dict, List, Optional, Union
 
 import wandb
-from fastapi import FastAPI, Request
-from fastapi.responses import Response
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST
 from pydantic import BaseModel
 from ray import serve
@@ -23,6 +23,7 @@ from relax.utils.metrics.adapters.tensorboard import _TensorboardAdapter
 from relax.utils.metrics.adapters.wandb import _is_offline_mode
 from relax.utils.metrics.sglang_exporter import SGLangMetricsExporter
 from relax.utils.metrics.timeline_trace import TimelineTraceAdapter
+from relax.utils.straggler.control import CONTROL_PAGE, ControlState
 
 
 logger = get_logger(__name__)
@@ -68,6 +69,16 @@ class ClearMetricsRequest(BaseModel):
 class LogErrorRequest(BaseModel):
     error_message: str
     error_traceback: Optional[str] = None
+
+
+class StragglerLevelRequest(BaseModel):
+    level: int
+
+
+class StragglerPollRequest(BaseModel):
+    level: int
+    rollout: int
+    health: str
 
 
 class MetricsBuffer:
@@ -127,6 +138,7 @@ class MetricsService:
         self.metrics_buffer = MetricsBuffer()
         self._rollout_handle_task: asyncio.Task[Any] | None = None
         self._sglang_exporter = SGLangMetricsExporter(self._discover_sglang_engines)
+        self._straggler = ControlState()
         self._adapters = {}
 
         if getattr(config, "use_tensorboard", False):
@@ -371,6 +383,29 @@ class MetricsService:
             "adapters": list(self._adapters.keys()),
             "wandb_enabled": self._use_wandb,
         }
+
+    @app.get("/straggler")
+    async def straggler_page(self) -> HTMLResponse:
+        """Page to switch the straggler profiler's level while training
+        runs."""
+        return HTMLResponse(CONTROL_PAGE)
+
+    @app.get("/straggler/control")
+    async def straggler_state(self) -> Dict[str, Any]:
+        return self._straggler.state()
+
+    @app.post("/straggler/control")
+    async def request_straggler_level(self, request: StragglerLevelRequest) -> Dict[str, Any]:
+        try:
+            return self._straggler.request(request.level)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/straggler/poll")
+    async def poll_straggler_level(self, request: StragglerPollRequest) -> Dict[str, Any]:
+        """The primary rank reports the level in effect and reads the requested
+        one."""
+        return self._straggler.poll(request.model_dump())
 
     @app.get("/query_metrics")
     async def query_metrics(self, step: Optional[int] = None) -> Dict[str, Any]:

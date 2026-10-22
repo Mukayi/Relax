@@ -136,3 +136,11 @@ def test_recovery_is_logged_as_warning(captured):
     clean = [_row(fwd=100.0, bwd=200.0, tokens=1000.0) for _ in range(4)]
     reporter.log_straggler_window(_args(), analyze_window(clean, _meta(4), config, state))
     assert len(warnings) == 1 and "recovered from slow_device" in warnings[0]
+
+
+def test_a_paused_window_logs_one_line_instead_of_a_summary(captured):
+    warnings, infos = captured
+    report = WindowReport(metrics={"straggler/control/level": 0.0}, alerts=[], rows=[], note="paused")
+    report.first_rollout, report.last_rollout = 10, 19
+    reporter.log_straggler_window(_args(), report)
+    assert warnings == [] and infos == ["[straggler] step=19 paused: rollouts 10-19 not analyzed"]

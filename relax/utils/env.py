@@ -234,6 +234,10 @@ class Envs(metaclass=_EnvsMeta):
     # off without either), newest TRACE_KEEP files kept.
     RELAX_STRAGGLER_TRACE_DIR = EnvProperty("RELAX_STRAGGLER_TRACE_DIR", str, "")
     RELAX_STRAGGLER_TRACE_KEEP = EnvProperty("RELAX_STRAGGLER_TRACE_KEEP", int, 50)
+    # Level at start (0 paused, 1 coarse, 2 detail; -1: detail with a trace directory, else coarse), and
+    # how often the primary rank polls the metrics service for a level change.
+    RELAX_STRAGGLER_LEVEL = EnvProperty("RELAX_STRAGGLER_LEVEL", int, -1)
+    RELAX_STRAGGLER_CONTROL_POLL_S = EnvProperty("RELAX_STRAGGLER_CONTROL_POLL_S", float, 5.0)
 
     # ------------- DeepSeek-V4 MXFP4 QAT -------------
     # Used only by relax.models.deepseek_v4.provider.model_provider;

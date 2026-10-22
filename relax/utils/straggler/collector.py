@@ -28,6 +28,7 @@ from time import perf_counter, time
 from typing import Any, Callable
 
 from relax.utils.logging_utils import get_logger
+from relax.utils.straggler.control import LEVELS
 from relax.utils.straggler.detector import DetectorConfig, DetectorState, RankMeta, WindowReport, analyze_window
 from relax.utils.straggler.health import HEALTH_DISABLE, HealthConfig, ProfilerHealth
 from relax.utils.straggler.stats import (
@@ -57,6 +58,7 @@ _GC_INDEX = FIELD_INDEX["gc"]
 _DROPPED_INDEX = FIELD_INDEX["dropped"]
 _ERRORS_INDEX = FIELD_INDEX["errors"]
 _HEALTH_INDEX = FIELD_INDEX["health"]
+_CONTROL_INDEX = FIELD_INDEX["control"]
 _MB_FWD_MAX_INDEX = FIELD_INDEX["mb_fwd_max"]
 _MB_FWD_MIN_INDEX = FIELD_INDEX["mb_fwd_min"]
 _MB_BWD_MAX_INDEX = FIELD_INDEX["mb_bwd_max"]
@@ -92,6 +94,7 @@ class _WindowJob:
     gather_ms: float = 0.0
     ready: WindowReport | None = None
     traces: list[RankTrace | None] | None = None
+    level: int = 1
 
 
 @dataclass
@@ -144,11 +147,18 @@ class StragglerCollector:
         gather_to: GatherToFn | None = None,
         trace_sink: TraceSink | None = None,
         max_trace_brackets: int = 4096,
+        level: int = 1,
+        level_request: Callable[[], int | None] = lambda: None,
     ) -> None:
         if report_interval < 1:
             raise ValueError(
                 f"straggler report_interval must be >= 1, got {report_interval}: a window closes every "
                 "report_interval rollouts. Set RELAX_STRAGGLER_REPORT_INTERVAL to a positive integer."
+            )
+        if not 0 <= level < len(LEVELS):
+            raise ValueError(
+                f"straggler level must be one of 0..{len(LEVELS) - 1} ({', '.join(LEVELS)}), got {level}. "
+                "Set RELAX_STRAGGLER_LEVEL accordingly."
             )
         self.rank_meta = rank_meta
         self.is_primary = is_primary
@@ -168,6 +178,11 @@ class StragglerCollector:
         self._step_numbers = dict.fromkeys(_NUMBERED, 0)
         self._next_tokens = -1.0
         self._trace_enabled = trace
+        self.level = self._usable(level)
+        # Plain attribute because ``record_event`` checks it on every bracket.
+        self._paused = self.level == 0
+        # Primary rank: the level the operator asks for, ``None`` without a request.
+        self._level_request = level_request
         self._synchronize = synchronize
         self._gather_to = gather_to
         self._trace_sink = trace_sink
@@ -226,7 +241,7 @@ class StragglerCollector:
         disabled, and during CUDA graph capture, where ``elapsed_time`` would
         be meaningless on replay.
         """
-        if self._disabled or self._is_capturing():
+        if self._disabled or self._paused or self._is_capturing():
             return None
         if not self._step_open:
             self._step_open = True
@@ -428,6 +443,8 @@ class StragglerCollector:
         self._window.set("unread", float(len(self._pending)))
         self._window.set("errors", errors)
         self._window.set("health", code)
+        self._window.set("control", self._control_code())
+        level = self.level
         try:
             started = self._clock()
             table = self._gather_window(code)
@@ -436,15 +453,59 @@ class StragglerCollector:
             gathered = self._clock()
             if self._handle_switch_off(table, closed_wall):
                 return
-            traces = self._gather_traces() if self._trace_enabled and not self._disabled else None
+            traces = self._gather_traces() if level == 2 and not self._disabled else None
             # A switched-off primary has already stopped its worker, so there
-            # is nothing to analyse.
+            # is nothing to analyse; a paused window recorded nothing.
             if self.is_primary and not self._disabled:
-                self._submit(
-                    self._job(table, closed_wall=closed_wall, gather_ms=(gathered - started) * 1e3, traces=traces)
-                )
+                if level == 0:
+                    paused = WindowReport(metrics={"straggler/control/level": 0.0}, alerts=[], rows=[], note="paused")
+                    self._submit(self._job(None, closed_wall=closed_wall, ready=paused))
+                else:
+                    gather_ms = (gathered - started) * 1e3
+                    self._submit(
+                        self._job(table, closed_wall=closed_wall, gather_ms=gather_ms, traces=traces, level=level)
+                    )
+            requested = int(max(row[_CONTROL_INDEX] for row in table)) - 1
+            if requested >= 0:
+                self._set_level(requested)
         finally:
             self._reset_window()
+
+    def _control_code(self) -> float:
+        """This window's ``control`` field: the level the operator asks for,
+        plus one, on the primary rank; 0 everywhere else or without a
+        request."""
+        if not self.is_primary:
+            return 0.0
+        try:
+            requested = self._level_request()
+        except Exception as exc:
+            self.on_error("control", exc)
+            return 0.0
+        return 0.0 if requested is None else float(requested + 1)
+
+    def _usable(self, level: int) -> int:
+        """Detail needs somewhere to write the trace; without it, coarse."""
+        return 1 if level == 2 and not self._trace_enabled else level
+
+    def _set_level(self, level: int) -> None:
+        """Switch every rank to ``level`` from the next window on."""
+        level = self._usable(level)
+        if level == self.level or not 0 <= level < len(LEVELS):
+            return
+        if self.is_primary:
+            logger.info(
+                "[straggler] level %s -> %s from rollout %d on",
+                LEVELS[self.level],
+                LEVELS[level],
+                self._window_last_rollout + 1,
+            )
+        self.level = level
+        self._paused = level == 0
+
+    def status(self) -> dict[str, Any]:
+        """What the primary rank reports to the control page."""
+        return {"level": self.level, "rollout": self._window_last_rollout, "health": self.health.state}
 
     def _gather_traces(self) -> list[RankTrace | None] | None:
         """Hand this window's sample to the primary rank: every rank joins the
@@ -560,7 +621,7 @@ class StragglerCollector:
         self._window.reset()
         self.window_start_wall = self._wall()
         self._window_first_rollout = None
-        self._trace_next = self._trace_enabled and not self._disabled and self._primary_rank is not None
+        self._trace_next = self.level == 2 and not self._disabled and self._primary_rank is not None
 
     def _job(self, table: list[list[float]] | None, **kwargs: Any) -> _WindowJob:
         first = self._window_first_rollout
@@ -609,6 +670,7 @@ class StragglerCollector:
                 return
             report.metrics["straggler/gather_ms"] = job.gather_ms
             report.metrics["straggler/analyze_ms"] = (self._clock() - started) * 1e3
+            report.metrics["straggler/control/level"] = float(job.level)
             report.window_start_wall = job.window_start_wall
             if job.traces is not None and self._trace_sink is not None:
                 try:

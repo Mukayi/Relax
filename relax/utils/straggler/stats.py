@@ -57,9 +57,10 @@ MICRO_BATCH_FIELDS: tuple[str, ...] = (
 )
 # Window-level status, not summed per step: event pairs still unread when the
 # window closed (their time lands in the next window), exceptions the profiler
-# caught on this rank during the window, and this rank's health code
-# (``health.HEALTH_*``; 2 asks every rank to switch the profiler off).
-STATUS_FIELDS: tuple[str, ...] = ("unread", "errors", "health")
+# caught on this rank during the window, this rank's health code
+# (``health.HEALTH_*``; 2 asks every rank to switch the profiler off), and the
+# level the primary rank asks every rank to switch to, plus one (0: no request).
+STATUS_FIELDS: tuple[str, ...] = ("unread", "errors", "health", "control")
 
 FIELDS: tuple[str, ...] = (
     GPU_SEGMENTS + PP_PHASE_FIELDS + CPU_FIELDS + COUNT_FIELDS + MICRO_BATCH_FIELDS + STATUS_FIELDS

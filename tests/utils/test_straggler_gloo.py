@@ -110,6 +110,7 @@ def _trace_worker(rank, world_size, init_file, out_dir):
             trace=True,
             gather_to=gather_to,
             trace_sink=sink,
+            level=2,
         )
         for rollout_id in range(3):
             bracket(collector)

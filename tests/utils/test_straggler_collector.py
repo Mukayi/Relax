@@ -288,7 +288,7 @@ def test_micro_batch_extremes_follow_the_slowest_forward_and_its_tokens():
     assert window.get("mb_fwd_min") == 1.0
 
 
-def _tracing_collector(world=2, interval=2, trace=True, primary=True, **kwargs):
+def _tracing_collector(world=2, interval=2, trace=True, primary=True, level=2, **kwargs):
     """A tracing collector for rank 0 (the primary unless ``primary`` is False)
     that records its synchronizes, trace gathers and sink calls."""
     calls = {"sync": 0, "gathered": [], "sunk": []}
@@ -313,6 +313,7 @@ def _tracing_collector(world=2, interval=2, trace=True, primary=True, **kwargs):
         synchronize=synchronize,
         gather_to=gather_to,
         trace_sink=sink,
+        level=level,
         **kwargs,
     )
     return collector, calls
@@ -369,13 +370,45 @@ def test_a_sample_still_in_flight_at_the_close_is_dropped():
     assert len(collector._pool) == 2
 
 
-@pytest.mark.parametrize(("trace", "primary"), [(False, True), (True, False)])
-def test_nothing_is_sampled_without_tracing_or_without_a_primary_rank(trace, primary):
-    collector, calls = _tracing_collector(trace=trace, primary=primary)
+@pytest.mark.parametrize(("trace", "primary", "level"), [(False, True, 2), (True, False, 2), (True, True, 1)])
+def test_nothing_is_sampled_without_tracing_a_primary_rank_or_the_detail_level(trace, primary, level):
+    collector, calls = _tracing_collector(trace=trace, primary=primary, level=level)
     for rollout_id in range(4):
         bracket(collector)
         collector.end_step(rollout_id=rollout_id)
     assert calls == {"sync": 0, "gathered": [], "sunk": []}
+
+
+def test_a_paused_rank_records_nothing_and_its_windows_are_not_analyzed():
+    collector = _collector(world=1, interval=1, level=0)
+    bracket(collector)
+    assert collector.pending_events == 0
+    (report,) = collector.end_step(rollout_id=0)
+    assert (report.note, report.metrics) == ("paused", {"straggler/control/level": 0.0})
+    assert collector.detector_state.consecutive == {}
+
+
+def test_the_requested_level_travels_in_the_primary_row_and_applies_from_the_next_window():
+    collector = _collector(world=2, interval=1, level_request=lambda: 0)
+    bracket(collector)
+    (report,) = collector.end_step(rollout_id=0)
+    assert report.metrics["straggler/control/level"] == 1.0
+    assert collector.gather_calls[-1][FIELD_INDEX["control"]] == 1.0
+    assert collector.status() == {"level": 0, "rollout": 0, "health": "active"}
+    bracket(collector)
+    assert collector.pending_events == 0
+
+
+@pytest.mark.parametrize(("trace", "expected"), [(True, 2), (False, 1)])
+def test_every_rank_follows_the_level_in_the_primary_row_detail_needing_a_trace_dir(trace, expected):
+    def gather(values):
+        primary_row = list(values)
+        primary_row[FIELD_INDEX["control"]] = 3.0
+        return [primary_row, list(values)]
+
+    collector = _collector(world=2, interval=1, is_primary=False, gather=gather, trace=trace)
+    collector.end_step(rollout_id=0)
+    assert collector.level == expected
 
 
 def test_report_interval_must_be_positive():

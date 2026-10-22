@@ -25,7 +25,7 @@ env_vars:
 | `RELAX_STRAGGLER_RECOVER_WINDOWS` | int | 2 | 已告警的 rank 要连续多少个干净窗口才解除告警，避免告警反复开关；「不确定」的窗口不算干净；必须 ≥ 1。 |
 | `RELAX_STRAGGLER_GATHER_TIMEOUT_S` | float | 60.0 | profiler 专用 Gloo 组的超时（秒）。单次 gather 是几毫秒的 CPU 小张量汇聚；这个值只限制「有 rank 已经消失」时其余 rank 阻塞多久。 |
 
-开启后每个 actor 角色的进程启动时打一行 `Straggler profiler enabled: report_interval=… primary=… trace_dir=… meta=RankMeta(rank=…, dp=…, tp=…, pp=…, cp=…, ep=…, host=…, device=…, primary=…)`（`trace_dir=-` 表示不采样明细，见下文「采样步明细」）；critic / reference / `actor_fwd` 不跑训练步，不会被采样。
+开启后每个 actor 角色的进程启动时打一行 `Straggler profiler enabled: report_interval=… primary=… level=… control=… trace_dir=… meta=RankMeta(rank=…, dp=…, tp=…, pp=…, cp=…, ep=…, host=…, device=…, primary=…)`（`trace_dir=-` 表示不采样明细，见下文「采样步明细」）；critic / reference / `actor_fwd` 不跑训练步，不会被采样。
 
 ## 看什么
 
@@ -89,6 +89,7 @@ closed; their time lands in the next window
 | `straggler/uncertain/count`、`straggler/uncertain/rank`（无则 −1）、`straggler/uncertain/cause` | 「不确定」的 rank 数、第一个这样的 rank 及其原因。原因编码：0 none、1 dropped_events、2 unread_events、3 profiler_errors、4 no_peers、5 missing_tokens、6 no_wait_reference。 |
 | `straggler/recovered/count` | 本窗口解除告警的 rank 数。 |
 | `straggler/window/first_rollout`、`straggler/window/last_rollout` | 这组标量属于哪个窗口（它们通常随下一个 rollout 发出）。 |
+| `straggler/control/level` | 这个窗口的级别：0 paused、1 coarse、2 detail（见下文「运行中切换级别」）。 |
 | `straggler/latency/analyzed_ms` | 从窗口结束（gather 之前）到判定完成（告警日志此刻打出）的毫秒数。 |
 | `straggler/health/state`、`straggler/health/errors`、`straggler/health/degraded_ranks` | 分析器自身健康：各 rank 中最差的状态（0 active、1 degraded、2 disabled）、本窗口捕获的异常数、处于 degraded 的 rank 数。 |
 | `straggler/self_overhead_ms`、`straggler/gather_ms`、`straggler/analyze_ms`、`straggler/dropped_events`、`straggler/unread_events` | 工具自身开销：每步 drain 读事件的 CPU 时间；primary 上每窗口 gather 的耗时（首个窗口另含一次元数据 gather）；后台线程每窗口判定的耗时；因队列满被丢弃的事件对数（正常为 0）；窗口结束时尚未读到的事件对数（正常为 0）。 |
@@ -118,9 +119,25 @@ primary 自己的 CPU 侧计时（`Timer` 事件，例如 `actor_train` 和每�
 
 开销与限制：
 
-- 每个窗口多一次 GPU 同步（采样步开头）和一次只发往 primary 的 gather（每个区间 24 B）；生成和写文件在 primary 的后台线程。
+- 每个窗口多一次 GPU 同步（采样步开头）和一次只发往 primary 的 gather（每个区间 24 B）；生成和写文件在 primary 的后台线程。8 卡 A100、Qwen3-0.6B TP1×PP4×DP2（步时约 1.6 s）实测：训练线程上每个明细窗口多约 2 ms（同步约 0.4 ms、gather 约 1.3 ms、读偏移约 0.3 ms），默认窗口 10 个 rollout 时折合每步约 0.01%。
 - 跨卡对齐用的是各 rank 的墙钟（`time.time()`），跨机器时受 NTP 精度影响，误差看 `align_spread_ms`。
 - 阶段命名和气泡推算只适用于非交错 1F1B；VPP 和 `combined_1f1b` 下只看第 2 层。窗口只有 1 个 rollout 时，采样步可能在窗口结束时还没读完，这一窗口就没有明细。
+
+### 运行中切换级别
+
+| 级别 | 含义 |
+| --- | --- |
+| 0 `paused` | 不记录任何计时区间；窗口照常 gather（只带状态），但不做判定，告警的连续计数冻结，标量只有 `straggler/control/level` |
+| 1 `coarse` | 上面的窗口统计和判定 |
+| 2 `detail` | 再加采样步明细；需要明细的输出目录（见上一节），没有时按 `coarse` 运行 |
+
+启动级别由 `RELAX_STRAGGLER_LEVEL` 给出，默认有明细目录时为 2，否则为 1。开启 `--use-metrics-service` 时，primary 在一个守护线程上每 `RELAX_STRAGGLER_CONTROL_POLL_S`（默认 5）秒向 metrics service 询问一次。训练中途可以在浏览器打开 `http://<head 节点>:<Serve HTTP 端口>/metrics/straggler` 点按钮切换，也可以直接：
+
+```bash
+curl -X POST http://<head>:<port>/metrics/straggler/control -H 'Content-Type: application/json' -d '{"level": 0}'
+```
+
+请求的级别写进 primary 那一行的 `control` 字段，随下一次窗口 gather 发给所有 rank，所有 rank 从下一个窗口起一起切换，所以最多晚一个窗口加一次轮询间隔生效；页面上能看到当前生效的级别和最近一次轮询的时间。分析器因异常关闭后（见「分析器自身出错时」）不再响应切换；没开 metrics service 时级别固定为启动值。这些接口没有鉴权，和 metrics service 的其他接口一样只应在集群内访问。训练进程自己不开端口：页面和接口挂在 Relax 启动的 Ray Serve HTTP 服务上（head 节点，端口 8000），由 primary 主动轮询；从集群外访问需要自行转发这个端口。
 
 ## 覆盖范围
 
@@ -169,7 +186,7 @@ gather 本身失败时只有本 rank 知道。处理方式是**不退出集合�
 ## 开销
 
 - 每个 Megatron 计时点一对非阻塞的 `event.record()`（事件从池里复用）；每步末尾用 `event.query()` 惰性读取已完成的事件，不调用 `cuda.synchronize()`，耗时记在 `straggler/self_overhead_ms`。
-- 每 `REPORT_INTERVAL` 个 rollout 一次 Gloo `all_gather`，耗时记在 `straggler/gather_ms`。每个 rank 每窗口贡献 264 B（33 个 float64），与 micro-batch 数无关；由于是 `all_gather`，每个 rank 都会拿到 `N × 264 B` 的完整表，全作业每窗口合计接收 `N × (N−1) × 264 B`（不含 Gloo 协议开销）。首个窗口另有一次元数据汇聚，每个 rank 1 KiB。
+- 每 `REPORT_INTERVAL` 个 rollout 一次 Gloo `all_gather`，耗时记在 `straggler/gather_ms`。每个 rank 每窗口贡献 272 B（34 个 float64），与 micro-batch 数无关；由于是 `all_gather`，每个 rank 都会拿到 `N × 272 B` 的完整表，全作业每窗口合计接收 `N × (N−1) × 272 B`（不含 Gloo 协议开销）。首个窗口另有一次元数据汇聚，每个 rank 1 KiB。
 - 判定在 primary 的后台线程上跑，耗时记在 `straggler/analyze_ms`，复杂度 O(n log n)（n = 同 stage rank 数）：8 个 rank 每窗口几毫秒，2048 个 rank 的 CPU 基准约 35 ms。
 - 在 8×A100、Qwen3-0.6B DP8（step 约 1 s）上，逐项相加的最坏上界约 1.9 ms/step（约 0.19%），端到端开 / 关对比与 0 无法区分；开启后不新增同步调用，NCCL 与计算 kernel 的重叠比例不变。测量方法和各组数据见 [RFC #362](https://github.com/redai-studio/Relax/issues/362)。
 
@@ -189,5 +206,6 @@ gather 本身失败时只有本 rank 知道。处理方式是**不退出集合�
 - `relax/utils/straggler/health.py`：分析器自身的健康状态（active → degraded → disabled）。
 - `relax/utils/straggler/reporter.py`：指标 / timeline 输出（训练线程）与日志输出（后台线程）。
 - `relax/utils/straggler/trace.py`：采样步明细：把各 rank 的区间排成嵌套切片，写出 Perfetto 能打开的 JSON（在 primary 的后台线程）。
+- `relax/utils/straggler/control.py`：运行中切换级别：metrics service 一侧的状态、primary 上的轮询线程和控制页。
 - `relax/utils/straggler/runtime.py`：唯一接触加速器（经 `relax.utils.device`，CUDA / NPU 通用）、进程组和 Megatron 并行状态的模块；`StragglerProfiler` 负责每步在 `log_perf_data` 前后的上报。
-- 接线：`relax/backends/megatron/model.py`（`config.timers = straggler_timers(...)` 三处）、`relax/backends/megatron/actor.py`（`install_straggler_profiler`，每步 `_log_perf_data`）。
+- 接线：`relax/backends/megatron/model.py`（`config.timers = straggler_timers(...)` 三处）、`relax/backends/megatron/actor.py`（`install_straggler_profiler`，每步 `_log_perf_data`）、`relax/utils/metrics/service.py`（控制页和 `/straggler/*` 接口）。

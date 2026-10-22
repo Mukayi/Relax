@@ -18,6 +18,7 @@ from typing import Any, Callable
 
 from relax.utils.logging_utils import get_logger
 from relax.utils.straggler.collector import StragglerCollector
+from relax.utils.straggler.control import LEVELS, LevelPoller
 from relax.utils.straggler.detector import DetectorConfig, RankMeta, WindowReport
 from relax.utils.straggler.reporter import log_straggler_window, report_straggler_window
 from relax.utils.straggler.timers import StragglerTimers
@@ -71,7 +72,7 @@ def init_straggler_gather_group(timeout_s: float) -> None:
     than the training one.
 
     The generic Gloo group is shared with weight sync and other paths, so its
-    timeout cannot be lowered for this; a straggler gather is ``world × 264 B``
+    timeout cannot be lowered for this; a straggler gather is ``world × 272 B``
     of CPU copies (milliseconds), and a rank that vanished must not park the
     rest of the job for ``--distributed-timeout-minutes``. Every member of the
     default group must call this in the same order, so it runs on all ranks of
@@ -300,6 +301,7 @@ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None
     # on every other rank.
     is_primary = is_metrics_primary_rank()
     traces_to = trace_dir(args)
+    poller: LevelPoller | None = None
     collector = StragglerCollector(
         rank_meta=replace(local_rank_meta(), primary=is_primary),
         is_primary=is_primary,
@@ -319,16 +321,36 @@ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None
         synchronize=device_synchronize(),
         gather_to=gloo_gather_objects_to,
         trace_sink=partial(write_window_trace, traces_to, Envs.RELAX_STRAGGLER_TRACE_KEEP) if traces_to else None,
+        level=initial_level(bool(traces_to)),
+        # Read at window closes; the poller is created below, once there is a collector to report.
+        level_request=lambda: poller.requested if poller is not None else None,
     )
+    if is_primary and getattr(args, "use_metrics_service", False):
+        from relax.utils.utils import get_serve_url
+
+        poller = LevelPoller(
+            get_serve_url(route_prefix="/metrics"), collector.status, Envs.RELAX_STRAGGLER_CONTROL_POLL_S
+        )
     _PROFILER = StragglerProfiler(collector, args)
     logger.info(
-        "Straggler profiler enabled: report_interval=%d primary=%s trace_dir=%s meta=%s",
+        "Straggler profiler enabled: report_interval=%d primary=%s level=%s control=%s trace_dir=%s meta=%s",
         collector.report_interval,
         is_primary,
+        LEVELS[collector.level],
+        "metrics service" if poller is not None else "-",
         traces_to or "-",
         collector.rank_meta,
     )
     return _PROFILER
+
+
+def initial_level(trace_on: bool) -> int:
+    """The level a run starts at: ``RELAX_STRAGGLER_LEVEL``, else detail when
+    traces have somewhere to go and coarse otherwise."""
+    from relax.utils.env import Envs
+
+    level = Envs.RELAX_STRAGGLER_LEVEL
+    return level if level >= 0 else (2 if trace_on else 1)
 
 
 def _timers_for(collector: StragglerCollector, phase: str) -> StragglerTimers:

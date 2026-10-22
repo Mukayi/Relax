@@ -114,6 +114,11 @@ def log_straggler_window(args: Any, report: WindowReport) -> None:
     if _switched_off(report):
         logger.warning("[straggler] step=%d profiler switched off on every rank: %s", step, report.note)
         return
+    if report.note == "paused":
+        logger.info(
+            "[straggler] step=%d paused: rollouts %d-%d not analyzed", step, report.first_rollout, report.last_rollout
+        )
+        return
 
     for alert in report.alerts:
         if alert.new:
