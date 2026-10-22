@@ -88,7 +88,7 @@ closed; their time lands in the next window
 | `straggler/pp_stage_imbalance` | 各 PP stage 计算时间中位数的 `max/min`，与是否有慢 rank 无关。 |
 | `straggler/{pp_wait_fill,pp_wait_up,pp_wait_down,pp_wait_drain}/{max_ms,max_rank}` | 训练阶段的 `pp_recv` 按非交错 1F1B 的阶段拆开（ms/step）后的最大值和对应 rank：`fill` 是填充阶段等上游激活，`up` / `down` 是稳态阶段等上游激活 / 下游梯度，`drain` 是排空阶段等下游梯度。均衡的流水线在稳态不空等，所以 `up + down` 超出传输时间的部分就是多出来的气泡。上游 rank 在一步开头停顿时，整条流水线被往后推，体现在下游 stage 的 `fill` 上，稳态不变。只在开 PP 时输出；交错调度（VPP）的收发只计入 `pp_recv`。 |
 | `straggler/pp_bubble/ratio` | `pp_recv` 占该 rank 已计时训练时间（自身计算 + 等待 + `pp_send`）的比例，取各 PP stage 中位数的最大值；只在开 PP 时输出。 |
-| `straggler/micro_batch/{fwd_max_ms,fwd_max_rank,fwd_argmax,fwd_argmax_tokens,fwd_min_ms,bwd_max_ms,bwd_max_rank,tokens_max,tokens_min}` | 本窗口内单个训练 micro-batch 的极值（不按步平均）：最慢的前向及其 rank、它是所在 rollout 的第几个前向（从 0 起）及其 token 数（拿不到时为 −1）、最快的前向、最慢的反向及其 rank，以及单个 micro-batch 的最大 / 最小 token 数（没有 token 数时不输出）。 |
+| `straggler/micro_batch/{fwd_max_ms,fwd_max_rank,fwd_argmax,fwd_argmax_tokens,fwd_min_ms,bwd_max_ms,bwd_max_rank,tokens_max,tokens_min}` | 本窗口内单个训练 micro-batch 的极值（不按步平均）：最慢的前向及其 rank、它是所在 rollout 的第几个前向（从 0 起，VPP 下为 −1）及其 token 数（拿不到时为 −1）、最快的前向、最慢的反向及其 rank，以及单个 micro-batch 的最大 / 最小 token 数（没有 token 数时不输出）。 |
 | `straggler/gc/{median_ms,max_ms}` | Python GC 停顿。 |
 | `straggler/flagged/count`、`straggler/flagged/rank`（无则 −1）、`straggler/flagged/reason` | 告警状态。reason 编码：0 none、1 slow_device、2 data_imbalance、3 upstream_wait、4 cpu_bound、5 late_arrival。 |
 | `straggler/waiting/count` | 本窗口因上游 PP stage 慢而在等待的 rank 数。它们是被拖慢的，不是慢 rank，不计入 `flagged`。 |
@@ -106,31 +106,31 @@ closed; their time lands in the next window
 
 ### 采样步 trace（Perfetto）
 
-有 trace 目录时（见「开启」中的 `RELAX_STRAGGLER_TRACE_DIR`），从第二个窗口起，每个窗口的第一个 rollout（下称采样步）会被记录在真实时间轴上：这一步开头同步一次 GPU 并记录一个锚点事件，这一步里的每次计时都保留相对锚点的起止时间。窗口结束时，各 rank 把采样步的计时发给 primary（只发往 primary 的 `gather_object`），primary 在后台线程写出 `straggler_trace_rollout{N}.json`。文件是 Chrome trace 格式，用 [ui.perfetto.dev](https://ui.perfetto.dev) 打开。这个功能不需要 metrics service。
+有 trace 目录时（见「开启」中的 `RELAX_STRAGGLER_TRACE_DIR`），从第二个窗口起，每个窗口的第一个 rollout（下称采样步）会被记录在真实时间轴上：这一步开头同步一次 GPU 并记录一个锚点事件，这一步里的每次计时都保留相对锚点的起止时间。窗口结束时，各 rank 把采样步的计时发给 primary（只发往 primary 的 `gather_object`），primary 在后台线程写出 `straggler_trace_rollout{N}.json`。有 trace 目录时，所有 rank 每个窗口都参加这次 gather，没有采样步的 rank（第一个窗口、`paused` / `coarse` 级别、分析器关闭后）发送一个空条目，所以某个 rank 本地出错不会让各 rank 的集合通信错开。文件是 Chrome trace 格式，用 [ui.perfetto.dev](https://ui.perfetto.dev) 打开。这个功能不需要 metrics service。
 
 每个 rank 一行，按 (dp, pp, tp) 排序，同一条流水线的各 stage 相邻。行名包含该 rank 实测的 PP 等待，以及用它自己实测的前向、反向耗时推算的均衡 1F1B 气泡（`(PP − 1) × (平均 fwd + 平均 bwd)` × 优化器步数），两者之差就是多出来的气泡。最慢的 stage 推算值会大于实测值（差为负），这时看其他 stage 的差值。行内的切片按时间嵌套：
 
 | 层 | 内容 |
 | --- | --- |
 | 第 1 层（PP） | `busy`：连续的计算和通信；`bubble fill` / `up` / `down` / `drain`：PP 等待，按 1F1B 阶段命名，`waits_for` 写明在等上一个还是下一个 stage；`untimed`：超过 0.5 ms 且没有任何计时覆盖的时间（CPU 侧停顿） |
-| 第 2 层（fwd / bwd） | `busy` 里的 `F{i}` / `B{i}`（`i` 是 micro-batch 序号，前向带 token 数）、`send`、`grad sync`、`param gather`、`optimizer`；log-prob 阶段为 `lp F{i}` 等 |
-| 第 3 层（模块） | 只在 `modules` 级别出现：`F{i}` / `B{i}` 里每个 transformer 层的 attention 和 MLP（MoE 层记为 `moe`）的前向、反向，例如 `attn fwd L3`、`moe bwd L3`，参数带 `layer` 和 `micro_batch`；出现在 `B{i}` 里的前向是激活重计算，记为 `… (recompute)`；log-prob 阶段为 `lp attn fwd L3` 等 |
+| 第 2 层（fwd / bwd） | `busy` 里的 `F{i}` / `B{i}`（`i` 是 micro-batch 序号，VPP 下没有序号，记为 `F` / `B`；前向带 token 数）、`send`、`grad sync`（DP 梯度同步，即 Megatron 的 `all-grads-sync`；其他梯度同步用 Megatron 的计时器名，例如 `embedding-grads-all-reduce`）、`param gather`、`optimizer`；log-prob 阶段为 `lp F{i}` 等 |
+| 第 3 层（模块） | 只在 `modules` 级别出现：`F{i}` / `B{i}` 里每个 transformer 层的 attention 和 MLP（MoE 层记为 `moe`）的前向、反向，例如 `attn fwd L3`、`moe bwd L3`，参数带 `layer` 和 `micro_batch`（VPP 下没有 `micro_batch`）；MTP 层的层号从 1 重新开始，记为 `attn fwd MTP L1` 等，参数另带 `mtp`；出现在 `B{i}` 里的前向是激活重计算，记为 `… (recompute)`；log-prob 阶段为 `lp attn fwd L3` 等 |
 
 primary 自身的 CPU 侧计时（`Timer` 事件，例如 `actor_train` 和每个 micro-batch 的 `get_data_batch_*`，不含调用栈）单独一行 `primary CPU`；采样步结束时还没结束的计时不包括在内。
 
 | 指标 | 含义 |
 |------|------|
-| `straggler/trace/ranks`、`straggler/trace/lost` | 提供了 trace 的 rank 数；丢失的计时数（队列满被丢弃，或超出每步 4096 条普通计时、16384 条模块计时的上限） |
+| `straggler/trace/ranks`、`straggler/trace/lost` | 提供了 trace 的 rank 数；丢失的计时数（队列满被丢弃，或超出每步 4096 条普通计时、8192 条模块计时的上限；模块计时最多占计时队列的一半，被挤掉时只计在这里，不计入 `dropped_events`） |
 | `straggler/trace/module_brackets` | trace 中模块计时的条数，各 rank 求和（仅 `modules` 级别） |
-| `straggler/trace/align_spread_ms` | 同一 DP 组梯度同步的结束时刻在各 rank 墙钟上的最大差值，即跨卡对齐误差 |
+| `straggler/trace/align_spread_ms` | 同一 DP 组 DP 梯度同步（`all-grads-sync`）的结束时刻在各 rank 墙钟上的最大差值，即跨卡对齐误差 |
 | `straggler/trace/bubble_excess_ms_max`、`straggler/trace/bubble_excess_rank` | 实测 PP 等待超出均衡 1F1B 气泡的最大值及其 rank |
 
 开销与限制：
 
-- 每个窗口多一次 GPU 同步（采样步开头）和一次只发往 primary 的 gather（每条计时 24 B）；生成和写文件在 primary 的后台线程完成。在 8 卡 A100、Qwen3-0.6B TP1×PP4×DP2（步时约 1.6 s）上实测，训练线程每个窗口多约 2 ms（同步约 0.4 ms、gather 约 1.3 ms、读取时间偏移约 0.3 ms），按默认 10 个 rollout 一个窗口折算，每步约 0.01%。
+- 每个窗口多一次 GPU 同步（采样步开头）和一次只发往 primary 的 gather（每条计时 24 B）；生成和写文件在 primary 的后台线程完成。在 8 卡 A100、Qwen3-0.6B TP1×PP4×DP2（步时约 1.6 s）上实测，训练线程每个窗口多约 2 ms（同步约 0.4 ms、gather 约 1.3 ms、读取时间偏移约 0.3 ms），按默认 10 个 rollout 一个窗口折算，每步约 0.01%。有 trace 目录、但级别为 `coarse` 或 `paused` 时，每个窗口仍有这次 gather，每个 rank 只发一个空条目。
 - `modules` 级别只在采样步挂 hook，所有 rank 相同。同一配置下实测（每个 stage 7 层，每个 rank 每步约 250 条模块计时）：采样步的前向长 3–10%（小模型受 kernel 发射限制，hook 的 CPU 开销会显现出来），反向不变，步时仍在步间波动范围内；每个窗口读取模块计时多约 3.5 ms。窗口统计里包含这些略长的前向。CUDA graph 捕获期间不计时，被捕获的层没有模块切片。
 - 跨卡对齐依赖各 rank 的墙钟（`time.time()`），跨机器时受 NTP 精度影响，误差见 `align_spread_ms`。
-- 阶段命名和气泡推算只适用于非交错 1F1B；VPP 和 `combined_1f1b` 下只看第 2 层。窗口只有 1 个 rollout 时，采样步可能在窗口结束时还没读完，这个窗口就没有 trace。
+- 阶段命名和气泡推算只适用于非交错 1F1B；VPP 和 `combined_1f1b` 下只看第 2 层。VPP 下 `F` / `B` 和模块切片都没有 micro-batch 序号：交错调度里第 n 次调用不一定是第 n 个 micro-batch，Megatron 的反向调用也不带 micro-batch 和模型块的信息。窗口只有 1 个 rollout 时，采样步可能在窗口结束时还没读完，这个窗口就没有 trace。
 
 ### 运行中切换级别
 
@@ -159,7 +159,7 @@ curl -X POST http://<head>:8000/metrics/straggler/control -H 'Content-Type: appl
 | --- | --- |
 | `fwd` / `bwd` | 每个 micro-batch 的前向 / 反向（整体计时，不拆分到层） |
 | `pp_recv` / `pp_send` | PP 点对点通信（Megatron 的 9 个计时器名合并为 2 段，不区分是哪两个 rank 之间；非交错 1F1B 训练时，4 个接收计时器另按阶段和方向计入 `pp_wait_*`） |
-| `dp_grad_sync` | DP 梯度同步（4 个计时器名合并为 1 段，CP 组内和 DP 组内的部分分不开） |
+| `dp_grad_sync` | DP 梯度同步（4 个计时器名合并为 1 段，CP 组内和 DP 组内的部分分不开；采样步 trace 里 4 个计时器分开显示） |
 | `dp_param_gather` | 分布式优化器的参数 all-gather |
 | `optim` | 优化器各阶段（6 个计时器名） |
 
@@ -190,6 +190,8 @@ curl -X POST http://<head>:8000/metrics/straggler/control -H 'Content-Type: appl
 计时调用、读取计时、窗口 gather、判定和日志回调中的异常都会被捕获并计数，不会抛进训练循环。某个 rank 累计 3 次异常，或连续 3 个窗口有被丢弃的计时或异常，就会请求关闭分析器。这个请求写在该 rank 统计向量的 `health` 字段里随 gather 发出，所以所有 rank 看到同一张表，在同一个窗口一起关闭，不会出现某个 rank 单独退出、其他 rank 卡在下一次 gather 的情况。关闭后计时调用直接跳过，但该 rank **仍然参与每次窗口 gather**：它发送一个长度为 `NUM_FIELDS`、只有 `health` 为 2 的全零向量，所以集合通信的形状不变，关闭状态也会持续传给还没收到的 rank。
 
 gather 本身失败时只有失败的 rank 知道。它**不退出集合通信**：失败被计数，本窗口照常重置，下一个窗口照常发送统计向量（或关闭后的全零向量）。连续失败达到上限后，该 rank 在本地关闭并开始发送全零向量，其余 rank 在下一次成功的 gather 中读到 `health = 2`，在同一个窗口一起关闭。
+
+本地打包统计向量失败的 rank 照常参加 gather，只是发送一行 NaN，所有 rank 都跳过这个窗口。gather 成功、但某个 rank 在本地读表时出错，只有它跳过这个窗口：有 trace 目录时它照常参加随后的采样 gather（见「采样步 trace」），错过的级别切换在下一个窗口补上（primary 每个窗口都重复发送请求的级别）。两种情况都按一次异常计数。
 
 首个窗口的元数据汇聚只做一次、不重试：其余 rank 拿到元数据后每个窗口只做数值 gather，失败的 rank 单独重试会与它们的集合通信错位。所以失败的 rank 照常发送这个窗口的统计向量并把 `health` 设为 2，所有 rank 在这个窗口一起关闭。元数据汇聚只有一次集合通信，每个 rank 发送一个 1 KiB 的定长字节串；本地序列化失败或元数据超长的 rank 照常参与，只是发送一个空条目，所有 rank 都看到同一个缺失的条目，同样在这个窗口一起关闭。
 
