@@ -56,6 +56,7 @@ import numpy as np
 from relax.utils.straggler.stats import (
     FIELD_INDEX,
     GPU_SEGMENTS,
+    PP_PHASE_FIELDS,
     SELF_SEGMENTS,
     WAIT_SEGMENTS,
 )
@@ -277,6 +278,7 @@ class _Window:
     """One gathered window, per step, plus its raw window-level counters."""
 
     x: np.ndarray
+    raw: np.ndarray
     dropped: np.ndarray
     unread: np.ndarray
     errors: np.ndarray
@@ -289,17 +291,21 @@ class _Window:
     def col(self, name: str) -> np.ndarray:
         return self.x[:, FIELD_INDEX[name]]
 
+    def raw_col(self, name: str) -> np.ndarray:
+        """A window-level field (status, micro-batch extreme), not per step."""
+        return self.raw[:, FIELD_INDEX[name]]
+
 
 def _window(table: Sequence[Sequence[float]]) -> _Window:
-    x = np.asarray(table, dtype=np.float64)
-    raw = {name: x[:, FIELD_INDEX[name]].copy() for name in ("dropped", "unread", "errors", "health")}
-    # Everything else per step, so numbers stay comparable across intervals.
-    x = x / np.maximum(x[:, FIELD_INDEX["num_steps"]], 1.0)[:, None]
+    raw = np.asarray(table, dtype=np.float64)
+    # Summed fields per step, so numbers stay comparable across intervals.
+    x = raw / np.maximum(raw[:, FIELD_INDEX["num_steps"]], 1.0)[:, None]
     self_ms = sum(x[:, FIELD_INDEX[name]] for name in SELF_SEGMENTS)
     tokens = x[:, FIELD_INDEX["tokens"]]
     return _Window(
         x=x,
-        **raw,
+        raw=raw,
+        **{name: raw[:, FIELD_INDEX[name]].copy() for name in ("dropped", "unread", "errors", "health")},
         self_ms=self_ms,
         wait_ms=sum(x[:, FIELD_INDEX[name]] for name in WAIT_SEGMENTS),
         tokens=tokens,
@@ -563,6 +569,8 @@ def _row(
         "tokens": float(w.tokens[i]),
         "ms_per_ktok": float(w.per_ktok[i]),
         "gc_ms": float(w.col("gc")[i]),
+        "steady_ms": float(w.col("pp_wait_up")[i] + w.col("pp_wait_down")[i]),
+        "mb_fwd_max": float(w.raw_col("mb_fwd_max")[i]),
         "reason": reason,
         "uncertain": cause,
         **{name: float(w.col(name)[i]) for name in GPU_SEGMENTS},
@@ -628,6 +636,8 @@ def _metrics(
     metrics["straggler/pp_stage_imbalance"] = (
         float(max(stage_values) / min(stage_values)) if len(stage_values) > 1 else 1.0
     )
+    _pp_wait_metrics(metrics, w, meta)
+    _micro_batch_metrics(metrics, w, meta)
     metrics["straggler/self_overhead_ms"] = float(np.mean(w.col("overhead")))
     metrics["straggler/dropped_events"] = float(np.sum(w.dropped))
     metrics["straggler/unread_events"] = float(np.sum(w.unread))
@@ -635,6 +645,48 @@ def _metrics(
     metrics["straggler/health/errors"] = float(np.sum(w.errors))
     metrics["straggler/health/degraded_ranks"] = float(np.sum(w.health > 0))
     return metrics
+
+
+def _emit_max(metrics: dict[str, float], key: str, values: np.ndarray, meta: Sequence[RankMeta]) -> int | None:
+    """``{key}_ms`` / ``{key}_rank``: the largest value and its rank, whose
+    index is returned; nothing (``None``) when every value is zero."""
+    if not np.any(values > _EPS):
+        return None
+    worst = int(np.argmax(values))
+    metrics[f"{key}_ms"] = float(values[worst])
+    metrics[f"{key}_rank"] = float(meta[worst].rank)
+    return worst
+
+
+def _pp_wait_metrics(metrics: dict[str, float], w: _Window, meta: Sequence[RankMeta]) -> None:
+    """Per-phase PP waits and the bubble share of the timed training time;
+    nothing without PP."""
+    pp_recv = w.col("pp_recv")
+    if not np.any(pp_recv > _EPS):
+        return
+    for name in PP_PHASE_FIELDS:
+        _emit_max(metrics, f"straggler/{name}/max", w.col(name), meta)
+    ratio = pp_recv / np.maximum(w.self_ms + w.wait_ms + w.col("pp_send"), _EPS)
+    metrics["straggler/pp_bubble/ratio"] = float(
+        max(np.median(ratio[idx]) for idx in _group_indices(meta, lambda m: m.pp))
+    )
+
+
+def _micro_batch_metrics(metrics: dict[str, float], w: _Window, meta: Sequence[RankMeta]) -> None:
+    """Extremes of single training micro-batches over the window; nothing
+    without a training forward."""
+    slowest = _emit_max(metrics, "straggler/micro_batch/fwd_max", w.raw_col("mb_fwd_max"), meta)
+    if slowest is None:
+        return
+    fwd_min = w.raw_col("mb_fwd_min")
+    metrics["straggler/micro_batch/fwd_argmax"] = float(w.raw_col("mb_fwd_argmax")[slowest])
+    metrics["straggler/micro_batch/fwd_argmax_tokens"] = float(w.raw_col("mb_fwd_argmax_tokens")[slowest])
+    metrics["straggler/micro_batch/fwd_min_ms"] = float(np.min(fwd_min[fwd_min > _EPS]))
+    _emit_max(metrics, "straggler/micro_batch/bwd_max", w.raw_col("mb_bwd_max"), meta)
+    tokens_max, tokens_min = w.raw_col("mb_tokens_max"), w.raw_col("mb_tokens_min")
+    if np.any(tokens_max > 0):
+        metrics["straggler/micro_batch/tokens_max"] = float(np.max(tokens_max))
+        metrics["straggler/micro_batch/tokens_min"] = float(np.min(tokens_min[tokens_min > 0]))
 
 
 def analyze_window(

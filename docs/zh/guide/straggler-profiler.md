@@ -41,16 +41,16 @@ latest to grad-sync rank 0 by 13.4 ms (peers idle 45.9 ms), pp_stage_imbalance 1
 有告警时，某 rank 的 reason 变化的那个窗口打一条 WARNING，之后每个仍有告警的窗口打一张 INFO per-rank 表。每种 reason 都要连续 `PERSIST_WINDOWS` 个窗口才成立，要连续 `RECOVER_WINDOWS` 个干净窗口才解除（解除时再打一条 WARNING：`rank 5 (…) recovered from slow_device after 2 clean windows`）：
 
 ```text
-[straggler] step=29 rank 3 (rank3_dp3_tp0_pp0, host=…, gpu=3) reaches the DP grad-sync 195.6 ms/step
-after its DP peers (peers idle 201.4 ms/step = 21% of their compute, z=120.1) for 3 windows;
-its own GPU forward is 0.99x peers, gc 1.8 ms, cpu/gpu fwd 1.55x -> late_arrival (host-side stall)
+[straggler] step=29 rank 3 (rank3_dp3_tp0_pp0, host=…, gpu=3) reaches the DP grad-sync 197.4 ms/step
+after its DP peers (peers idle 203.3 ms/step = 22% of their compute, z=41.0) for 3 windows;
+its own GPU forward is 0.99x peers, gc 1.8 ms, cpu/gpu fwd 1.56x -> late_arrival (host-side stall)
 [straggler] step=29 per-rank window (ms/step):
- rank | tag               | host | device | self_ms | wait_ms | late_ms | tokens  | ms_per_ktok | gc_ms | reason       | uncertain
-    0 | rank0_dp0_tp0_pp0 | …    |      0 |   941.0 |     6.4 |     0.4 | 14802.1 |        63.6 |   1.8 | none         |
-    3 | rank3_dp3_tp0_pp0 | …    |      3 |   743.6 |     5.8 |   195.6 | 14592.7 |        51.0 |   1.8 | late_arrival |
+ rank | tag               | host | device | self_ms | wait_ms | late_ms | tokens  | ms_per_ktok | gc_ms | steady_ms | mb_fwd_max | reason       | uncertain
+    0 | rank0_dp0_tp0_pp0 | …    |      0 |   933.7 |     6.4 |     6.1 | 14802.1 |        63.1 |   1.8 |       0.0 |      157.8 | none         |
+    3 | rank3_dp3_tp0_pp0 | …    |      3 |   737.1 |     5.9 |   197.4 | 14592.7 |        50.5 |   1.8 |       0.0 |      148.0 | late_arrival |
 ```
 
-表里只列出 rank 0 和 rank 3，实际每个 rank 一行。
+表里只列出 rank 0 和 rank 3，实际每个 rank 一行。`steady_ms` 是稳态 PP 等待（`pp_wait_up + pp_wait_down`，这个例子没开 PP，所以为 0），`mb_fwd_max` 是本窗口最慢的单个前向（ms）。
 
 某个 rank 的窗口不足以下结论时，它被标为「不确定」并给出原因（原因变化时打一条 WARNING），而不是默默当作正常：
 
@@ -80,6 +80,9 @@ closed; their time lands in the next window
 | `straggler/late/max_ms`、`straggler/late/max_rank`、`straggler/late/peer_idle_ms` | 最晚到达 DP 梯度同步的 rank、晚了多少（按 `bwd + dp_grad_sync` 比较，见下文 `late_arrival`）、同组其他 rank 因此每步空转多久。 |
 | `straggler/tokens/{median,max,spread}` | 各 rank 每步 token 数的不均程度：`median` / `max` 为全局值，`spread` 为同 stage 内最大超出；任一 rank token 数为 0 时不输出。 |
 | `straggler/pp_stage_imbalance` | 各 PP stage 计算时间中位数的 `max/min`，与是否有慢 rank 无关。 |
+| `straggler/{pp_wait_fill,pp_wait_up,pp_wait_down,pp_wait_drain}/{max_ms,max_rank}` | 训练阶段的 `pp_recv` 按非交错 1F1B 的阶段拆开（ms/step）后的最大值及其 rank：`fill` 是填充阶段等上游激活，`up` / `down` 是稳态等上游激活 / 下游梯度，`drain` 是排空阶段等下游梯度。均衡的流水线在稳态不空闲，所以 `up + down` 超出传输时间的部分就是额外的气泡。上游 rank 在一步开头停顿，会把它所在的整条流水线往后推，体现在下游 stage 的 `fill` 上，稳态不变。只在开 PP 时输出；交错调度（VPP）的收发只计入 `pp_recv`。 |
+| `straggler/pp_bubble/ratio` | `pp_recv` 占该 rank 已计时训练时间（自身 + 等待 + `pp_send`）的比例，取各 PP stage 中位数里的最大值；只在开 PP 时输出。 |
+| `straggler/micro_batch/{fwd_max_ms,fwd_max_rank,fwd_argmax,fwd_argmax_tokens,fwd_min_ms,bwd_max_ms,bwd_max_rank,tokens_max,tokens_min}` | 本窗口内单个训练 micro-batch 的极值（不按步平均）：最慢的前向及其 rank、它是所在 rollout 的第几个前向（从 0 起）和它的 token 数（没拿到时为 −1）、最快的前向、最慢的反向及其 rank，以及单个 micro-batch 的最大 / 最小 token 数（没有 token 数时不输出）。 |
 | `straggler/gc/{median_ms,max_ms}` | Python GC 停顿。 |
 | `straggler/flagged/count`、`straggler/flagged/rank`（无则 −1）、`straggler/flagged/reason` | 告警状态。reason 编码：0 none、1 slow_device、2 data_imbalance、3 upstream_wait、4 cpu_bound、5 late_arrival。 |
 | `straggler/waiting/count` | 本窗口因上游 PP stage 慢而在等的 rank 数（被上游拖慢，不是慢 rank；不计入 `flagged`）。 |
@@ -101,7 +104,7 @@ closed; their time lands in the next window
 | 覆盖 | 内容 |
 | --- | --- |
 | `fwd` / `bwd` | 每个 micro-batch 的前向 / 反向（整块，不含层内拆分） |
-| `pp_recv` / `pp_send` | PP 点对点通信（9 个上游名字并入 2 段，不区分方向与级次） |
+| `pp_recv` / `pp_send` | PP 点对点通信（9 个上游名字并入 2 段，不区分级次；非交错 1F1B 训练时的 4 个接收名字另按阶段和方向计入 `pp_wait_*`） |
 | `dp_grad_sync` | DP 梯度同步（4 个上游名字并入 1 段，CP 组内与 DP 组内不可分） |
 | `dp_param_gather` | 分布式优化器的参数 all-gather |
 | `optim` | 优化器各阶段（6 个上游名字） |
@@ -111,7 +114,7 @@ closed; their time lands in the next window
 - **attention、MoE、head/logits、MTP 的内部**。上游 Megatron 在这些模块里没有任何计时点，
   所以现在只能看到它们被包含在 `fwd` / `bwd` 里，无法单独归因。要在这些粒度上定位，
   需要新增挂点——这属于后续工作，当前版本不提供。
-- **EP all-to-all**（MoE 专家并行的通信）。它属于「等 peer」类，目前混在计算段里。
+- **EP all-to-all**（MoE 专家并行的通信）。它属于「等 peer」类，混在计算段里。
 - **真实的通算重叠比例**。`dp_grad_sync` 变小**不能**直接读成「重叠更好」——它是「等待段之和」，
   是代理量，不是重叠率本身。
 
@@ -136,12 +139,12 @@ closed; their time lands in the next window
 
 计时调用、读事件、窗口 gather、判定、日志回调里的异常都被捕获并计数，不会抛进训练循环。某个 rank 累计 3 次异常，或连续 3 个窗口有丢弃的事件对或异常，就请求关闭分析器。这个请求放在该 rank 的窗口向量里（`health` 字段）一起 gather，所以所有 rank 看到同一张表，在同一个窗口一起关闭，不会有 rank 单独退出而让其他 rank 卡在下一次 gather 里。关闭后计时调用直接跳过，但该 rank **仍然参与每次窗口 gather**：它发一个长度为 `NUM_FIELDS` 的全零行，只把 `health` 写成 2，因此集合通信的形状不变，关闭状态也会持续传给还没看到的 rank。
 
-gather 本身失败时只有本 rank 知道。现在的处理是**不退出集合通信**：失败被计数，本次窗口照常重置，下一次窗口仍发一行（正常行或上面的空行）。持续失败达到上限后该 rank 本地关闭并开始发空行，其余 rank 在下一个能完成的 gather 里读到 `health = 2`，在同一个窗口一起关闭。首个窗口的元数据汇聚只做一次、不重试：其余 rank 拿到元数据后每个窗口只做数值 gather，失败的 rank 单独重试会和它们的集合通信错位，所以它照常发这一窗口的行并把 `health` 写成 2，所有 rank 在这个窗口一起关闭。元数据汇聚本身只有一次集合通信，每个 rank 发一个 1 KiB 的定长字节行：本地序列化元数据失败、或元数据超长的 rank 照常参与，只是发一个空行，所有 rank 收到后看到同一个缺失的条目，同样在这个窗口一起关闭。为了让「某 rank 进程真的消失」这种发不出任何东西的情形有界，profiler 在安装时给这类 gather 单独建一个 Gloo 组，超时由 `RELAX_STRAGGLER_GATHER_TIMEOUT_S`（默认 60 s）控制，不影响通用 Gloo 组和训练路径的超时。**已知限制**：单次 gather 会因为组超时而阻塞到该超时；如果整个组都失联，所有 rank 都只能各自本地关闭，没有跨 rank 的传播。
+gather 本身失败时只有本 rank 知道。处理方式是**不退出集合通信**：失败被计数，本次窗口照常重置，下一次窗口仍发一行（正常行或上面的空行）。持续失败达到上限后该 rank 本地关闭并开始发空行，其余 rank 在下一个能完成的 gather 里读到 `health = 2`，在同一个窗口一起关闭。首个窗口的元数据汇聚只做一次、不重试：其余 rank 拿到元数据后每个窗口只做数值 gather，失败的 rank 单独重试会和它们的集合通信错位，所以它照常发这一窗口的行并把 `health` 写成 2，所有 rank 在这个窗口一起关闭。元数据汇聚本身只有一次集合通信，每个 rank 发一个 1 KiB 的定长字节行：本地序列化元数据失败、或元数据超长的 rank 照常参与，只是发一个空行，所有 rank 收到后看到同一个缺失的条目，同样在这个窗口一起关闭。为了让「某 rank 进程真的消失」这种发不出任何东西的情形有界，profiler 在安装时给这类 gather 单独建一个 Gloo 组，超时由 `RELAX_STRAGGLER_GATHER_TIMEOUT_S`（默认 60 s）控制，不影响通用 Gloo 组和训练路径的超时。**已知限制**：单次 gather 会因为组超时而阻塞到该超时；如果整个组都失联，所有 rank 都只能各自本地关闭，没有跨 rank 的传播。
 
 ## 开销
 
 - 每个 Megatron 计时点一对非阻塞的 `event.record()`（事件从池里复用）；每步末尾用 `event.query()` 惰性读取已完成的事件，不调用 `cuda.synchronize()`，耗时记在 `straggler/self_overhead_ms`。
-- 每 `REPORT_INTERVAL` 个 rollout 一次 Gloo `all_gather`，耗时记在 `straggler/gather_ms`。每个 rank 每窗口贡献 168 B（21 个 float64），与 micro-batch 数无关；由于是 `all_gather`，每个 rank 都会拿到 `N × 168 B` 的完整表，全作业每窗口合计接收 `N × (N−1) × 168 B`（不含 Gloo 协议开销）。首个窗口另有一次元数据汇聚，每个 rank 1 KiB。
+- 每 `REPORT_INTERVAL` 个 rollout 一次 Gloo `all_gather`，耗时记在 `straggler/gather_ms`。每个 rank 每窗口贡献 264 B（33 个 float64），与 micro-batch 数无关；由于是 `all_gather`，每个 rank 都会拿到 `N × 264 B` 的完整表，全作业每窗口合计接收 `N × (N−1) × 264 B`（不含 Gloo 协议开销）。首个窗口另有一次元数据汇聚，每个 rank 1 KiB。
 - 判定在 primary 的后台线程上跑，耗时记在 `straggler/analyze_ms`，复杂度 O(n log n)（n = 同 stage rank 数）：8 个 rank 每窗口几毫秒，2048 个 rank 的 CPU 基准约 35 ms。
 - 在 8×A100、Qwen3-0.6B DP8（step 约 1 s）上，逐项相加的最坏上界约 1.9 ms/step（约 0.19%），端到端开 / 关对比与 0 无法区分；开启后不新增同步调用，NCCL 与计算 kernel 的重叠比例不变。测量方法和各组数据见 [RFC #362](https://github.com/redai-studio/Relax/issues/362)。
 

@@ -68,7 +68,7 @@ def _collector(world=2, gather=None, **kwargs):
 def test_drain_error_never_reaches_training_and_is_counted_in_the_window():
     collector = _collector()
     bracket(collector)
-    _, start, _, _ = collector._pending[0]
+    _, _, start, _, _, _, _ = collector._pending[0]
 
     def boom(other):
         raise RuntimeError("device error")
@@ -153,7 +153,7 @@ def test_repeated_drain_errors_escalate_to_disable_across_windows():
         raise RuntimeError("device error")
 
     bracket(collector)
-    collector._pending[0][1].elapsed_time = boom
+    collector._pending[0][2].elapsed_time = boom
     collector.end_step(rollout_id=0)  # 1 error -> degraded
     assert not collector.disabled
     collector.end_step(rollout_id=1)  # same pair fails again -> 2 errors -> disable requested and applied

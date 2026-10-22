@@ -4,7 +4,13 @@
 import pytest
 
 from relax.utils.straggler import timers as timers_module
-from relax.utils.straggler.stats import FIELD_INDEX, FORWARD_ONLY_TIMER_SEGMENTS, MEGATRON_TIMER_SEGMENTS
+from relax.utils.straggler.stats import (
+    FIELD_INDEX,
+    FORWARD_ONLY_TIMER_SEGMENTS,
+    MEGATRON_TIMER_SEGMENTS,
+    PP_PHASE_FIELDS,
+    PP_PHASE_TIMERS,
+)
 from relax.utils.straggler.timers import EventPool, StragglerTimers, _NullTimer, _SegmentTimer
 from tests.utils.straggler_helpers import FakeEvent
 
@@ -34,8 +40,8 @@ class _FakeSink:
         self.discarded.append(event)
         self.pool.release(event)
 
-    def push(self, segment_index, start_event, end_event, cpu_ms):
-        self.pushed.append((segment_index, start_event, end_event, cpu_ms))
+    def push(self, segment_index, phase_index, start_event, end_event, cpu_ms):
+        self.pushed.append((segment_index, phase_index, start_event, end_event, cpu_ms))
 
 
 def test_event_pool_reuses_released_events_and_grows_when_empty():
@@ -63,10 +69,29 @@ def test_segment_timer_start_stop_pushes_pair_with_segment_index():
     timers("backward-compute").start(barrier=True)
     timers("backward-compute").stop(barrier=True)
     assert len(sink.pushed) == 1
-    segment_index, start, end, cpu_ms = sink.pushed[0]
+    segment_index, phase_index, start, end, cpu_ms = sink.pushed[0]
     assert segment_index == FIELD_INDEX["bwd"]
+    assert phase_index == -1
     assert start.elapsed_time(end) == 1.0
     assert cpu_ms >= 0.0
+
+
+def test_training_pp_recv_names_carry_their_1f1b_phase():
+    sink = _FakeSink()
+    timers = StragglerTimers(sink, MEGATRON_TIMER_SEGMENTS, PP_PHASE_TIMERS)
+    names = [*PP_PHASE_TIMERS, "forward-send-forward-recv"]
+    for name in names:
+        timers(name).start()
+        timers(name).stop()
+    pushed = [(segment_index, phase_index) for segment_index, phase_index, *_ in sink.pushed]
+    assert pushed == [(FIELD_INDEX["pp_recv"], FIELD_INDEX[PP_PHASE_TIMERS[name]]) for name in PP_PHASE_TIMERS] + [
+        (FIELD_INDEX["pp_recv"], -1)
+    ]
+
+
+def test_phase_timers_are_training_pp_recv_names_covering_every_phase_once():
+    assert {MEGATRON_TIMER_SEGMENTS[name] for name in PP_PHASE_TIMERS} == {"pp_recv"}
+    assert sorted(PP_PHASE_TIMERS.values()) == sorted(PP_PHASE_FIELDS)
 
 
 def test_segment_timer_tolerates_double_start_and_stop_without_start():

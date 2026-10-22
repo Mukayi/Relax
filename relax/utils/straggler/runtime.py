@@ -60,7 +60,7 @@ def init_straggler_gather_group(timeout_s: float) -> None:
     than the training one.
 
     The generic Gloo group is shared with weight sync and other paths, so its
-    timeout cannot be lowered for this; a straggler gather is ``world × 168 B``
+    timeout cannot be lowered for this; a straggler gather is ``world × 264 B``
     of CPU copies (milliseconds), and a rank that vanished must not park the
     rest of the job for ``--distributed-timeout-minutes``. Every member of the
     default group must call this in the same order, so it runs on all ranks of
@@ -271,3 +271,13 @@ def straggler_timers(phase: str) -> StragglerTimers | None:
     """The ``config.timers`` value for ``phase``: ``None`` without a profiler,
     which is what Relax assigns anyway."""
     return _timers_for(_PROFILER.collector, phase) if _PROFILER is not None else None
+
+
+def note_microbatch_tokens(total_lengths: Any) -> None:
+    """Report the sample lengths of the training micro-batch whose forward
+    bracket is open; a no-op without a profiler.
+
+    Only a host-side list is summed: summing a device tensor would synchronize.
+    """
+    if _PROFILER is not None and isinstance(total_lengths, (list, tuple)):
+        _PROFILER.collector.note_tokens(int(sum(total_lengths)))

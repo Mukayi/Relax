@@ -30,6 +30,9 @@ GPU_SEGMENTS: tuple[str, ...] = (
     "lp_pp_recv",
     "lp_pp_send",
 )
+# The training-phase ``pp_recv`` split by the 1F1B phase of each bracket (ms,
+# summed over the window); ``pp_recv`` keeps the total. See PP_PHASE_TIMERS.
+PP_PHASE_FIELDS: tuple[str, ...] = ("pp_wait_fill", "pp_wait_up", "pp_wait_down", "pp_wait_drain")
 # CPU wall time (ms) of the same fwd / bwd brackets, and Python GC pauses that
 # happened while a step was in flight.
 CPU_FIELDS: tuple[str, ...] = ("cpu_fwd", "cpu_bwd", "gc")
@@ -37,13 +40,30 @@ CPU_FIELDS: tuple[str, ...] = ("cpu_fwd", "cpu_bwd", "gc")
 # steps in the window, event pairs dropped because the pending queue was full,
 # and the collector's own CPU cost (ms) spent draining events.
 COUNT_FIELDS: tuple[str, ...] = ("tokens", "num_fwd", "num_steps", "dropped", "overhead")
+# Window-level extremes over single training micro-batches, not summed per
+# step: the slowest and fastest fwd / bwd bracket (ms), which forward of its
+# step the slowest one was (from 0) and its token count (-1 when the training
+# forward_step did not report one), and the largest and smallest token counts.
+# A minimum, or a token extreme, of 0 means no sample.
+MICRO_BATCH_FIELDS: tuple[str, ...] = (
+    "mb_fwd_max",
+    "mb_fwd_min",
+    "mb_bwd_max",
+    "mb_bwd_min",
+    "mb_fwd_argmax",
+    "mb_fwd_argmax_tokens",
+    "mb_tokens_max",
+    "mb_tokens_min",
+)
 # Window-level status, not summed per step: event pairs still unread when the
 # window closed (their time lands in the next window), exceptions the profiler
 # caught on this rank during the window, and this rank's health code
 # (``health.HEALTH_*``; 2 asks every rank to switch the profiler off).
 STATUS_FIELDS: tuple[str, ...] = ("unread", "errors", "health")
 
-FIELDS: tuple[str, ...] = GPU_SEGMENTS + CPU_FIELDS + COUNT_FIELDS + STATUS_FIELDS
+FIELDS: tuple[str, ...] = (
+    GPU_SEGMENTS + PP_PHASE_FIELDS + CPU_FIELDS + COUNT_FIELDS + MICRO_BATCH_FIELDS + STATUS_FIELDS
+)
 FIELD_INDEX: Mapping[str, int] = {name: index for index, name in enumerate(FIELDS)}
 NUM_FIELDS: int = len(FIELDS)
 
@@ -96,6 +116,21 @@ MEGATRON_TIMER_SEGMENTS: Mapping[str, str] = {
     "optimizer-copy-main-to-model-params": "optim",
 }
 
+# Megatron timer name -> PP_PHASE_FIELDS entry, training phase only. In the
+# non-interleaved 1F1B schedules (Megatron's and Relax's streaming one) the
+# warmup only calls recv_forward, the steady state only the two combined
+# send / recv calls and the cooldown only recv_backward, so the name gives the
+# phase and the neighbour waited for: ``up`` waits for the previous stage's
+# activations, ``down`` for the next stage's gradients. A balanced pipeline does
+# not idle in the steady state, so ``up + down`` beyond the transfer time is
+# extra bubble. The interleaved schedule's names count in ``pp_recv`` only.
+PP_PHASE_TIMERS: Mapping[str, str] = {
+    "forward-recv": "pp_wait_fill",
+    "backward-send-forward-recv": "pp_wait_up",
+    "forward-send-backward-recv": "pp_wait_down",
+    "backward-recv": "pp_wait_drain",
+}
+
 # Same call sites during ``forward_only`` land in their own buckets so a slow
 # log-prob pass does not pollute the training-step numbers.
 FORWARD_ONLY_TIMER_SEGMENTS: Mapping[str, str] = {
@@ -122,6 +157,18 @@ class WindowStats:
 
     def add_index(self, index: int, value: float) -> None:
         self.values[index] += value
+
+    def max_index(self, index: int, value: float) -> bool:
+        """Keep the larger value; True when ``value`` is the new maximum."""
+        if value > self.values[index]:
+            self.values[index] = value
+            return True
+        return False
+
+    def min_index(self, index: int, value: float) -> None:
+        """Keep the smaller value, a stored 0 meaning no sample yet."""
+        if self.values[index] == 0.0 or value < self.values[index]:
+            self.values[index] = value
 
     def get(self, field: str) -> float:
         return self.values[FIELD_INDEX[field]]

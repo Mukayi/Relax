@@ -35,6 +35,8 @@ _TABLE_COLUMNS: tuple[str, ...] = (
     "tokens",
     "ms_per_ktok",
     "gc_ms",
+    "steady_ms",
+    "mb_fwd_max",
 )
 
 

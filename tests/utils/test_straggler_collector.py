@@ -9,8 +9,8 @@ import pytest
 
 from relax.utils.straggler import collector as collector_module
 from relax.utils.straggler.health import HEALTH_DISABLE
-from relax.utils.straggler.stats import FIELD_INDEX
-from tests.utils.straggler_helpers import bracket, make_collector, meta
+from relax.utils.straggler.stats import FIELD_INDEX, PP_PHASE_FIELDS
+from tests.utils.straggler_helpers import FakeEvent, bracket, make_collector, meta
 
 
 class _FakeCapture:
@@ -48,7 +48,7 @@ def test_drain_folds_completed_events_in_order_and_recycles_them():
     bracket(collector)
     bracket(collector, "backward-compute")
     # Hold the second pair back: its end event is "still running".
-    _, _, pending_end, _ = collector._pending[1]
+    _, _, _, pending_end, _, _, _ = collector._pending[1]
     pending_end.done = False
     assert collector.pending_events == 2
     assert collector.drain() == 1
@@ -71,7 +71,7 @@ def test_drain_stops_at_first_incomplete_pair_and_requires_both_events():
     bracket(collector, "backward-compute")
     # Pairs complete in stream order: an incomplete *start* of the first pair
     # blocks the (complete) second pair as well, so nothing is folded.
-    _, first_start, _, _ = collector._pending[0]
+    _, _, first_start, _, _, _, _ = collector._pending[0]
     first_start.done = False
     assert collector.drain() == 0
     assert collector.pending_events == 2
@@ -83,7 +83,7 @@ def test_drain_leaves_queue_consistent_when_readout_raises():
     collector = _collector(world=1)
     bracket(collector)
     bracket(collector, "backward-compute")
-    _, start, _, _ = collector._pending[1]
+    _, _, start, _, _, _, _ = collector._pending[1]
 
     def boom(other):
         raise RuntimeError("device error")
@@ -238,6 +238,52 @@ def test_forward_only_timers_land_in_lp_buckets():
     collector.drain()
     assert collector.window.get("lp_fwd") == 1.0
     assert collector.window.get("fwd") == 0.0
+
+
+def _timed(collector, name, ms, tokens=None):
+    """One bracket lasting ``ms`` fake milliseconds; ``tokens`` is reported
+    while it is open, as the training forward_step does."""
+    timer = collector.train_timers(name)
+    timer.start()
+    if tokens is not None:
+        collector.note_tokens(tokens)
+    for _ in range(ms - 1):
+        FakeEvent().record()
+    timer.stop()
+
+
+def test_training_pp_waits_are_also_split_by_1f1b_phase():
+    collector = _collector(world=1)
+    for name in ("forward-recv", "backward-send-forward-recv", "forward-send-backward-recv", "backward-recv"):
+        bracket(collector, name)
+    bracket(collector, "forward-send-forward-recv")  # interleaved schedule: total only
+    bracket(collector, "forward-recv", timers=collector.forward_only_timers)
+    collector.drain()
+    assert collector.window.get("pp_recv") == 5.0
+    assert [collector.window.get(name) for name in PP_PHASE_FIELDS] == [1.0, 1.0, 1.0, 1.0]
+    assert collector.window.get("lp_pp_recv") == 1.0
+
+
+def test_micro_batch_extremes_follow_the_slowest_forward_and_its_tokens():
+    collector = _collector(world=1, interval=10)
+    _timed(collector, "forward-compute", 3, tokens=300)
+    _timed(collector, "forward-compute", 7, tokens=900)
+    _timed(collector, "forward-compute", 2)
+    _timed(collector, "backward-compute", 5)
+    _timed(collector, "backward-compute", 4)
+    collector.end_step(rollout_id=0)
+    window = collector.window
+    assert (window.get("mb_fwd_max"), window.get("mb_fwd_min")) == (7.0, 2.0)
+    assert (window.get("mb_fwd_argmax"), window.get("mb_fwd_argmax_tokens")) == (1.0, 900.0)
+    assert (window.get("mb_bwd_max"), window.get("mb_bwd_min")) == (5.0, 4.0)
+    assert (window.get("mb_tokens_max"), window.get("mb_tokens_min")) == (900.0, 300.0)
+
+    # Numbering restarts every step; a forward without a reported count has -1 tokens.
+    _timed(collector, "forward-compute", 1)
+    _timed(collector, "forward-compute", 9)
+    collector.end_step(rollout_id=1)
+    assert (window.get("mb_fwd_argmax"), window.get("mb_fwd_argmax_tokens")) == (1.0, -1.0)
+    assert window.get("mb_fwd_min") == 1.0
 
 
 def test_report_interval_must_be_positive():

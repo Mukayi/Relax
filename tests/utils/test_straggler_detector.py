@@ -15,6 +15,7 @@ from relax.utils.straggler.detector import (
     _relative_and_z,
     analyze_window,
 )
+from relax.utils.straggler.stats import FIELD_INDEX
 from tests.utils.straggler_helpers import meta as _meta
 from tests.utils.straggler_helpers import row as _row
 
@@ -505,3 +506,77 @@ def test_detector_config_accepts_minimum_value_of_one_for_both():
 def test_detector_config_defaults_are_unchanged():
     cfg = DetectorConfig()
     assert cfg.persist_windows == 3 and cfg.recover_windows == 2
+
+
+def test_pp_waits_by_phase_and_the_bubble_ratio_come_with_pp():
+    table = [
+        _healthy_row(pp_recv=10.0, pp_wait_fill=4.0, pp_wait_up=6.0),
+        _healthy_row(pp_recv=10.0, pp_wait_fill=4.0, pp_wait_up=6.0),
+        _healthy_row(pp_recv=40.0, pp_wait_down=30.0, pp_wait_drain=10.0),
+        _healthy_row(pp_recv=10.0, pp_wait_down=8.0, pp_wait_drain=2.0),
+    ]
+    report = _analyze_once(table, _meta(4, pp_size=2))
+    metrics = report.metrics
+    assert (metrics["straggler/pp_wait_down/max_ms"], metrics["straggler/pp_wait_down/max_rank"]) == (30.0, 2.0)
+    assert (metrics["straggler/pp_wait_up/max_ms"], metrics["straggler/pp_wait_up/max_rank"]) == (6.0, 0.0)
+    # pp_recv over self (320) + waits (pp_recv + 5) per rank; the larger stage median wins.
+    assert metrics["straggler/pp_bubble/ratio"] == pytest.approx(np.median([40.0 / 365.0, 10.0 / 335.0]))
+    assert [row["steady_ms"] for row in report.rows] == [6.0, 6.0, 30.0, 8.0]
+
+    metrics = _analyze_once([_healthy_row(), _healthy_row()], _meta(2)).metrics
+    assert not [name for name in metrics if name.startswith(("straggler/pp_wait_", "straggler/pp_bubble/"))]
+
+
+def _with_window_fields(values, **fields):
+    """Set window-level fields, which ``row`` would scale by the step count."""
+    for name, value in fields.items():
+        values[FIELD_INDEX[name]] = value
+    return values
+
+
+def test_micro_batch_extremes_are_window_level_and_name_the_slowest_rank():
+    table = [
+        _with_window_fields(
+            _healthy_row(),
+            mb_fwd_max=12.0,
+            mb_fwd_min=8.0,
+            mb_bwd_max=20.0,
+            mb_bwd_min=15.0,
+            mb_fwd_argmax=3.0,
+            mb_fwd_argmax_tokens=900.0,
+            mb_tokens_max=900.0,
+            mb_tokens_min=300.0,
+        ),
+        _with_window_fields(
+            _healthy_row(),
+            mb_fwd_max=30.0,
+            mb_fwd_min=9.0,
+            mb_bwd_max=25.0,
+            mb_bwd_min=16.0,
+            mb_fwd_argmax=0.0,
+            mb_fwd_argmax_tokens=-1.0,
+            mb_tokens_max=800.0,
+            mb_tokens_min=200.0,
+        ),
+    ]
+    report = _analyze_once(table, _meta(2))
+    metrics = {
+        name[len("straggler/micro_batch/") :]: value
+        for name, value in report.metrics.items()
+        if name.startswith("straggler/micro_batch/")
+    }
+    assert metrics == {
+        "fwd_max_ms": 30.0,
+        "fwd_max_rank": 1.0,
+        "fwd_argmax": 0.0,
+        "fwd_argmax_tokens": -1.0,
+        "fwd_min_ms": 8.0,
+        "bwd_max_ms": 25.0,
+        "bwd_max_rank": 1.0,
+        "tokens_max": 900.0,
+        "tokens_min": 200.0,
+    }
+    assert [row["mb_fwd_max"] for row in report.rows] == [12.0, 30.0]
+
+    metrics = _analyze_once([_healthy_row(), _healthy_row()], _meta(2)).metrics
+    assert not [name for name in metrics if name.startswith("straggler/micro_batch/")]

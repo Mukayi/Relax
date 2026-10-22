@@ -41,16 +41,16 @@ latest to grad-sync rank 0 by 13.4 ms (peers idle 45.9 ms), pp_stage_imbalance 1
 When there are alerts, the window in which a rank's reason changes logs one WARNING, and every window that still has alerts logs an INFO per-rank table. Every reason needs `PERSIST_WINDOWS` consecutive windows to be raised and `RECOVER_WINDOWS` consecutive clean windows to clear (the clearing logs another WARNING: `rank 5 (…) recovered from slow_device after 2 clean windows`):
 
 ```text
-[straggler] step=29 rank 3 (rank3_dp3_tp0_pp0, host=…, gpu=3) reaches the DP grad-sync 195.6 ms/step
-after its DP peers (peers idle 201.4 ms/step = 21% of their compute, z=120.1) for 3 windows;
-its own GPU forward is 0.99x peers, gc 1.8 ms, cpu/gpu fwd 1.55x -> late_arrival (host-side stall)
+[straggler] step=29 rank 3 (rank3_dp3_tp0_pp0, host=…, gpu=3) reaches the DP grad-sync 197.4 ms/step
+after its DP peers (peers idle 203.3 ms/step = 22% of their compute, z=41.0) for 3 windows;
+its own GPU forward is 0.99x peers, gc 1.8 ms, cpu/gpu fwd 1.56x -> late_arrival (host-side stall)
 [straggler] step=29 per-rank window (ms/step):
- rank | tag               | host | device | self_ms | wait_ms | late_ms | tokens  | ms_per_ktok | gc_ms | reason       | uncertain
-    0 | rank0_dp0_tp0_pp0 | …    |      0 |   941.0 |     6.4 |     0.4 | 14802.1 |        63.6 |   1.8 | none         |
-    3 | rank3_dp3_tp0_pp0 | …    |      3 |   743.6 |     5.8 |   195.6 | 14592.7 |        51.0 |   1.8 | late_arrival |
+ rank | tag               | host | device | self_ms | wait_ms | late_ms | tokens  | ms_per_ktok | gc_ms | steady_ms | mb_fwd_max | reason       | uncertain
+    0 | rank0_dp0_tp0_pp0 | …    |      0 |   933.7 |     6.4 |     6.1 | 14802.1 |        63.1 |   1.8 |       0.0 |      157.8 | none         |
+    3 | rank3_dp3_tp0_pp0 | …    |      3 |   737.1 |     5.9 |   197.4 | 14592.7 |        50.5 |   1.8 |       0.0 |      148.0 | late_arrival |
 ```
 
-The table is cut down to ranks 0 and 3; the real one has a row per rank.
+The table is cut down to ranks 0 and 3; the real one has a row per rank. `steady_ms` is the steady-state PP wait (`pp_wait_up + pp_wait_down`, 0 here because this run has no PP) and `mb_fwd_max` the slowest single forward of the window (ms).
 
 A rank whose window cannot support a verdict is reported as uncertain with a cause (one WARNING when the cause changes) instead of silently passing as healthy:
 
@@ -80,6 +80,9 @@ These scalars go out in the same `tracking_utils.log` call as the `perf/*` metri
 | `straggler/late/max_ms`, `straggler/late/max_rank`, `straggler/late/peer_idle_ms` | The rank that reaches the DP gradient sync last, by how much (compared on `bwd + dp_grad_sync`, see `late_arrival` below), and how long its peers idle for it per step. |
 | `straggler/tokens/{median,max,spread}` | Token-count imbalance: `median` / `max` are global, `spread` is the largest excess within a stage; omitted when any rank reports zero tokens. |
 | `straggler/pp_stage_imbalance` | `max/min` of per-stage median compute time; independent of any slow device. |
+| `straggler/{pp_wait_fill,pp_wait_up,pp_wait_down,pp_wait_drain}/{max_ms,max_rank}` | The training-phase `pp_recv` split by non-interleaved 1F1B phase (ms/step): the largest value and its rank. `fill` waits for upstream activations while the pipeline fills, `up` / `down` wait for upstream activations / downstream gradients in the steady state, and `drain` waits for downstream gradients while it drains. A balanced pipeline does not idle in the steady state, so `up + down` beyond the transfer time is extra bubble. A stall of an upstream rank at the start of the step delays its whole pipeline, so it shows up in the downstream stages' `fill`, not in the steady state. Only with PP; the interleaved (VPP) schedule's transfers count in `pp_recv` only. |
+| `straggler/pp_bubble/ratio` | `pp_recv` as a share of the rank's timed training time (own + waits + `pp_send`); the largest per-stage median. Only with PP. |
+| `straggler/micro_batch/{fwd_max_ms,fwd_max_rank,fwd_argmax,fwd_argmax_tokens,fwd_min_ms,bwd_max_ms,bwd_max_rank,tokens_max,tokens_min}` | Extremes of single training micro-batches over the window (not per step): the slowest forward and its rank, which forward of its rollout it was (from 0) and its token count (−1 when not reported), the fastest forward, the slowest backward and its rank, and the largest / smallest token count of a micro-batch (omitted without token counts). |
 | `straggler/gc/{median_ms,max_ms}` | Python GC pauses. |
 | `straggler/flagged/count`, `straggler/flagged/rank` (−1 if none), `straggler/flagged/reason` | Alert state. Reason codes: 0 none, 1 slow_device, 2 data_imbalance, 3 upstream_wait, 4 cpu_bound, 5 late_arrival. |
 | `straggler/waiting/count` | Ranks waiting on a slow upstream PP stage in this window (victims, not culprits; not counted in `flagged`). |
@@ -101,7 +104,7 @@ The timings reuse the 22 timer call sites Megatron already has, so they cover th
 | Covered | Detail |
 | --- | --- |
 | `fwd` / `bwd` | One micro-batch's forward / backward (whole block, not split into layers) |
-| `pp_recv` / `pp_send` | PP point-to-point (9 upstream names folded into 2 segments; direction and rank pair are not distinguished) |
+| `pp_recv` / `pp_send` | PP point-to-point (9 upstream names folded into 2 segments; the rank pair is not distinguished; the 4 receive names of non-interleaved 1F1B training also count by phase and direction in `pp_wait_*`) |
 | `dp_grad_sync` | DP gradient sync (4 upstream names folded into 1 segment; the CP and DP portions are not separable) |
 | `dp_param_gather` | The distributed optimizer's parameter all-gather |
 | `optim` | The optimizer phases (6 upstream names) |
@@ -109,7 +112,7 @@ The timings reuse the 22 timer call sites Megatron already has, so they cover th
 **Not covered** (no upstream call site exists; adding one is new work):
 
 - **The internals of attention, MoE, head/logits and MTP.** Upstream Megatron has no timer call site inside these modules, so today they are only visible *inside* `fwd` / `bwd` and cannot be attributed separately. Drilling into them needs new call sites and is out of scope for this version.
-- **EP all-to-all** (expert-parallel communication in MoE). It is a "wait for a peer" kind of cost and is currently mixed into the compute segment.
+- **EP all-to-all** (expert-parallel communication in MoE). It is a "wait for a peer" kind of cost and is mixed into the compute segment.
 - **The real compute/communication overlap ratio.** A smaller `dp_grad_sync` does **not** read as "better overlap" — it is the sum of the waiting segments, a proxy, not the overlap ratio itself.
 
 **Known granularity limits** (see `reason` below): ranks of the same TP group wait for each other inside forward and backward, so when one of them slows down the whole group is reported and which one it was cannot be told apart; when every rank slows down at once (whole-machine clock throttle, shared storage stall) nothing is detected.
@@ -132,12 +135,12 @@ With `--overlap-grad-reduce` the gradient reduce-scatter is issued bucket by buc
 
 Exceptions in the timer calls, the event read-out, the window gather, the analysis and the log callback are caught and counted; none reaches the training loop. A rank that has caught 3 errors, or has had dropped event pairs or errors in 3 consecutive windows, asks for the profiler to be switched off. The request travels in that rank's window vector (the `health` field), so every rank sees the same gathered table and switches off at the same window; no rank leaves on its own and strands the others in the next gather. Once off, the timer calls are skipped, but the rank **keeps joining every window gather**: it sends an all-zero row of `NUM_FIELDS` values with only `health` set to 2, so the collective keeps its shape and the switched-off state keeps reaching ranks that have not seen it yet.
 
-A failed gather is only visible to the rank it failed on. It no longer leaves the collective: the failure is counted, the window is reset as usual, and the next window gathers again with a normal row (or the switched-off row above). After repeated failures the rank switches off locally and starts sending that row, and the other ranks read `health = 2` in the next gather that completes and switch off in the same window. The metadata gather of the first window runs once and is never retried: the ranks that got the metadata only gather rows from then on, so a retry on the failed rank alone would misalign the collectives. That rank sends its row for the window as usual with `health = 2`, and every rank switches off in that window. The metadata gather itself is a single collective of one fixed 1 KiB byte row per rank: a rank that fails to serialize its metadata, or has too much of it, still joins with an empty row, and every rank then sees the same missing entry and switches off in that window the same way. To bound the case where a rank process is really gone and can send nothing, the profiler creates a dedicated Gloo group for these gathers at install time, with a timeout set by `RELAX_STRAGGLER_GATHER_TIMEOUT_S` (60 s by default); this does not change the timeout of the shared Gloo group or the training path. **Known limitation:** a single gather still blocks for that timeout when a member has disappeared, and if the whole group is gone every rank can only switch off locally, with no cross-rank propagation.
+A failed gather is only visible to the rank it failed on. It does not leave the collective: the failure is counted, the window is reset as usual, and the next window gathers again with a normal row (or the switched-off row above). After repeated failures the rank switches off locally and starts sending that row, and the other ranks read `health = 2` in the next gather that completes and switch off in the same window. The metadata gather of the first window runs once and is never retried: the ranks that got the metadata only gather rows from then on, so a retry on the failed rank alone would misalign the collectives. That rank sends its row for the window as usual with `health = 2`, and every rank switches off in that window. The metadata gather itself is a single collective of one fixed 1 KiB byte row per rank: a rank that fails to serialize its metadata, or has too much of it, still joins with an empty row, and every rank then sees the same missing entry and switches off in that window the same way. To bound the case where a rank process is really gone and can send nothing, the profiler creates a dedicated Gloo group for these gathers at install time, with a timeout set by `RELAX_STRAGGLER_GATHER_TIMEOUT_S` (60 s by default); this does not change the timeout of the shared Gloo group or the training path. **Known limitation:** a single gather still blocks for that timeout when a member has disappeared, and if the whole group is gone every rank can only switch off locally, with no cross-rank propagation.
 
 ## Overhead
 
 - One pair of non-blocking `event.record()` calls per Megatron timer call site (events are pooled). At the end of each step completed events are read lazily with `event.query()`, never `cuda.synchronize()`; the cost is reported as `straggler/self_overhead_ms`.
-- One Gloo `all_gather` every `REPORT_INTERVAL` rollouts, reported as `straggler/gather_ms`. Each rank contributes 168 B per window (21 float64), independent of the micro-batch count; because this is an `all_gather`, every rank materializes the full `N × 168 B` table, and the whole job receives `N × (N−1) × 168 B` per window (excluding Gloo protocol overhead). The first window also has a separate metadata gather of 1 KiB per rank.
+- One Gloo `all_gather` every `REPORT_INTERVAL` rollouts, reported as `straggler/gather_ms`. Each rank contributes 264 B per window (33 float64), independent of the micro-batch count; because this is an `all_gather`, every rank materializes the full `N × 264 B` table, and the whole job receives `N × (N−1) × 264 B` per window (excluding Gloo protocol overhead). The first window also has a separate metadata gather of 1 KiB per rank.
 - The analysis runs on a background thread of the primary rank, reported as `straggler/analyze_ms`. It is O(n log n) in the stage size: a few milliseconds per window at 8 ranks, about 35 ms at 2048 ranks in a CPU benchmark.
 - On 8×A100 with Qwen3-0.6B DP8 (step ≈ 1 s), the summed worst-case upper bound is about 1.9 ms/step (≈ 0.19 %), and end-to-end on/off comparisons are indistinguishable from zero; turning it on adds no synchronizing calls and leaves the NCCL/compute kernel overlap unchanged. The method and all measurements are in [RFC #362](https://github.com/redai-studio/Relax/issues/362).
 

@@ -7,11 +7,17 @@ Gloo gather per window) -> ``worker`` thread on the primary rank ->
 ``detector`` -> ``reporter``. ``runtime`` binds it to torch / Megatron.
 """
 
-from relax.utils.straggler.runtime import StragglerProfiler, install_straggler_profiler, straggler_timers
+from relax.utils.straggler.runtime import (
+    StragglerProfiler,
+    install_straggler_profiler,
+    note_microbatch_tokens,
+    straggler_timers,
+)
 
 
 __all__ = [
     "StragglerProfiler",
     "install_straggler_profiler",
+    "note_microbatch_tokens",
     "straggler_timers",
 ]

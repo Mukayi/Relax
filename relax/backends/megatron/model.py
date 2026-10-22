@@ -46,7 +46,7 @@ from relax.utils.megatron_peft_utils import is_lora_enabled
 from relax.utils.memory_utils import available_memory, clear_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.replay import capture_hooks
-from relax.utils.straggler import straggler_timers
+from relax.utils.straggler import note_microbatch_tokens, straggler_timers
 from relax.utils.timer import timer
 from relax.utils.training.packing_metrics import PackingMetrics
 from relax.utils.training.ppo_utils import (
@@ -1164,6 +1164,7 @@ def train_one_step(
                 args.allgather_cp,
                 is_vl_model,
             )
+        note_microbatch_tokens(batch.get("total_lengths"))
         if args.ci_test and args.enable_mtp_training:
             main_loss_has_tokens = main_loss_has_tokens or _main_loss_has_tokens(batch)
 

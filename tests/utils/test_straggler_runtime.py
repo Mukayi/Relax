@@ -109,6 +109,22 @@ def test_timers_are_none_without_a_profiler():
         runtime._timers_for(_profiler().collector, "eval")
 
 
+class _DeviceLengths:
+    def __iter__(self):
+        raise AssertionError("summing device lengths would synchronize")
+
+
+def test_micro_batch_tokens_reach_the_profiler_only_as_host_lists(monkeypatch):
+    runtime.note_microbatch_tokens([1, 2])  # no profiler: nothing happens
+    profiler = _profiler()
+    noted = []
+    monkeypatch.setattr(runtime, "_PROFILER", profiler)
+    monkeypatch.setattr(profiler.collector, "note_tokens", noted.append)
+    for lengths in ([100, 250], (7,), None, _DeviceLengths()):
+        runtime.note_microbatch_tokens(lengths)
+    assert noted == [350, 7]
+
+
 def test_only_the_latest_of_several_ready_windows_reaches_the_metrics(monkeypatch):
     def window(n):
         return WindowReport(

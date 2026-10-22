@@ -35,8 +35,9 @@ class EventSink(Protocol):
         ``None`` when recording is not possible right now (e.g. the stream is
         being captured into a CUDA graph)."""
 
-    def push(self, segment_index: int, start_event: Any, end_event: Any, cpu_ms: float) -> None:
-        """Hand over one completed bracket for later, lazy readout."""
+    def push(self, segment_index: int, phase_index: int, start_event: Any, end_event: Any, cpu_ms: float) -> None:
+        """Hand over one completed bracket for later, lazy readout;
+        ``phase_index`` is a PP phase field, or -1."""
 
     def discard_event(self, event: Any) -> None:
         """Return an event whose bracket could not be completed."""
@@ -87,7 +88,8 @@ class _NullTimer:
 
 
 class _SegmentTimer:
-    """One Megatron timer name bound to one straggler segment.
+    """One Megatron timer name bound to one straggler segment, and to a PP
+    phase field when it has one (``phase_index`` -1 otherwise).
 
     ``barrier`` is accepted for protocol compatibility and ignored: a barrier
     here would reintroduce exactly the synchronization we are avoiding. A
@@ -96,10 +98,11 @@ class _SegmentTimer:
     the profiler can never take the training loop down.
     """
 
-    __slots__ = ("_segment_index", "_sink", "_start_event", "_start_cpu")
+    __slots__ = ("_segment_index", "_phase_index", "_sink", "_start_event", "_start_cpu")
 
-    def __init__(self, segment_index: int, sink: EventSink) -> None:
+    def __init__(self, segment_index: int, phase_index: int, sink: EventSink) -> None:
         self._segment_index = segment_index
+        self._phase_index = phase_index
         self._sink = sink
         self._start_event: Any = None
         self._start_cpu: float = 0.0
@@ -124,7 +127,13 @@ class _SegmentTimer:
             if end_event is None:
                 self._sink.discard_event(start_event)
                 return
-            self._sink.push(self._segment_index, start_event, end_event, (perf_counter() - self._start_cpu) * 1e3)
+            self._sink.push(
+                self._segment_index,
+                self._phase_index,
+                start_event,
+                end_event,
+                (perf_counter() - self._start_cpu) * 1e3,
+            )
         except Exception as exc:
             self._sink.discard_event(start_event)
             self._sink.on_error("timer", exc)
@@ -144,9 +153,12 @@ class StragglerTimers:
     noticed immediately instead of silently doing nothing.
     """
 
-    def __init__(self, sink: EventSink, name_to_segment: Mapping[str, str]) -> None:
+    def __init__(
+        self, sink: EventSink, name_to_segment: Mapping[str, str], name_to_phase: Mapping[str, str] | None = None
+    ) -> None:
         self._sink = sink
         self._name_to_segment = dict(name_to_segment)
+        self._name_to_phase = dict(name_to_phase or {})
         self._timers: dict[str, _SegmentTimer | _NullTimer] = {}
         self._null = _NullTimer()
 
@@ -162,7 +174,8 @@ class StragglerTimers:
         if timer is None:
             segment = self._name_to_segment.get(name)
             if segment is not None:
-                timer = _SegmentTimer(FIELD_INDEX[segment], self._sink)
+                phase = self._name_to_phase.get(name)
+                timer = _SegmentTimer(FIELD_INDEX[segment], FIELD_INDEX[phase] if phase else -1, self._sink)
             else:
                 timer = self._null
                 if name not in _IGNORED_TIMER_NAMES:

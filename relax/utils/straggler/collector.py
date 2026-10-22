@@ -28,6 +28,7 @@ from relax.utils.straggler.stats import (
     FIELD_INDEX,
     FORWARD_ONLY_TIMER_SEGMENTS,
     MEGATRON_TIMER_SEGMENTS,
+    PP_PHASE_TIMERS,
     WindowStats,
     disabled_row,
 )
@@ -46,6 +47,14 @@ _GC_INDEX = FIELD_INDEX["gc"]
 _DROPPED_INDEX = FIELD_INDEX["dropped"]
 _ERRORS_INDEX = FIELD_INDEX["errors"]
 _HEALTH_INDEX = FIELD_INDEX["health"]
+_MB_FWD_MAX_INDEX = FIELD_INDEX["mb_fwd_max"]
+_MB_FWD_MIN_INDEX = FIELD_INDEX["mb_fwd_min"]
+_MB_BWD_MAX_INDEX = FIELD_INDEX["mb_bwd_max"]
+_MB_BWD_MIN_INDEX = FIELD_INDEX["mb_bwd_min"]
+_MB_FWD_ARGMAX_INDEX = FIELD_INDEX["mb_fwd_argmax"]
+_MB_FWD_ARGMAX_TOKENS_INDEX = FIELD_INDEX["mb_fwd_argmax_tokens"]
+_MB_TOKENS_MAX_INDEX = FIELD_INDEX["mb_tokens_max"]
+_MB_TOKENS_MIN_INDEX = FIELD_INDEX["mb_tokens_min"]
 
 # An analysis takes milliseconds (35 ms at 2048 ranks); this only bounds a stuck worker at the end of a run.
 _FINAL_FLUSH_TIMEOUT_S = 10.0
@@ -111,7 +120,13 @@ class StragglerCollector:
         self.detector_state = DetectorState()
         self._pool = EventPool(pool_size, event_factory)
         self._max_pending = max_pending
-        self._pending: deque[tuple[int, Any, Any, float]] = deque()
+        # (segment, PP phase field or -1, start event, end event, CPU ms, micro-batch, tokens);
+        # the last two only mean something for a training forward.
+        self._pending: deque[tuple[int, int, Any, Any, float, int, float]] = deque()
+        # Training forwards pushed in this step, and the token count reported
+        # for the forward bracket that is open (-1 when none was).
+        self._step_fwd = 0
+        self._next_tokens = -1.0
         self._window = WindowStats()
         self._wall = wall_clock
         self.window_start_wall = wall_clock()
@@ -144,7 +159,7 @@ class StragglerCollector:
             gc.callbacks.append(self._on_gc)
         # One timers object per phase so the same Megatron call sites land in
         # different buckets during training vs. forward-only passes.
-        self.train_timers = StragglerTimers(self, MEGATRON_TIMER_SEGMENTS)
+        self.train_timers = StragglerTimers(self, MEGATRON_TIMER_SEGMENTS, PP_PHASE_TIMERS)
         self.forward_only_timers = StragglerTimers(self, FORWARD_ONLY_TIMER_SEGMENTS)
 
     # ---- hot path -----------------------------------------------------------------------------------------------
@@ -175,16 +190,30 @@ class StragglerCollector:
         ``ProfilerHealth``)."""
         self.health.record_error(where, exc)
 
-    def push(self, segment_index: int, start_event: Any, end_event: Any, cpu_ms: float) -> None:
+    def push(self, segment_index: int, phase_index: int, start_event: Any, end_event: Any, cpu_ms: float) -> None:
         """Queue one bracket for ``drain``; when the queue is full drop the
         oldest pair and count it in ``dropped``, so a rank that stops draining
-        cannot grow without bound."""
+        cannot grow without bound.
+
+        A training forward takes the next micro-batch number of the step and
+        the token count reported while it was open.
+        """
         if len(self._pending) >= self._max_pending:
-            _, old_start, old_end, _ = self._pending.popleft()
+            _, _, old_start, old_end, _, _, _ = self._pending.popleft()
             self._pool.release(old_start)
             self._pool.release(old_end)
             self._window.add_index(_DROPPED_INDEX, 1.0)
-        self._pending.append((segment_index, start_event, end_event, cpu_ms))
+        micro_batch, tokens = -1, -1.0
+        if segment_index == _FWD_INDEX:
+            micro_batch, tokens = self._step_fwd, self._next_tokens
+            self._step_fwd += 1
+            self._next_tokens = -1.0
+        self._pending.append((segment_index, phase_index, start_event, end_event, cpu_ms, micro_batch, tokens))
+
+    def note_tokens(self, tokens: int) -> None:
+        """Take the token count of the training micro-batch whose forward
+        bracket is open; that bracket's ``push`` claims it."""
+        self._next_tokens = float(tokens)
 
     def add_tokens(self, tokens: int) -> None:
         """Count the tokens this rank trained on in the current step."""
@@ -223,15 +252,27 @@ class StragglerCollector:
         pending = self._pending
         window = self._window
         while pending:
-            segment_index, start_event, end_event, cpu_ms = pending[0]
+            segment_index, phase_index, start_event, end_event, cpu_ms, micro_batch, tokens = pending[0]
             if not (end_event.query() and start_event.query()):
                 break
-            window.add_index(segment_index, start_event.elapsed_time(end_event))
+            ms = start_event.elapsed_time(end_event)
+            window.add_index(segment_index, ms)
+            if phase_index >= 0:
+                window.add_index(phase_index, ms)
             if segment_index == _FWD_INDEX:
                 window.add_index(_CPU_FWD_INDEX, cpu_ms)
                 window.add_index(_NUM_FWD_INDEX, 1.0)
+                if window.max_index(_MB_FWD_MAX_INDEX, ms):
+                    window.values[_MB_FWD_ARGMAX_INDEX] = float(micro_batch)
+                    window.values[_MB_FWD_ARGMAX_TOKENS_INDEX] = tokens
+                window.min_index(_MB_FWD_MIN_INDEX, ms)
+                if tokens >= 0:
+                    window.max_index(_MB_TOKENS_MAX_INDEX, tokens)
+                    window.min_index(_MB_TOKENS_MIN_INDEX, tokens)
             elif segment_index == _BWD_INDEX:
                 window.add_index(_CPU_BWD_INDEX, cpu_ms)
+                window.max_index(_MB_BWD_MAX_INDEX, ms)
+                window.min_index(_MB_BWD_MIN_INDEX, ms)
             pending.popleft()
             self._pool.release(start_event)
             self._pool.release(end_event)
@@ -260,6 +301,7 @@ class StragglerCollector:
         except Exception as exc:
             self.on_error("drain", exc)
         self._step_open = False
+        self._step_fwd = 0
         self._window.add("num_steps", 1.0)
         if self._window_first_rollout is None:
             self._window_first_rollout = rollout_id
@@ -458,7 +500,7 @@ class StragglerCollector:
         self._disabled = True
         self.health.disable(reason)
         while self._pending:
-            _, start_event, end_event, _ = self._pending.popleft()
+            _, _, start_event, end_event, _, _, _ = self._pending.popleft()
             self._pool.release(start_event)
             self._pool.release(end_event)
         self.close()
