@@ -239,9 +239,9 @@ def test_the_superseded_warning_names_the_window_that_is_returned(monkeypatch):
     assert profiler.collector.health.errors_total == 2, "window 0 superseded, window 2 failed"
 
 
-@pytest.mark.parametrize(("primary", "vpp"), [(True, None), (False, 2)])
-def test_install_uses_the_shared_metrics_primary_rank_and_numbers_micro_batches_only_without_vpp(
-    monkeypatch, primary, vpp
+@pytest.mark.parametrize(("primary", "vpp", "combined"), [(True, None, False), (False, 2, False), (False, 2, True)])
+def test_install_uses_the_shared_metrics_primary_rank_and_megatrons_schedule_table_under_vpp(
+    monkeypatch, primary, vpp, combined
 ):
     monkeypatch.setenv("RELAX_STRAGGLER_PROFILER", "1")
     monkeypatch.setattr(train_metric_utils, "is_metrics_primary_rank", lambda: primary)
@@ -253,10 +253,17 @@ def test_install_uses_the_shared_metrics_primary_rank_and_numbers_micro_batches_
     monkeypatch.setattr(runtime, "_PROFILER", None)
     args = _args()
     args.virtual_pipeline_model_parallel_size = vpp
+    args.pipeline_model_parallel_size = 2
+    args.overlap_moe_expert_parallel_comm = combined
     profiler = install_straggler_profiler("actor", args)
     try:
         assert profiler.collector.is_primary is primary
         assert profiler.collector._cpu_events_source is runtime._cpu_events
-        assert profiler.collector._number_micro_batches is (vpp is None)
+        table = profiler.collector._schedule_table
+        if vpp is None:
+            assert table is None
+        else:
+            # Megatron's own table, with micro-batches grouped by the PP size; empty under combined 1F1B.
+            assert list(table(3)) == ([] if combined else [(0, 0), (1, 0), (0, 1), (1, 1), (2, 0), (2, 1)])
     finally:
         profiler.collector.close()

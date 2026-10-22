@@ -209,6 +209,18 @@ def test_brackets_without_a_micro_batch_number_are_named_without_one():
     assert named == {"F": {"tokens": 300}, "B": {}, "attn fwd L1": {"layer": 1}}
 
 
+def test_under_interleaved_pp_micro_batch_brackets_and_their_modules_name_the_model_chunk():
+    fwd, bwd = FIELD_INDEX["fwd"], FIELD_INDEX["bwd"]
+    brackets = [(fwd, 1, 3, 300, 0, 10), (bwd, 0, 3, -1, 10, 30), _module("attn_fwd", 8, 1, 4)]
+    trace, _ = build_trace([_trace(brackets)], _meta(1))
+    named = {e["name"]: e.get("args", {}) for e in _slices(trace, 0) if e["name"] != "busy"}
+    assert named == {
+        "F3 chunk 1": {"micro_batch": 3, "model_chunk": 1, "tokens": 300},
+        "B3 chunk 0": {"micro_batch": 3, "model_chunk": 0},
+        "attn fwd L8": {"layer": 8, "micro_batch": 3, "model_chunk": 1},
+    }
+
+
 def test_an_mtp_layer_is_named_apart_from_the_decoder_layer_with_the_same_number():
     modules = [_module("attn_fwd", 1, 1, 4), _module("attn_fwd", -1, 5, 8)]
     trace, _ = build_trace([_trace(_FIRST_STAGE + modules)], _meta(1))

@@ -8,8 +8,8 @@ pipeline sit next to each other. Within a row the slices nest by time:
 * level 1 (PP): busy runs and the PP waits between them (``bubble <phase>``),
   plus ``untimed`` gaps that no bracket covers (host-side time);
 * level 2 (fwd / bwd): inside a busy run, ``F{i}`` / ``B{i}`` per micro-batch
-  (``F`` / ``B`` without a number under interleaved PP, where the calls are
-  not in micro-batch order), sends, the gradient syncs and the optimizer;
+  (``F{i} chunk {c}`` under interleaved PP, with the model chunk), sends, the
+  gradient syncs and the optimizer;
   ``grad sync`` is the DP reduction, the other syncs keep their Megatron timer
   names;
 * level 3 (modules, only at the ``modules`` level): inside ``F{i}`` / ``B{i}``,
@@ -111,10 +111,24 @@ def _brackets(trace: RankTrace) -> list[_Bracket]:
     )
 
 
+def _micro_batch_args(bracket: _Bracket) -> dict[str, Any]:
+    """The micro-batch of a fwd / bwd / log-prob fwd bracket and, under
+    interleaved PP, its model chunk (held in the phase slot); empty for other
+    brackets."""
+    if bracket.segment not in _MICRO_BATCH_NAMES:
+        return {}
+    args: dict[str, Any] = {"micro_batch": bracket.micro_batch} if bracket.micro_batch >= 0 else {}
+    if bracket.phase >= 0:
+        args["model_chunk"] = bracket.phase
+    return args
+
+
 def _name(bracket: _Bracket) -> str:
     name = _MICRO_BATCH_NAMES.get(bracket.segment)
     if name is not None:
-        return name if bracket.micro_batch < 0 else f"{name}{bracket.micro_batch}"
+        if bracket.micro_batch >= 0:
+            name += str(bracket.micro_batch)
+        return name if bracket.phase < 0 else f"{name} chunk {bracket.phase}"
     if bracket.segment == _LP_RECV:
         return "lp bubble"
     if bracket.segment == _RECV:
@@ -172,7 +186,7 @@ def _rank_events(brackets: list[_Bracket], pid: int, wall_us: float) -> list[dic
             continue
         events.append(_slice("busy", pid, wall_us, start, end))
         for bracket in members:
-            args = {"micro_batch": bracket.micro_batch} if bracket.micro_batch >= 0 else {}
+            args = _micro_batch_args(bracket)
             if bracket.tokens >= 0:
                 args["tokens"] = bracket.tokens
             events.append(_slice(_name(bracket), pid, wall_us, bracket.start, bracket.end, args))
@@ -201,8 +215,7 @@ def _module_events(
         name = f"{_MODULE_NAMES[module.segment]} {'MTP ' if mtp else ''}L{layer}"
         args: dict[str, Any] = {"layer": layer, "mtp": True} if mtp else {"layer": layer}
         if outer is not None:
-            if outer.micro_batch >= 0:
-                args["micro_batch"] = outer.micro_batch
+            args.update(_micro_batch_args(outer))
             if outer.segment == _BWD and module.segment in _MODULE_FORWARDS:
                 name += " (recompute)"
             elif outer.segment == _LP_FWD:

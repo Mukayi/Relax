@@ -347,7 +347,7 @@ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None
         level=initial_level(bool(traces_to)),
         # Read at window closes; the poller is created below, once there is a collector to report.
         level_request=lambda: poller.requested if poller is not None else None,
-        number_micro_batches=(getattr(args, "virtual_pipeline_model_parallel_size", None) or 1) == 1,
+        schedule_table=interleaved_schedule_table(args),
     )
     if is_primary and getattr(args, "use_metrics_service", False):
         from relax.utils.utils import get_serve_url
@@ -409,6 +409,30 @@ def straggler_timers(phase: str) -> StragglerTimers | None:
     """The ``config.timers`` value for ``phase``: ``None`` without a profiler,
     which is what Relax assigns anyway."""
     return _timers_for(_PROFILER.collector, phase) if _PROFILER is not None else None
+
+
+def interleaved_schedule_table(args: Any) -> Callable[[int], Sequence[tuple[int, int]]] | None:
+    """Megatron's interleaved schedule table for a micro-batch count; ``None``
+    without interleaved PP."""
+    chunks = getattr(args, "virtual_pipeline_model_parallel_size", None) or 1
+    if chunks == 1:
+        return None
+    if getattr(args, "overlap_moe_expert_parallel_comm", False):
+        # Combined 1F1B merges forward and backward steps, so no bracket has a micro-batch or model chunk.
+        return lambda num_microbatches: ()
+    from megatron.core.pipeline_parallel.schedules import get_schedule_table
+
+    # Megatron's default group size is the PP size.
+    group = getattr(args, "microbatch_group_size_per_vp_stage", None) or args.pipeline_model_parallel_size
+    return partial(get_schedule_table, num_model_chunks=chunks, microbatch_group_size_per_vp_stage=group)
+
+
+def note_schedule(num_microbatches: int) -> None:
+    """Report the micro-batch count of the forward-backward call about to run,
+    which names each bracket's micro-batch and model chunk under interleaved
+    PP; a no-op without a profiler."""
+    if _PROFILER is not None:
+        _PROFILER.collector.note_schedule(num_microbatches)
 
 
 def note_microbatch_tokens(total_lengths: Any) -> None:

@@ -46,7 +46,7 @@ from relax.utils.megatron_peft_utils import is_lora_enabled
 from relax.utils.memory_utils import available_memory, clear_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.replay import capture_hooks
-from relax.utils.straggler import note_microbatch_tokens, straggler_timers
+from relax.utils.straggler import note_microbatch_tokens, note_schedule, straggler_timers
 from relax.utils.timer import timer
 from relax.utils.training.packing_metrics import PackingMetrics
 from relax.utils.training.ppo_utils import (
@@ -954,6 +954,7 @@ def forward_only(
     forward_data_store = []
     num_steps_per_rollout = len(num_microbatches)
     for step_id in range(num_steps_per_rollout):
+        note_schedule(num_microbatches[step_id])
         forward_data_store += forward_backward_func(
             forward_step_func=forward_step,
             data_iterator=data_iterator,
@@ -1325,6 +1326,7 @@ def train_one_step(
             forward_backward_func = streaming_forward_backward_pipelining_without_interleaving
     else:
         forward_backward_func = get_forward_backward_func()
+    note_schedule(num_microbatches)
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step,
         data_iterator=data_iterator,

@@ -11,6 +11,7 @@ from relax.utils.straggler.runtime import (
     StragglerProfiler,
     install_straggler_profiler,
     note_microbatch_tokens,
+    note_schedule,
     register_straggler_model,
     straggler_timers,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "StragglerProfiler",
     "install_straggler_profiler",
     "note_microbatch_tokens",
+    "note_schedule",
     "register_straggler_model",
     "straggler_timers",
 ]

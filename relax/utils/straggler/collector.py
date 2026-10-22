@@ -29,7 +29,7 @@ from array import array
 from collections import deque
 from dataclasses import dataclass, field
 from time import perf_counter, time
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from relax.utils.logging_utils import get_logger
 from relax.utils.straggler.control import LEVELS
@@ -163,7 +163,7 @@ class StragglerCollector:
         max_module_brackets: int = 8192,
         level: int = 1,
         level_request: Callable[[], int | None] = lambda: None,
-        number_micro_batches: bool = True,
+        schedule_table: Callable[[int], Sequence[tuple[int, int]]] | None = None,
     ) -> None:
         if report_interval < 1:
             raise ValueError(
@@ -195,9 +195,11 @@ class StragglerCollector:
         # count reported for the training forward bracket that is open (-1 when none was).
         self._step_numbers = dict.fromkeys(_NUMBERED, 0)
         self._next_tokens = -1.0
-        # Off under interleaved PP, where the n-th forward / backward is not micro-batch n and Megatron's backward
-        # step has no micro-batch or model chunk to number by: brackets then carry -1.
-        self._number_micro_batches = number_micro_batches
+        # Under interleaved PP the n-th forward / backward of a step is not micro-batch n: Megatron's schedule table
+        # for a micro-batch count names each bracket instead (``None`` without interleaved PP).
+        self._schedule_table = schedule_table
+        # The noted forward-backward call: bracket counts of the step at its start, its table, model chunks.
+        self._schedule: tuple[dict[int, int], Sequence[tuple[int, int]], int] | None = None
         self._trace_enabled = trace
         self.level = self._usable(level)
         # Plain attribute because ``record_event`` checks it on every bracket.
@@ -299,8 +301,9 @@ class StragglerCollector:
         ``lost``.
 
         A fwd / bwd / log-prob fwd bracket takes the next micro-batch number of
-        its segment in the step (none under interleaved PP); a training forward
-        also takes the token count reported while it was open.
+        its segment in the step, under interleaved PP the micro-batch and model
+        chunk that ``note_schedule`` gives it; a training forward also takes the
+        token count reported while it was open.
         """
         trace = self._trace
         full = len(self._pending) + len(self._modules) >= self._max_pending
@@ -332,10 +335,44 @@ class StragglerCollector:
             self._step_numbers[segment_index] = micro_batch + 1
             if segment_index == _FWD_INDEX:
                 tokens, self._next_tokens = self._next_tokens, -1.0
-            if not self._number_micro_batches:
-                micro_batch = -1
+            if self._schedule_table is not None:
+                # The phase slot of a micro-batch bracket holds its model chunk.
+                micro_batch, phase_index = self._scheduled(segment_index, micro_batch)
         self._pending.append((segment_index, phase_index, start_event, end_event, cpu_ms, micro_batch, tokens))
         self._pushed += 1
+
+    def note_schedule(self, num_microbatches: int) -> None:
+        """Take the micro-batch count of the forward-backward call about to
+        run.
+
+        Under interleaved PP Megatron runs the call's forward steps in the
+        order of its schedule table and its backward steps in the same order
+        with the model chunks reversed, so the table names the micro-batch and
+        model chunk of each of the call's brackets.
+        """
+        if self._schedule_table is None:
+            return
+        try:
+            table = self._schedule_table(num_microbatches)
+            self._schedule = (dict(self._step_numbers), table, len(table) // num_microbatches)
+        except Exception as exc:
+            self._schedule = None
+            self.on_error("schedule", exc)
+
+    def _scheduled(self, segment_index: int, count: int) -> tuple[int, int]:
+        """Micro-batch and model chunk of the ``count``-th bracket of a
+        numbered segment in the step; (-1, -1) outside the noted call."""
+        if self._schedule is None:
+            return -1, -1
+        starts, table, chunks = self._schedule
+        start = starts[segment_index]
+        if count - start >= len(table):
+            return -1, -1
+        micro_batch, chunk = table[count - start]
+        if segment_index == _BWD_INDEX:
+            chunk = chunks - 1 - chunk
+        # Each earlier call of the step ran ``chunks`` brackets per micro-batch.
+        return start // chunks + micro_batch, chunk
 
     def _begin_trace(self) -> None:
         """Anchor the sampled step: an event recorded on an idle device marks
@@ -506,6 +543,7 @@ class StragglerCollector:
             self.on_error("drain", exc)
         self._step_open = False
         self._step_numbers = dict.fromkeys(_NUMBERED, 0)
+        self._schedule = None
         if self._trace is not None and self._trace.end is None:
             self._detach_modules()
             self._trace.end = self._pushed

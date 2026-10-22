@@ -254,10 +254,12 @@ def _timed(collector, name, ms, tokens=None):
     timer.stop()
 
 
-def test_under_interleaved_pp_brackets_carry_no_micro_batch_number_but_keep_their_tokens():
-    collector, calls = _tracing_collector(number_micro_batches=False)
+def test_unnumbered_brackets_carry_no_micro_batch_number_but_keep_their_tokens():
+    # Combined 1F1B under interleaved PP: the schedule table names no bracket.
+    collector, calls = _tracing_collector(schedule_table=lambda num_microbatches: ())
     for rollout_id in range(2):
         collector.end_step(rollout_id=rollout_id)
+    collector.note_schedule(2)
     _timed(collector, "forward-compute", 3, tokens=300)
     _timed(collector, "forward-compute", 7, tokens=900)
     _timed(collector, "backward-compute", 5)
@@ -270,6 +272,37 @@ def test_under_interleaved_pp_brackets_carry_no_micro_batch_number_but_keep_thei
         (FIELD_INDEX["fwd"], -1, 300),
         (FIELD_INDEX["fwd"], -1, 900),
         (FIELD_INDEX["bwd"], -1, -1),
+    ]
+
+
+# Megatron's interleaved schedule table for 5 micro-batches, 2 model chunks and groups of 3 (its own example).
+_TABLE_5 = [(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1), (3, 0), (4, 0), (3, 1), (4, 1)]
+
+
+def test_under_interleaved_pp_brackets_take_the_micro_batch_and_model_chunk_of_the_schedule_table():
+    tables = {5: _TABLE_5, 1: [(0, 0), (0, 1)]}
+    collector, calls = _tracing_collector(schedule_table=tables.__getitem__)
+    for rollout_id in range(2):
+        collector.end_step(rollout_id=rollout_id)
+    collector.note_schedule(5)
+    for name in ("forward-compute", "backward-compute"):
+        for _ in _TABLE_5:
+            bracket(collector, name)
+    # The next call of the step continues the micro-batch numbers; a bracket beyond its table has none.
+    collector.note_schedule(1)
+    for _ in range(3):
+        bracket(collector)
+    collector.end_step(rollout_id=2)
+    collector.end_step(rollout_id=3)
+    sample, _ = calls["gathered"][-1]
+    fwd, bwd = FIELD_INDEX["fwd"], FIELD_INDEX["bwd"]
+    # Backward steps follow the table with the model chunks reversed.
+    assert [(int(r[0]), int(r[2]), int(r[1])) for r in _rows(sample)] == [
+        *((fwd, micro_batch, chunk) for micro_batch, chunk in _TABLE_5),
+        *((bwd, micro_batch, 1 - chunk) for micro_batch, chunk in _TABLE_5),
+        (fwd, 5, 0),
+        (fwd, 5, 1),
+        (fwd, -1, -1),
     ]
 
 
