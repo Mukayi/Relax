@@ -89,7 +89,7 @@ closed; their time lands in the next window
 | `straggler/uncertain/count`、`straggler/uncertain/rank`（无则 −1）、`straggler/uncertain/cause` | 「不确定」的 rank 数、第一个这样的 rank 及其原因。原因编码：0 none、1 dropped_events、2 unread_events、3 profiler_errors、4 no_peers、5 missing_tokens、6 no_wait_reference。 |
 | `straggler/recovered/count` | 本窗口解除告警的 rank 数。 |
 | `straggler/window/first_rollout`、`straggler/window/last_rollout` | 这组标量属于哪个窗口（它们通常随下一个 rollout 发出）。 |
-| `straggler/control/level` | 这个窗口的级别：0 paused、1 coarse、2 detail（见下文「运行中切换级别」）。 |
+| `straggler/control/level` | 这个窗口的级别：0 paused、1 coarse、2 detail、3 modules（见下文「运行中切换级别」）。 |
 | `straggler/latency/analyzed_ms` | 从窗口结束（gather 之前）到判定完成（告警日志此刻打出）的毫秒数。 |
 | `straggler/health/state`、`straggler/health/errors`、`straggler/health/degraded_ranks` | 分析器自身健康：各 rank 中最差的状态（0 active、1 degraded、2 disabled）、本窗口捕获的异常数、处于 degraded 的 rank 数。 |
 | `straggler/self_overhead_ms`、`straggler/gather_ms`、`straggler/analyze_ms`、`straggler/dropped_events`、`straggler/unread_events` | 工具自身开销：每步 drain 读事件的 CPU 时间；primary 上每窗口 gather 的耗时（首个窗口另含一次元数据 gather）；后台线程每窗口判定的耗时；因队列满被丢弃的事件对数（正常为 0）；窗口结束时尚未读到的事件对数（正常为 0）。 |
@@ -108,18 +108,21 @@ closed; their time lands in the next window
 | --- | --- |
 | 第 1 层（PP） | `busy`：连续的计算和通信；`bubble fill` / `up` / `down` / `drain`：PP 等待，按 1F1B 阶段命名，`waits_for` 写明在等上一个还是下一个 stage；`untimed`：超过 0.5 ms、没有任何计时区间覆盖的时间（CPU 侧停顿） |
 | 第 2 层（fwd / bwd） | `busy` 里面的 `F{i}` / `B{i}`（`i` 是 micro-batch 序号，前向带 token 数）、`send`、`grad sync`、`param gather`、`optimizer`；log-prob 阶段是 `lp F{i}` 等 |
+| 第 3 层（modules） | 只在 `modules` 级别出现。`F{i}` / `B{i}` 里面每个 transformer 层的 attention 和 MLP（MoE 层记为 `moe`）的前向、反向，例如 `attn fwd L3`、`moe bwd L3`，参数里带 `layer` 和 `micro_batch`；`B{i}` 里面出现的前向是激活重计算，记为 `… (recompute)`；log-prob 阶段是 `lp attn fwd L3` 等 |
 
 primary 自己的 CPU 侧计时（`Timer` 事件，例如 `actor_train` 和每个 micro-batch 的 `get_data_batch_*`，去掉调用栈）另起一行 `primary CPU`；采样步结束时仍在计时的不在其中。
 
 | 指标 | 含义 |
 |------|------|
-| `straggler/trace/ranks`、`straggler/trace/lost` | 交来明细的 rank 数；丢失的区间数（队列满被丢弃，或超过每步 4096 个区间的上限） |
+| `straggler/trace/ranks`、`straggler/trace/lost` | 交来明细的 rank 数；丢失的区间数（队列满被丢弃，或超过每步 4096 个区间、外加 16384 个模块区间的上限） |
+| `straggler/trace/module_brackets` | 明细里的模块区间数，各 rank 求和（仅 `modules` 级别） |
 | `straggler/trace/align_spread_ms` | 同一 DP 组的梯度同步结束时刻在各 rank 墙钟上的最大差，也就是跨卡对齐误差 |
 | `straggler/trace/bubble_excess_ms_max`、`straggler/trace/bubble_excess_rank` | 实测 PP 等待超出均衡 1F1B 气泡最多的量和它的 rank |
 
 开销与限制：
 
 - 每个窗口多一次 GPU 同步（采样步开头）和一次只发往 primary 的 gather（每个区间 24 B）；生成和写文件在 primary 的后台线程。8 卡 A100、Qwen3-0.6B TP1×PP4×DP2（步时约 1.6 s）实测：训练线程上每个明细窗口多约 2 ms（同步约 0.4 ms、gather 约 1.3 ms、读偏移约 0.3 ms），默认窗口 10 个 rollout 时折合每步约 0.01%。
+- `modules` 级别只给采样步挂 hook，所有 rank 一样。同一配置实测（每个 stage 7 层，每个 rank 每步约 250 个模块区间）：这一步的前向长 3–10%（小模型受 kernel 发射限制，hook 的 CPU 时间会显出来），反向不变，步时在步与步之间的波动范围内；读模块区间每个窗口多约 3.5 ms。窗口统计里包含这些略长的前向。CUDA graph 捕获期间不记录任何区间，被捕获的层没有模块切片。
 - 跨卡对齐用的是各 rank 的墙钟（`time.time()`），跨机器时受 NTP 精度影响，误差看 `align_spread_ms`。
 - 阶段命名和气泡推算只适用于非交错 1F1B；VPP 和 `combined_1f1b` 下只看第 2 层。窗口只有 1 个 rollout 时，采样步可能在窗口结束时还没读完，这一窗口就没有明细。
 
@@ -130,8 +133,9 @@ primary 自己的 CPU 侧计时（`Timer` 事件，例如 `actor_train` 和每�
 | 0 `paused` | 不记录任何计时区间；窗口照常 gather（只带状态），但不做判定，告警的连续计数冻结，标量只有 `straggler/control/level` |
 | 1 `coarse` | 上面的窗口统计和判定 |
 | 2 `detail` | 再加采样步明细；需要明细的输出目录（见上一节），没有时按 `coarse` 运行 |
+| 3 `modules` | 明细里再加第 3 层（每层 attention / MLP 的前向、反向）。hook 只在采样步运行期间存在，只有这一步付出开销；模块区间只进明细，不进窗口统计，也不参与判定。和 `detail` 一样需要明细目录，且从不是默认级别 |
 
-启动级别由 `RELAX_STRAGGLER_LEVEL` 给出，默认有明细目录时为 2，否则为 1。开启 `--use-metrics-service` 时，primary 在一个守护线程上每 `RELAX_STRAGGLER_CONTROL_POLL_S`（默认 5）秒向 metrics service 询问一次。训练中途可以在浏览器打开 `http://<head 节点>:<Serve HTTP 端口>/metrics/straggler` 点按钮切换，也可以直接：
+启动级别由 `RELAX_STRAGGLER_LEVEL` 给出，默认有明细目录时为 2，否则为 1；3 只有显式设置才会生效。开启 `--use-metrics-service` 时，primary 在一个守护线程上每 `RELAX_STRAGGLER_CONTROL_POLL_S`（默认 5）秒向 metrics service 询问一次。训练中途可以在浏览器打开 `http://<head 节点>:<Serve HTTP 端口>/metrics/straggler` 点按钮切换，也可以直接：
 
 ```bash
 curl -X POST http://<head>:<port>/metrics/straggler/control -H 'Content-Type: application/json' -d '{"level": 0}'
@@ -154,8 +158,9 @@ curl -X POST http://<head>:<port>/metrics/straggler/control -H 'Content-Type: ap
 **不覆盖**（上游没有对应计时点，需要新增挂点）：
 
 - **attention、MoE、head/logits、MTP 的内部**。上游 Megatron 在这些模块里没有任何计时点，
-  所以现在只能看到它们被包含在 `fwd` / `bwd` 里，无法单独归因。要在这些粒度上定位，
-  需要新增挂点——这属于后续工作，当前版本不提供。
+  所以窗口统计只能看到它们被包含在 `fwd` / `bwd` 里。`modules` 级别把每层的 attention 和
+  MLP / MoE 块作为整体计时，只写进采样步明细；块内部（例如 MoE 的 dispatch / experts / combine）
+  和输出层仍然拆不出来。
 - **EP all-to-all**（MoE 专家并行的通信）。它属于「等 peer」类，混在计算段里。
 - **真实的通算重叠比例**。`dp_grad_sync` 变小**不能**直接读成「重叠更好」——它是「等待段之和」，
   是代理量，不是重叠率本身。
@@ -207,5 +212,6 @@ gather 本身失败时只有本 rank 知道。处理方式是**不退出集合�
 - `relax/utils/straggler/reporter.py`：指标 / timeline 输出（训练线程）与日志输出（后台线程）。
 - `relax/utils/straggler/trace.py`：采样步明细：把各 rank 的区间排成嵌套切片，写出 Perfetto 能打开的 JSON（在 primary 的后台线程）。
 - `relax/utils/straggler/control.py`：运行中切换级别：metrics service 一侧的状态、primary 上的轮询线程和控制页。
+- `relax/utils/straggler/modules.py`：`modules` 级别：在采样步给每层的 attention 和 MLP / MoE 块挂前向 hook 和梯度 hook。
 - `relax/utils/straggler/runtime.py`：唯一接触加速器（经 `relax.utils.device`，CUDA / NPU 通用）、进程组和 Megatron 并行状态的模块；`StragglerProfiler` 负责每步在 `log_perf_data` 前后的上报。
-- 接线：`relax/backends/megatron/model.py`（`config.timers = straggler_timers(...)` 三处）、`relax/backends/megatron/actor.py`（`install_straggler_profiler`，每步 `_log_perf_data`）、`relax/utils/metrics/service.py`（控制页和 `/straggler/*` 接口）。
+- 接线：`relax/backends/megatron/model.py`（`config.timers = straggler_timers(...)` 三处）、`relax/backends/megatron/actor.py`（`install_straggler_profiler`、`register_straggler_model`，每步 `_log_perf_data`）、`relax/utils/metrics/service.py`（控制页和 `/straggler/*` 接口）。

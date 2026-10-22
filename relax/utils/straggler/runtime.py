@@ -14,12 +14,13 @@ import pickle
 import socket
 from dataclasses import replace
 from functools import partial
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from relax.utils.logging_utils import get_logger
 from relax.utils.straggler.collector import StragglerCollector
 from relax.utils.straggler.control import LEVELS, LevelPoller
 from relax.utils.straggler.detector import DetectorConfig, RankMeta, WindowReport
+from relax.utils.straggler.modules import ModuleTimers
 from relax.utils.straggler.reporter import log_straggler_window, report_straggler_window
 from relax.utils.straggler.timers import StragglerTimers
 from relax.utils.straggler.trace import write_window_trace
@@ -344,9 +345,29 @@ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None
     return _PROFILER
 
 
+def register_straggler_model(model_chunks: Sequence[Any]) -> None:
+    """Hand the model chunks to the profiler for the ``modules`` level; a no-op
+    without a profiler.
+
+    Their layers are hooked only while a sampled step at that level runs.
+    """
+    if _PROFILER is None:
+        return
+    collector = _PROFILER.collector
+    try:
+        timers = ModuleTimers(model_chunks, collector)
+    except Exception as exc:
+        collector.on_error("modules", exc)
+        return
+    collector.module_timers = timers
+    if collector.is_primary:
+        logger.info("[straggler] modules level: %d attention / MLP blocks on this rank", timers.blocks)
+
+
 def initial_level(trace_on: bool) -> int:
     """The level a run starts at: ``RELAX_STRAGGLER_LEVEL``, else detail when
-    traces have somewhere to go and coarse otherwise."""
+    traces have somewhere to go and coarse otherwise; never ``modules`` unless
+    asked for."""
     from relax.utils.env import Envs
 
     level = Envs.RELAX_STRAGGLER_LEVEL

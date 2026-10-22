@@ -10,7 +10,7 @@ import pytest
 
 from relax.utils.straggler import collector as collector_module
 from relax.utils.straggler.health import HEALTH_DISABLE
-from relax.utils.straggler.stats import FIELD_INDEX, PP_PHASE_FIELDS
+from relax.utils.straggler.stats import FIELD_INDEX, MODULE_INDEX, PP_PHASE_FIELDS
 from relax.utils.straggler.trace import RECORD_WIDTH
 from tests.utils.straggler_helpers import FakeEvent, bracket, make_collector, meta
 
@@ -399,11 +399,73 @@ def test_the_requested_level_travels_in_the_primary_row_and_applies_from_the_nex
     assert collector.pending_events == 0
 
 
-@pytest.mark.parametrize(("trace", "expected"), [(True, 2), (False, 1)])
-def test_every_rank_follows_the_level_in_the_primary_row_detail_needing_a_trace_dir(trace, expected):
+class _ModuleHooks:
+    def __init__(self):
+        self.calls = []
+
+    def attach(self):
+        self.calls.append("attach")
+
+    def detach(self):
+        self.calls.append("detach")
+
+
+def _module_bracket(collector, layer):
+    start = collector.record_event()
+    end = collector.record_event()
+    if start is not None:
+        collector.push(MODULE_INDEX["attn_fwd"], layer, start, end, 0.0)
+
+
+def test_the_modules_level_hooks_only_the_sampled_step_and_keeps_module_brackets_out_of_the_window():
+    gathered = []
+
+    def gather(values):
+        gathered.append(list(values))
+        return [list(values)] * 2
+
+    collector, calls = _tracing_collector(level=3, gather=gather, max_trace_brackets=1, max_module_brackets=1)
+    hooks = collector.module_timers = _ModuleHooks()
+    after_step = []
+    for rollout_id in range(4):
+        bracket(collector)
+        _module_bracket(collector, 1)
+        _module_bracket(collector, 2)
+        collector.end_step(rollout_id=rollout_id)
+        after_step.append(list(hooks.calls))
+    assert after_step == [[], [], ["attach", "detach"], ["attach", "detach"]]
+    sample, _ = calls["gathered"][-1]
+    # The fwd bracket and the first module bracket, each under its own cap; the second module bracket is lost.
+    rows = _rows(sample)
+    assert [int(r[0]) for r in rows] == [FIELD_INDEX["fwd"], MODULE_INDEX["attn_fwd"]] and rows[1][1] == 1.0
+    assert sample.lost == 1
+    assert [row[FIELD_INDEX["fwd"]] for row in gathered] == [2.0, 2.0]
+    assert collector.health.errors_total == 0
+    # Switching off in the middle of a sampled step removes the hooks too.
+    bracket(collector)
+    collector._disable("test")
+    assert hooks.calls[-2:] == ["attach", "detach"]
+
+
+def test_a_module_bracket_finding_the_queue_full_is_dropped_instead_of_a_window_bracket():
+    collector, calls = _tracing_collector(level=3, interval=1, max_pending=1)
+    collector.end_step(rollout_id=0)
+    bracket(collector)
+    _module_bracket(collector, 1)
+    assert (collector.pending_events, collector.window.get("dropped")) == (1, 0.0)
+    collector.end_step(rollout_id=1)
+    sample, _ = calls["gathered"][-1]
+    assert [int(r[0]) for r in _rows(sample)] == [FIELD_INDEX["fwd"]] and sample.lost == 1
+    assert collector.health.errors_total == 0
+
+
+@pytest.mark.parametrize(
+    ("requested", "trace", "expected"), [(2, True, 2), (2, False, 1), (3, True, 3), (3, False, 1)]
+)
+def test_every_rank_follows_the_level_in_the_primary_row_detail_needing_a_trace_dir(requested, trace, expected):
     def gather(values):
         primary_row = list(values)
-        primary_row[FIELD_INDEX["control"]] = 3.0
+        primary_row[FIELD_INDEX["control"]] = requested + 1.0
         return [primary_row, list(values)]
 
     collector = _collector(world=2, interval=1, is_primary=False, gather=gather, trace=trace)

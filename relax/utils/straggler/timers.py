@@ -37,7 +37,8 @@ class EventSink(Protocol):
 
     def push(self, segment_index: int, phase_index: int, start_event: Any, end_event: Any, cpu_ms: float) -> None:
         """Hand over one completed bracket for later, lazy readout;
-        ``phase_index`` is a PP phase field, or -1."""
+        ``phase_index`` is a PP phase field, -1, or a module bracket's layer
+        number."""
 
     def discard_event(self, event: Any) -> None:
         """Return an event whose bracket could not be completed."""

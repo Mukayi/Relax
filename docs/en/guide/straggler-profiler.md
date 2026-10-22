@@ -89,7 +89,7 @@ These scalars go out in the same `tracking_utils.log` call as the `perf/*` metri
 | `straggler/uncertain/count`, `straggler/uncertain/rank` (−1 if none), `straggler/uncertain/cause` | Number of uncertain ranks, the first one and its cause. Cause codes: 0 none, 1 dropped_events, 2 unread_events, 3 profiler_errors, 4 no_peers, 5 missing_tokens, 6 no_wait_reference. |
 | `straggler/recovered/count` | Ranks whose alert cleared in this window. |
 | `straggler/window/first_rollout`, `straggler/window/last_rollout` | The window these scalars belong to (they are usually emitted one rollout later). |
-| `straggler/control/level` | The window's level: 0 paused, 1 coarse, 2 detail (see *Switching the level while training*). |
+| `straggler/control/level` | The window's level: 0 paused, 1 coarse, 2 detail, 3 modules (see *Switching the level while training*). |
 | `straggler/latency/analyzed_ms` | Milliseconds from the window close (before the gather) to the end of its analysis, when the alert lines are logged. |
 | `straggler/health/state`, `straggler/health/errors`, `straggler/health/degraded_ranks` | The profiler's own health: worst state across ranks (0 active, 1 degraded, 2 disabled), errors caught in the window, and ranks currently degraded. |
 | `straggler/self_overhead_ms`, `straggler/gather_ms`, `straggler/analyze_ms`, `straggler/dropped_events`, `straggler/unread_events` | The tool's own cost: CPU time per step spent draining events; gather time per window on the primary rank (the first window also includes one metadata gather); analysis time per window on the background thread; event pairs dropped because the queue was full (normally 0); event pairs still unread when the window closed (normally 0). |
@@ -108,18 +108,21 @@ Each rank is a row, ordered by (dp, pp, tp) so the stages of a pipeline sit next
 | --- | --- |
 | 1 (PP) | `busy`: back-to-back compute and communication; `bubble fill` / `up` / `down` / `drain`: PP waits named by 1F1B phase, with `waits_for` saying whether the previous or the next stage is awaited; `untimed`: more than 0.5 ms covered by no bracket (host-side stalls) |
 | 2 (fwd / bwd) | Inside `busy`: `F{i}` / `B{i}` (`i` is the micro-batch number; forwards carry their token count), `send`, `grad sync`, `param gather`, `optimizer`; log-prob passes show `lp F{i}` and so on |
+| 3 (modules) | Only at the `modules` level. Inside `F{i}` / `B{i}`: the forward and backward of the attention and of the MLP (`moe` for a MoE layer) of every transformer layer, e.g. `attn fwd L3`, `moe bwd L3`, with `layer` and `micro_batch` in the arguments; a forward inside `B{i}` is an activation recompute and is named `… (recompute)`; log-prob passes show `lp attn fwd L3` and so on |
 
 The primary rank's own CPU-side timers (`Timer` events such as `actor_train` and the per-micro-batch `get_data_batch_*`, without call stacks) get a `primary CPU` row; timers still running when the sampled step ends are absent.
 
 | Metric | Meaning |
 |--------|---------|
-| `straggler/trace/ranks`, `straggler/trace/lost` | Ranks that delivered a sample; brackets lost (dropped from a full queue, or beyond the 4096-bracket cap per step) |
+| `straggler/trace/ranks`, `straggler/trace/lost` | Ranks that delivered a sample; brackets lost (dropped from a full queue, or beyond the per-step cap of 4096 brackets plus 16384 module brackets) |
+| `straggler/trace/module_brackets` | Module brackets in the sample, summed over ranks (`modules` level only) |
 | `straggler/trace/align_spread_ms` | The largest difference between the wall-clock end of the same gradient sync on the ranks of a DP group, i.e. the cross-rank alignment error |
 | `straggler/trace/bubble_excess_ms_max`, `straggler/trace/bubble_excess_rank` | The largest excess of measured PP wait over the balanced 1F1B bubble, and its rank |
 
 Cost and limits:
 
 - One extra device synchronize per window (at the start of the sampled step) and one gather to the primary rank only (24 B per bracket); building and writing the file happen on the primary's background thread. Measured on 8×A100 with Qwen3-0.6B TP1×PP4×DP2 (step ≈ 1.6 s): about 2 ms more per detail window on the training thread (synchronize ≈ 0.4 ms, gather ≈ 1.3 ms, offset readout ≈ 0.3 ms), about 0.01 % per step with the default 10-rollout window.
+- The `modules` level hooks only the sampled step, on every rank alike. Measured on the same setup (7 layers per stage, about 250 module brackets per rank and step): that step's forwards are 3–10 % longer (the hooks' CPU time shows on a small, launch-bound model), backwards are unchanged, and its step time stays within the step-to-step noise; draining the module brackets adds about 3.5 ms per window. The window statistics include those slightly longer forwards. Under CUDA graph capture no bracket is recorded, so captured layers have no module slices.
 - Ranks are aligned by their wall clocks (`time.time()`), so across machines NTP accuracy applies; `align_spread_ms` shows the error.
 - Phase names and the bubble estimate assume non-interleaved 1F1B; with VPP or `combined_1f1b` read level 2 only. With one-rollout windows the sampled step may still be in flight when the window closes, and that window has no sample.
 
@@ -130,8 +133,9 @@ Cost and limits:
 | 0 `paused` | No timer bracket is recorded; windows still gather (status only) but are not analyzed, alert streaks are frozen, and the only scalar is `straggler/control/level` |
 | 1 `coarse` | The window statistics and verdicts above |
 | 2 `detail` | Plus the sampled-step trace; needs a trace directory (see above) and runs as `coarse` without one |
+| 3 `modules` | Plus level-3 slices in that trace (attention / MLP forward and backward per layer). The hooks exist only while the sampled step runs, so only that step pays for them; module brackets go into the trace only, never into the window statistics or the verdicts. Needs a trace directory like `detail`, and is never the default |
 
-`RELAX_STRAGGLER_LEVEL` sets the start level (default: 2 with a trace directory, 1 otherwise). With `--use-metrics-service`, the primary rank asks the metrics service for a level every `RELAX_STRAGGLER_CONTROL_POLL_S` seconds (5 by default) from a daemon thread. While training runs, open `http://<head node>:<Serve HTTP port>/metrics/straggler` in a browser and press a button, or:
+`RELAX_STRAGGLER_LEVEL` sets the start level (default: 2 with a trace directory, 1 otherwise; 3 only when set explicitly). With `--use-metrics-service`, the primary rank asks the metrics service for a level every `RELAX_STRAGGLER_CONTROL_POLL_S` seconds (5 by default) from a daemon thread. While training runs, open `http://<head node>:<Serve HTTP port>/metrics/straggler` in a browser and press a button, or:
 
 ```bash
 curl -X POST http://<head>:<port>/metrics/straggler/control -H 'Content-Type: application/json' -d '{"level": 0}'
@@ -153,7 +157,7 @@ The timings reuse the 22 timer call sites Megatron already has, so they cover th
 
 **Not covered** (no upstream call site exists; adding one is new work):
 
-- **The internals of attention, MoE, head/logits and MTP.** Upstream Megatron has no timer call site inside these modules, so today they are only visible *inside* `fwd` / `bwd` and cannot be attributed separately. Drilling into them needs new call sites and is out of scope for this version.
+- **The internals of attention, MoE, head/logits and MTP.** Upstream Megatron has no timer call site inside these modules, so the window statistics only see them *inside* `fwd` / `bwd`. The `modules` level times each layer's attention and MLP / MoE block as a whole, in the sampled-step trace only; what happens inside a block (MoE dispatch / experts / combine, for example) and the output layer are still not split out.
 - **EP all-to-all** (expert-parallel communication in MoE). It is a "wait for a peer" kind of cost and is mixed into the compute segment.
 - **The real compute/communication overlap ratio.** A smaller `dp_grad_sync` does **not** read as "better overlap" — it is the sum of the waiting segments, a proxy, not the overlap ratio itself.
 
@@ -203,5 +207,6 @@ The alert line is logged as soon as the analysis finishes (`straggler/latency/an
 - `relax/utils/straggler/reporter.py`: metrics / timeline output (training thread) and log output (background thread).
 - `relax/utils/straggler/trace.py`: the sampled-step trace: lays every rank's brackets out as nested slices and writes the Perfetto JSON (on the primary's background thread).
 - `relax/utils/straggler/control.py`: switching the level while training runs: the metrics-service side state, the primary rank's polling thread and the control page.
+- `relax/utils/straggler/modules.py`: the `modules` level: forward hooks and gradient hooks on every layer's attention and MLP / MoE block during the sampled step.
 - `relax/utils/straggler/runtime.py`: the only module that touches the accelerator (through `relax.utils.device`, so CUDA and NPU alike), the process groups or Megatron's parallel state; `StragglerProfiler` does the per-step reporting around `log_perf_data`.
-- Wiring: `relax/backends/megatron/model.py` (`config.timers = straggler_timers(...)` at three sites), `relax/backends/megatron/actor.py` (`install_straggler_profiler`, per-step `_log_perf_data`) and `relax/utils/metrics/service.py` (the control page and the `/straggler/*` endpoints).
+- Wiring: `relax/backends/megatron/model.py` (`config.timers = straggler_timers(...)` at three sites), `relax/backends/megatron/actor.py` (`install_straggler_profiler`, `register_straggler_model`, per-step `_log_perf_data`) and `relax/utils/metrics/service.py` (the control page and the `/straggler/*` endpoints).

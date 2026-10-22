@@ -8,9 +8,11 @@ pipeline sit next to each other. Within a row the slices nest by time:
 * level 1 (PP): busy runs and the PP waits between them (``bubble <phase>``),
   plus ``untimed`` gaps that no bracket covers (host-side time);
 * level 2 (fwd / bwd): inside a busy run, ``F{i}`` / ``B{i}`` per micro-batch,
-  sends, the gradient sync and the optimizer.
-
-Module-level slices would nest one level deeper, inside ``F{i}`` / ``B{i}``.
+  sends, the gradient sync and the optimizer;
+* level 3 (modules, only at the ``modules`` level): inside ``F{i}`` / ``B{i}``,
+  the forward / backward of the attention and the MLP (``moe``) of every
+  layer, e.g. ``attn fwd L3``; a forward inside a ``B{i}`` is an activation
+  recompute.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from typing import Any, Sequence
 
 from relax.utils.logging_utils import get_logger
 from relax.utils.straggler.detector import RankMeta
-from relax.utils.straggler.stats import FIELD_INDEX, GPU_SEGMENTS, PP_PHASE_FIELDS
+from relax.utils.straggler.stats import FIELD_INDEX, GPU_SEGMENTS, MODULE_INDEX, NUM_FIELDS, PP_PHASE_FIELDS
 
 
 logger = get_logger(__name__)
@@ -31,8 +33,8 @@ logger = get_logger(__name__)
 # Above any real pid (kernel.pid_max <= 2**22) so the straggler rows never merge
 # with a live process's track in Perfetto.
 TIMELINE_PID_BASE = 1 << 30
-# Segment, PP phase field (-1), micro-batch (-1), tokens (-1), start and end in
-# ms after the rank's anchor event.
+# Segment, PP phase field (-1) or a module's layer number, micro-batch (-1),
+# tokens (-1), start and end in ms after the rank's anchor event.
 RECORD_WIDTH = 6
 FILE_PREFIX = "straggler_trace_rollout"
 # Gaps between brackets shorter than this are launch latency, not host stalls.
@@ -47,6 +49,8 @@ _RECV = FIELD_INDEX["pp_recv"]
 _LP_RECV = FIELD_INDEX["lp_pp_recv"]
 _SEGMENT_NAMES = {FIELD_INDEX[name]: name for name in GPU_SEGMENTS}
 _PHASE_NAMES = {FIELD_INDEX[name]: name.removeprefix("pp_wait_") for name in PP_PHASE_FIELDS}
+_MODULE_NAMES = {index: name.replace("_", " ") for name, index in MODULE_INDEX.items()}
+_MODULE_FORWARDS = frozenset(index for name, index in MODULE_INDEX.items() if name.endswith("_fwd"))
 _WAITS_FOR = {"fill": "previous stage", "up": "previous stage", "down": "next stage", "drain": "next stage"}
 _LEVEL2_NAMES = {
     "pp_send": "send",
@@ -164,6 +168,36 @@ def _rank_events(brackets: list[_Bracket], pid: int, wall_us: float) -> list[dic
     return events
 
 
+def _module_events(
+    modules: list[_Bracket], brackets: list[_Bracket], pid: int, wall_us: float
+) -> list[dict[str, Any]]:
+    """Level-3 slices.
+
+    Each module bracket takes the micro-batch of the ``F{i}`` / ``B{i}`` / ``lp
+    F{i}`` bracket that contains it; both lists are sorted by start, and
+    brackets of one stream do not overlap.
+    """
+    outers = [b for b in brackets if b.segment in (_FWD, _BWD, _LP_FWD)]
+    events: list[dict[str, Any]] = []
+    j = 0
+    for module in modules:
+        while j < len(outers) and outers[j].end < module.start:
+            j += 1
+        outer = (
+            outers[j] if j < len(outers) and outers[j].start <= module.start <= module.end <= outers[j].end else None
+        )
+        name = f"{_MODULE_NAMES[module.segment]} L{module.phase}"
+        args: dict[str, Any] = {"layer": module.phase}
+        if outer is not None:
+            args["micro_batch"] = outer.micro_batch
+            if outer.segment == _BWD and module.segment in _MODULE_FORWARDS:
+                name += " (recompute)"
+            elif outer.segment == _LP_FWD:
+                name = f"lp {name}"
+        events.append(_slice(name, pid, wall_us, module.start, module.end, args))
+    return events
+
+
 def _expected_bubble(brackets: list[_Bracket], stages: int) -> float | None:
     """Idle time a balanced pipeline would have in this sample.
 
@@ -194,6 +228,7 @@ def build_trace(
     events: list[dict[str, Any]] = []
     grad_sync_ends: dict[tuple[int, int], list[float]] = {}
     excess: dict[int, float] = {}
+    module_brackets = 0
     order = sorted(range(len(meta)), key=lambda i: (meta[i].dp, meta[i].pp, meta[i].tp))
     for sort_index, i in enumerate(order):
         trace, rank_meta = traces[i], meta[i]
@@ -202,6 +237,10 @@ def build_trace(
         pid = TIMELINE_PID_BASE + rank_meta.rank
         wall_us = trace.wall * 1e6
         brackets = _brackets(trace)
+        modules = [b for b in brackets if b.segment >= NUM_FIELDS]
+        if modules:
+            brackets = [b for b in brackets if b.segment < NUM_FIELDS]
+            module_brackets += len(modules)
         bubble = sum(b.end - b.start for b in brackets if b.segment == _RECV)
         expected = _expected_bubble(brackets, stages)
         name = f"pp{rank_meta.pp} dp{rank_meta.dp} tp{rank_meta.tp} · rank {rank_meta.rank}"
@@ -214,6 +253,7 @@ def build_trace(
             {"ph": "M", "name": "thread_name", "pid": pid, "tid": 0, "args": {"name": "GPU compute stream"}},
         ]
         events += _rank_events(brackets, pid, wall_us)
+        events += _module_events(modules, brackets, pid, wall_us)
         syncs = [b.end for b in brackets if b.segment == _GRAD_SYNC]
         if syncs:
             grad_sync_ends.setdefault((rank_meta.pp, rank_meta.tp), []).append(trace.wall * 1e3 + syncs[-1])
@@ -224,6 +264,8 @@ def build_trace(
         ]
     traced = [trace for trace in traces if trace is not None]
     metrics = {"straggler/trace/ranks": float(len(traced)), "straggler/trace/lost": float(sum(t.lost for t in traced))}
+    if module_brackets:
+        metrics["straggler/trace/module_brackets"] = float(module_brackets)
     spreads = [max(ends) - min(ends) for ends in grad_sync_ends.values() if len(ends) > 1]
     if spreads:
         metrics["straggler/trace/align_spread_ms"] = float(max(spreads))

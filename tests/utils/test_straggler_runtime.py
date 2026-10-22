@@ -128,7 +128,8 @@ def test_micro_batch_tokens_reach_the_profiler_only_as_host_lists(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("env", "trace_on", "expected"), [(None, True, 2), (None, False, 1), ("0", True, 0), ("1", True, 1)]
+    ("env", "trace_on", "expected"),
+    [(None, True, 2), (None, False, 1), ("0", True, 0), ("1", True, 1), ("3", True, 3)],
 )
 def test_the_start_level_comes_from_the_env_or_from_whether_traces_can_be_written(
     monkeypatch, env, trace_on, expected
@@ -138,6 +139,17 @@ def test_the_start_level_comes_from_the_env_or_from_whether_traces_can_be_writte
     else:
         monkeypatch.setenv("RELAX_STRAGGLER_LEVEL", env)
     assert runtime.initial_level(trace_on) == expected
+
+
+def test_the_model_reaches_the_collector_only_with_a_profiler(monkeypatch):
+    monkeypatch.setattr(runtime, "_PROFILER", None)
+    runtime.register_straggler_model([])
+    profiler = _profiler()
+    monkeypatch.setattr(runtime, "_PROFILER", profiler)
+    runtime.register_straggler_model([])
+    assert profiler.collector.module_timers.blocks == 0
+    runtime.register_straggler_model([object()])
+    assert profiler.collector.health.errors_total == 1, "a model without modules() is a profiler error"
 
 
 def test_traces_go_to_the_env_dir_or_under_the_timeline_dir(monkeypatch):

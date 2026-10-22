@@ -13,8 +13,8 @@ def test_requests_are_validated_and_reach_the_next_poll_with_the_primary_status(
     times = iter(range(100, 200))
     state = ControlState(clock=lambda: float(next(times)))
     assert state.poll({"level": 1, "rollout": 9, "health": "active"}) == {"requested": None, "version": 0}
-    with pytest.raises(ValueError, match="0..2"):
-        state.request(3)
+    with pytest.raises(ValueError, match="0..3"):
+        state.request(4)
     state.request(0)
     assert state.poll({"level": 1, "rollout": 19, "health": "active"}) == {"requested": 0, "version": 1}
     snapshot = state.state()

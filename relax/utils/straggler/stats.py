@@ -68,6 +68,13 @@ FIELDS: tuple[str, ...] = (
 FIELD_INDEX: Mapping[str, int] = {name: index for index, name in enumerate(FIELDS)}
 NUM_FIELDS: int = len(FIELDS)
 
+# Module brackets of a sampled step at the ``modules`` level: the attention and
+# the MLP (``moe`` when it is a MoE layer) of every transformer layer, forward
+# and backward. They only go into the trace, never into a window, so their
+# indices start after the last field.
+MODULE_SEGMENTS: tuple[str, ...] = ("attn_fwd", "attn_bwd", "mlp_fwd", "mlp_bwd", "moe_fwd", "moe_bwd")
+MODULE_INDEX: Mapping[str, int] = {name: NUM_FIELDS + index for index, name in enumerate(MODULE_SEGMENTS)}
+
 
 def disabled_row() -> list[float]:
     """The vector a switched-off rank keeps sending: all zeros except the

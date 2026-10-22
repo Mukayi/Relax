@@ -103,7 +103,7 @@ from relax.utils.utils import (
 )
 
 from ...utils.profile_utils import TrainProfiler
-from ...utils.straggler import install_straggler_profiler
+from ...utils.straggler import install_straggler_profiler, register_straggler_model
 from ...utils.training.tensor_backper import TensorBackuper
 from .checkpoint import _checkpoint_iteration_dir, is_megatron_checkpoint, load_checkpoint
 from .collective_utils import _agree_drained
@@ -462,6 +462,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
             args, role
         )
+        register_straggler_model(self.model)
         self._dpo_reference_identity: DPOReferenceIdentity | None = None
         self._expected_dpo_reference_identity: DPOReferenceIdentity | None = None
 

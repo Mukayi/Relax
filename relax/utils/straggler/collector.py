@@ -15,6 +15,8 @@ With tracing on, the first step of every window after the first is also
 placed on a real time axis (see ``trace``): it starts with one device
 synchronize and an anchor event, its brackets keep their offsets from that
 anchor, and the window close gathers every rank's sample to the primary rank.
+At the ``modules`` level that step also carries module brackets (see
+``modules``), whose hooks exist only while it runs.
 """
 
 from __future__ import annotations
@@ -31,10 +33,12 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.straggler.control import LEVELS
 from relax.utils.straggler.detector import DetectorConfig, DetectorState, RankMeta, WindowReport, analyze_window
 from relax.utils.straggler.health import HEALTH_DISABLE, HealthConfig, ProfilerHealth
+from relax.utils.straggler.modules import ModuleTimers
 from relax.utils.straggler.stats import (
     FIELD_INDEX,
     FORWARD_ONLY_TIMER_SEGMENTS,
     MEGATRON_TIMER_SEGMENTS,
+    NUM_FIELDS,
     PP_PHASE_TIMERS,
     WindowStats,
     disabled_row,
@@ -101,7 +105,8 @@ class _WindowJob:
 class _TraceCapture:
     """The sampled step being read out: its anchor event and wall-clock time,
     the sequence numbers of its first pair and one past its last (set when the
-    step ends), its brackets so far and how many of them were lost."""
+    step ends), its brackets so far (``modules`` of them module brackets) and
+    how many were lost."""
 
     anchor: Any
     wall: float
@@ -109,6 +114,7 @@ class _TraceCapture:
     end: int | None = None
     records: array = field(default_factory=lambda: array("f"))
     lost: int = 0
+    modules: int = 0
 
     def covers(self, seq: int) -> bool:
         return self.first <= seq and (self.end is None or seq < self.end)
@@ -147,6 +153,7 @@ class StragglerCollector:
         gather_to: GatherToFn | None = None,
         trace_sink: TraceSink | None = None,
         max_trace_brackets: int = 4096,
+        max_module_brackets: int = 16384,
         level: int = 1,
         level_request: Callable[[], int | None] = lambda: None,
     ) -> None:
@@ -187,6 +194,9 @@ class StragglerCollector:
         self._gather_to = gather_to
         self._trace_sink = trace_sink
         self._max_trace_brackets = max_trace_brackets
+        self._max_module_brackets = max_module_brackets
+        # Set by the runtime once the model exists; attached only during a sampled step at level 3.
+        self.module_timers: ModuleTimers | None = None
         # The first window has no sample: its first step carries the warm-up.
         self._trace_next = False
         self._trace: _TraceCapture | None = None
@@ -269,9 +279,16 @@ class StragglerCollector:
 
         A fwd / bwd / log-prob fwd bracket takes the next micro-batch number of
         its segment in the step; a training forward also takes the token count
-        reported while it was open.
+        reported while it was open. A module bracket that finds the queue full
+        is dropped itself, so it never costs the window a bracket.
         """
         if len(self._pending) >= self._max_pending:
+            if segment_index >= NUM_FIELDS:
+                self._pool.release(start_event)
+                self._pool.release(end_event)
+                if self._trace is not None:
+                    self._trace.lost += 1
+                return
             _, _, old_start, old_end, _, _, _ = self._pending.popleft()
             self._pool.release(old_start)
             self._pool.release(old_end)
@@ -297,6 +314,20 @@ class StragglerCollector:
         anchor = self._pool.acquire()
         anchor.record()
         self._trace = _TraceCapture(anchor=anchor, wall=self._wall(), first=self._pushed)
+        if self.level == 3 and self.module_timers is not None:
+            try:
+                self.module_timers.attach()
+            except Exception as exc:
+                self._detach_modules()
+                self.on_error("modules", exc)
+
+    def _detach_modules(self) -> None:
+        if self.module_timers is None:
+            return
+        try:
+            self.module_timers.detach()
+        except Exception as exc:
+            self.on_error("modules", exc)
 
     def note_tokens(self, tokens: int) -> None:
         """Take the token count of the training micro-batch whose forward
@@ -354,14 +385,17 @@ class StragglerCollector:
             segment_index, phase_index, start_event, end_event, cpu_ms, micro_batch, tokens = pending[0]
             if not (end_event.query() and start_event.query()):
                 break
-            ms = start_event.elapsed_time(end_event)
+            # A module bracket goes into the trace only; its phase slot holds the layer number.
+            module = segment_index >= NUM_FIELDS
+            ms = 0.0 if module else start_event.elapsed_time(end_event)
             # Read before anything is folded, so a failing readout leaves no partial update.
             traced = trace is not None and trace.covers(self._popped)
             if traced:
                 offsets = (trace.anchor.elapsed_time(start_event), trace.anchor.elapsed_time(end_event))
-            window.add_index(segment_index, ms)
-            if phase_index >= 0:
-                window.add_index(phase_index, ms)
+            if not module:
+                window.add_index(segment_index, ms)
+                if phase_index >= 0:
+                    window.add_index(phase_index, ms)
             if segment_index == _FWD_INDEX:
                 window.add_index(_CPU_FWD_INDEX, cpu_ms)
                 window.add_index(_NUM_FWD_INDEX, 1.0)
@@ -377,8 +411,13 @@ class StragglerCollector:
                 window.max_index(_MB_BWD_MAX_INDEX, ms)
                 window.min_index(_MB_BWD_MIN_INDEX, ms)
             if traced:
-                if len(trace.records) < self._max_trace_brackets * RECORD_WIDTH:
+                if module:
+                    kept = trace.modules < self._max_module_brackets
+                else:
+                    kept = len(trace.records) // RECORD_WIDTH - trace.modules < self._max_trace_brackets
+                if kept:
                     trace.records.extend((segment_index, phase_index, micro_batch, tokens, *offsets))
+                    trace.modules += module
                 else:
                     trace.lost += 1
             pending.popleft()
@@ -422,6 +461,7 @@ class StragglerCollector:
         self._step_open = False
         self._step_numbers = dict.fromkeys(_NUMBERED, 0)
         if self._trace is not None and self._trace.end is None:
+            self._detach_modules()
             self._trace.end = self._pushed
             if self.is_primary:
                 self._cpu_span = (self._trace.wall, self._wall())
@@ -453,7 +493,7 @@ class StragglerCollector:
             gathered = self._clock()
             if self._handle_switch_off(table, closed_wall):
                 return
-            traces = self._gather_traces() if level == 2 and not self._disabled else None
+            traces = self._gather_traces() if level >= 2 and not self._disabled else None
             # A switched-off primary has already stopped its worker, so there
             # is nothing to analyse; a paused window recorded nothing.
             if self.is_primary and not self._disabled:
@@ -485,8 +525,9 @@ class StragglerCollector:
         return 0.0 if requested is None else float(requested + 1)
 
     def _usable(self, level: int) -> int:
-        """Detail needs somewhere to write the trace; without it, coarse."""
-        return 1 if level == 2 and not self._trace_enabled else level
+        """Detail and modules need somewhere to write the trace; without it,
+        coarse."""
+        return 1 if level >= 2 and not self._trace_enabled else level
 
     def _set_level(self, level: int) -> None:
         """Switch every rank to ``level`` from the next window on."""
@@ -621,7 +662,7 @@ class StragglerCollector:
         self._window.reset()
         self.window_start_wall = self._wall()
         self._window_first_rollout = None
-        self._trace_next = self.level == 2 and not self._disabled and self._primary_rank is not None
+        self._trace_next = self.level >= 2 and not self._disabled and self._primary_rank is not None
 
     def _job(self, table: list[list[float]] | None, **kwargs: Any) -> _WindowJob:
         first = self._window_first_rollout
@@ -711,6 +752,7 @@ class StragglerCollector:
         if self._trace is not None:
             self._pool.release(self._trace.anchor)
             self._trace = None
+        self._detach_modules()
         self.close()
         logger.warning(
             "[straggler] profiler disabled on rank %d: %s. Training continues; config.timers now records nothing.",

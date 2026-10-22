@@ -4,7 +4,9 @@ service: an operator sets a level on a small HTTP page, the primary rank polls
 for it on a daemon thread, and the window gather hands it to every rank.
 
 Levels: 0 paused (no brackets recorded, windows not analyzed), 1 coarse (the
-per-window statistics), 2 detail (plus the sampled-step trace).
+per-window statistics), 2 detail (plus the sampled-step trace), 3 modules
+(plus the attention / MLP forward and backward of every layer in that trace;
+never the default).
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ from relax.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
-LEVELS: tuple[str, ...] = ("paused", "coarse", "detail")
+LEVELS: tuple[str, ...] = ("paused", "coarse", "detail", "modules")
 
 
 class ControlState:
@@ -133,10 +135,12 @@ button.current { font-weight: bold; }
 <button data-level="0">Pause</button>
 <button data-level="1">Coarse</button>
 <button data-level="2">Detail (sampled-step trace)</button>
+<button data-level="3">Modules (detail + attention / MLP per layer)</button>
 </p>
 <p>A change takes effect at the next window boundary, at most RELAX_STRAGGLER_REPORT_INTERVAL rollouts
-later. Detail needs a trace directory (RELAX_STRAGGLER_TRACE_DIR or --timeline-dump-dir); without one it
-stays coarse.</p>
+later. Detail and modules need a trace directory (RELAX_STRAGGLER_TRACE_DIR or --timeline-dump-dir);
+without one they stay coarse. Modules hooks every layer during the sampled step, so that step runs
+slower.</p>
 <script>
 const LEVELS = __LEVELS__;
 const api = location.pathname.replace(/\\/straggler\\/?$/, "") + "/straggler/control";

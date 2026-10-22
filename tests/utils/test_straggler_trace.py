@@ -6,7 +6,7 @@ from array import array
 
 import pytest
 
-from relax.utils.straggler.stats import FIELD_INDEX
+from relax.utils.straggler.stats import FIELD_INDEX, MODULE_INDEX
 from relax.utils.straggler.trace import (
     FILE_PREFIX,
     TIMELINE_PID_BASE,
@@ -147,6 +147,42 @@ def test_missing_samples_are_skipped_and_cpu_events_get_their_own_row():
     assert {"ph": "M", "name": "process_name", "pid": 4242, "args": {"name": "primary CPU (pid 4242)"}} in trace[
         "traceEvents"
     ]
+
+
+def _module(name, layer, start, end):
+    return (MODULE_INDEX[name], layer, -1, -1, start, end)
+
+
+def test_module_brackets_nest_in_their_micro_batch_and_mark_recompute_and_log_prob_forwards():
+    modules = [
+        _module("attn_fwd", 1, 1, 4),
+        _module("moe_fwd", 1, 4, 9),
+        # Activation recompute: the forward runs again inside B0, before its backward.
+        _module("attn_fwd", 1, 41, 44),
+        _module("moe_bwd", 1, 45, 50),
+        _module("attn_bwd", 1, 50, 58),
+        _module("mlp_fwd", 2, 101, 103),
+        _module("attn_fwd", 3, 85, 86),
+    ]
+    log_prob = [_bracket("lp_fwd", 100, 104, micro_batch=5)]
+    plain, _ = build_trace([_trace(_FIRST_STAGE + log_prob)], _meta(1))
+    trace, metrics = build_trace([_trace(_FIRST_STAGE + log_prob + modules)], _meta(1))
+    assert metrics["straggler/trace/module_brackets"] == 7.0
+    # Busy runs, untimed gaps and the level-2 slices are those of the same step without modules.
+    assert [e for e in _slices(trace, 0) if "layer" not in e.get("args", {})] == _slices(plain, 0)
+    wall_us = 1000.0 * 1e6
+    named = {
+        (e["name"], (e["ts"] - wall_us) / 1e3): e["args"] for e in _slices(trace, 0) if "layer" in e.get("args", {})
+    }
+    assert named == {
+        ("attn fwd L1", 1.0): {"layer": 1, "micro_batch": 0},
+        ("moe fwd L1", 4.0): {"layer": 1, "micro_batch": 0},
+        ("attn fwd L1 (recompute)", 41.0): {"layer": 1, "micro_batch": 0},
+        ("moe bwd L1", 45.0): {"layer": 1, "micro_batch": 0},
+        ("attn bwd L1", 50.0): {"layer": 1, "micro_batch": 0},
+        ("lp mlp fwd L2", 101.0): {"layer": 2, "micro_batch": 5},
+        ("attn fwd L3", 85.0): {"layer": 3},
+    }
 
 
 def test_without_pp_there_is_no_bubble_estimate():
