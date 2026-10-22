@@ -344,19 +344,36 @@ def test_tracing_samples_the_first_step_of_every_window_after_the_first():
     assert reports[-1].metrics["straggler/trace/ranks"] == 2.0
 
 
-def test_a_sample_is_capped_and_carries_the_cpu_events_handed_over_after_its_step():
-    collector, calls = _tracing_collector(max_trace_brackets=2)
+def test_a_sample_is_capped_and_carries_the_cpu_events_of_its_step():
+    collector, calls = _tracing_collector(
+        max_trace_brackets=2, cpu_events=lambda start, end: [{"name": "get_data_batch"}]
+    )
     for rollout_id in range(2):
         collector.end_step(rollout_id=rollout_id)
     for _ in range(3):
         bracket(collector)
     collector.end_step(rollout_id=2)
-    assert collector.take_cpu_span() is not None and collector.take_cpu_span() is None
-    collector.attach_cpu_events([{"name": "get_data_batch"}])
     collector.end_step(rollout_id=3)
     sample, _ = calls["gathered"][-1]
     assert (len(_rows(sample)), sample.lost) == (2, 1)
     assert sample.cpu_events == [{"name": "get_data_batch"}]
+
+
+def test_with_one_rollout_windows_every_sample_carries_the_cpu_events_of_its_own_rollout():
+    read = []
+
+    def cpu_events(start, end):
+        read.append(start)
+        return [{"name": f"cpu of sampled step {len(read)}"}]
+
+    collector, calls = _tracing_collector(interval=1, cpu_events=cpu_events)
+    for rollout_id in range(4):
+        bracket(collector)
+        collector.end_step(rollout_id=rollout_id)
+    samples = [sample for sample, _ in calls["gathered"]]
+    assert samples[0] is None
+    assert [sample.cpu_events for sample in samples[1:]] == [[{"name": f"cpu of sampled step {n}"}] for n in (1, 2, 3)]
+    assert read == [sample.wall for sample in samples[1:]]
 
 
 def test_a_sample_still_in_flight_at_the_close_is_dropped():

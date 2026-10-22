@@ -235,12 +235,6 @@ class StragglerProfiler:
         """
         self.collector.add_tokens(tokens)
         reports = self.collector.end_step(rollout_id, final=rollout_id + 1 == self._args.num_rollout)
-        span = self.collector.take_cpu_span()
-        if span is not None:
-            try:
-                self.collector.attach_cpu_events(_cpu_events(*span))
-            except Exception as exc:
-                self.collector.on_error("trace", exc)
         metrics: dict[str, float] | None = None
         returned: WindowReport | None = None
         superseded: list[WindowReport] = []
@@ -349,6 +343,7 @@ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None
         gather_to=gloo_gather_objects_to,
         primary_rank=primary_rank,
         trace_sink=partial(write_window_trace, traces_to, Envs.RELAX_STRAGGLER_TRACE_KEEP) if traces_to else None,
+        cpu_events=_cpu_events,
         level=initial_level(bool(traces_to)),
         # Read at window closes; the poller is created below, once there is a collector to report.
         level_request=lambda: poller.requested if poller is not None else None,

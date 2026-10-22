@@ -3,7 +3,6 @@
 the profiler gets installed."""
 
 from argparse import Namespace
-from dataclasses import replace
 
 import pytest
 
@@ -181,24 +180,6 @@ def test_cpu_events_are_the_finished_timers_overlapping_the_step_without_call_st
     assert events[0]["args"] == {}
 
 
-def test_the_primary_hands_its_cpu_events_to_the_sample_after_the_traced_step(monkeypatch):
-    monkeypatch.setattr(runtime, "_cpu_events", lambda start, end: [{"name": "get_data_batch"}])
-    samples = []
-    profiler = _profiler(
-        interval=2,
-        world=1,
-        trace=True,
-        level=2,
-        gather_objects=lambda obj: [replace(meta(1)[0], primary=True)],
-        gather_to=lambda sample, dst: samples.append(sample) or [sample],
-        primary_rank=0,
-    )
-    for rollout_id in range(4):
-        _step(profiler, rollout_id)
-    assert samples[0] is None
-    assert samples[1].cpu_events == [{"name": "get_data_batch"}]
-
-
 def test_only_the_latest_of_several_ready_windows_reaches_the_metrics(monkeypatch):
     def window(n):
         return WindowReport(
@@ -271,5 +252,6 @@ def test_install_uses_the_shared_metrics_primary_rank(monkeypatch, primary):
     profiler = install_straggler_profiler("actor", _args())
     try:
         assert profiler.collector.is_primary is primary
+        assert profiler.collector._cpu_events_source is runtime._cpu_events
     finally:
         profiler.collector.close()

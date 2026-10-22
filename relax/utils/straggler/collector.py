@@ -83,6 +83,8 @@ GatherObjectsFn = Callable[[Any], list[Any]]
 GatherToFn = Callable[[Any, int], list[Any] | None]
 # (gathered traces, rank metadata, first rollout of the window) -> trace scalars.
 TraceSink = Callable[[list[RankTrace | None], list[RankMeta], int], dict[str, float]]
+# (start, end) wall-clock seconds -> the primary rank's CPU timeline events in that span.
+CpuEventsFn = Callable[[float, float], list[dict[str, Any]]]
 
 
 @dataclass
@@ -155,6 +157,7 @@ class StragglerCollector:
         gather_to: GatherToFn | None = None,
         primary_rank: int | None = None,
         trace_sink: TraceSink | None = None,
+        cpu_events: CpuEventsFn | None = None,
         max_trace_brackets: int = 4096,
         max_module_brackets: int = 16384,
         level: int = 1,
@@ -207,9 +210,8 @@ class StragglerCollector:
         self._trace_next = False
         self._trace: _TraceCapture | None = None
         self._trace_done: RankTrace | None = None
-        # Primary rank only: the wall-clock span of the step traced last, until
-        # the runtime hands over the CPU events in it.
-        self._cpu_span: tuple[float, float] | None = None
+        # Primary rank only: the CPU events of the step traced last, read when it ends.
+        self._cpu_events_source = cpu_events
         self._cpu_events: list[dict[str, Any]] = []
         self._window = WindowStats()
         self._wall = wall_clock
@@ -343,16 +345,6 @@ class StragglerCollector:
         """Count the tokens this rank trained on in the current step."""
         self._window.add("tokens", float(tokens))
 
-    def take_cpu_span(self) -> tuple[float, float] | None:
-        """The wall-clock span of the step traced last, once (primary rank)."""
-        span, self._cpu_span = self._cpu_span, None
-        return span
-
-    def attach_cpu_events(self, events: list[dict[str, Any]]) -> None:
-        """CPU timeline events of the traced step, sent with this rank's
-        sample."""
-        self._cpu_events = events
-
     def _on_gc(self, phase: str, info: dict[str, Any]) -> None:
         if self._train_thread is not None and threading.get_ident() != self._train_thread:
             return
@@ -468,8 +460,12 @@ class StragglerCollector:
         if self._trace is not None and self._trace.end is None:
             self._detach_modules()
             self._trace.end = self._pushed
-            if self.is_primary:
-                self._cpu_span = (self._trace.wall, self._wall())
+            if self.is_primary and self._cpu_events_source is not None:
+                # Read before this call can close the window, so the sample leaves with the events of its own step.
+                try:
+                    self._cpu_events = self._cpu_events_source(self._trace.wall, self._wall())
+                except Exception as exc:
+                    self.on_error("trace", exc)
             self._finish_trace()
         self._window.add("num_steps", 1.0)
         if self._window_first_rollout is None:
