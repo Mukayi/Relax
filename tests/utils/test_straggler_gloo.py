@@ -70,6 +70,71 @@ def _rank_worker(rank, world_size, init_file, out_dir, failure):
         dist.destroy_process_group()
 
 
+def _trace_worker(rank, world_size, init_file, out_dir):
+    import torch.distributed as dist
+
+    from relax.utils.straggler import runtime
+    from relax.utils.straggler.collector import StragglerCollector
+    from relax.utils.straggler.detector import RankMeta
+    from tests.utils.straggler_helpers import FakeEvent, bracket
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        runtime.init_straggler_gather_group(timeout_s=10)
+        calls, sunk = [], []
+
+        def gather_to(sample, dst):
+            calls.append(dst)
+            return runtime.gloo_gather_objects_to(sample, dst)
+
+        def sink(traces, meta, first_rollout):
+            sunk.append([None if trace is None else len(trace.records) for trace in traces])
+            return {}
+
+        collector = StragglerCollector(
+            rank_meta=RankMeta(rank=rank, dp=rank, tp=0, pp=0, primary=rank == 1),
+            is_primary=rank == 1,
+            report_interval=1,
+            event_factory=FakeEvent,
+            gather=runtime.gloo_all_gather,
+            gather_objects=runtime.gloo_all_gather_objects,
+            is_capturing=lambda: False,
+            register_gc_callback=False,
+            background=False,
+            trace=True,
+            gather_to=gather_to,
+            trace_sink=sink,
+        )
+        for rollout_id in range(3):
+            bracket(collector)
+            collector.end_step(rollout_id=rollout_id)
+        with open(f"{out_dir}/rank{rank}.json", "w") as f:
+            json.dump({"calls": calls, "sunk": sunk}, f)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not torch.distributed.is_available() or not torch.distributed.is_gloo_available(),
+    reason="torch.distributed with Gloo is required",
+)
+def test_every_rank_hands_its_sample_to_the_primary_rank_in_the_same_window(tmp_path):
+    import torch.multiprocessing as mp
+
+    mp.spawn(_trace_worker, args=(2, str(tmp_path / "gloo"), str(tmp_path)), nprocs=2, join=True)
+    ranks = [json.loads((tmp_path / f"rank{rank}.json").read_text()) for rank in range(2)]
+    assert ranks[0]["calls"] == ranks[1]["calls"] == [1, 1, 1]
+    # The first window has no sample; each later one brings one bracket per rank to rank 1 only.
+    assert ranks[1]["sunk"] == [[None, None], [6, 6], [6, 6]]
+    assert ranks[0]["sunk"] == []
+
+
 @pytest.mark.skipif(
     not torch.distributed.is_available() or not torch.distributed.is_gloo_available(),
     reason="torch.distributed with Gloo is required",

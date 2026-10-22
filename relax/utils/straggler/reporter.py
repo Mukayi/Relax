@@ -16,14 +16,12 @@ from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.straggler.detector import WindowReport
 from relax.utils.straggler.health import HEALTH_DISABLE
 from relax.utils.straggler.stats import GPU_SEGMENTS
+from relax.utils.straggler.trace import TIMELINE_PID_BASE
 from relax.utils.timer import TimelineEvent, Timer
 
 
 logger = get_logger(__name__)
 
-# Above any real pid (kernel.pid_max <= 2**22) so the straggler rows never merge
-# with a live process's track in Perfetto.
-TIMELINE_PID_BASE = 1 << 30
 _TABLE_COLUMNS: tuple[str, ...] = (
     "rank",
     "tag",

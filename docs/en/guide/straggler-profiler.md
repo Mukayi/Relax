@@ -25,7 +25,7 @@ env_vars:
 | `RELAX_STRAGGLER_RECOVER_WINDOWS` | int | 2 | Consecutive clean windows before a flagged rank's alert clears, so alerts do not flap; uncertain windows are not clean; must be at least 1. |
 | `RELAX_STRAGGLER_GATHER_TIMEOUT_S` | float | 60.0 | Timeout in seconds of the profiler's dedicated Gloo group. A gather is a few milliseconds of small CPU tensors; this only bounds how long the remaining ranks block once a rank has disappeared. |
 
-Each actor-role process logs `Straggler profiler enabled: report_interval=… primary=… meta=RankMeta(rank=…, dp=…, tp=…, pp=…, cp=…, ep=…, host=…, device=…)` at start-up. Critic / reference / `actor_fwd` actors never run training steps and are not profiled.
+Each actor-role process logs `Straggler profiler enabled: report_interval=… primary=… trace_dir=… meta=RankMeta(rank=…, dp=…, tp=…, pp=…, cp=…, ep=…, host=…, device=…, primary=…)` at start-up (`trace_dir=-` means no sampled-step trace, see *Sampled-step trace* below). Critic / reference / `actor_fwd` actors never run training steps and are not profiled.
 
 ## What you get
 
@@ -97,6 +97,31 @@ These scalars go out in the same `tracking_utils.log` call as the `perf/*` metri
 
 With `--timeline-dump-dir` set (the timeline is flushed through the metrics-service adapter, so `--use-metrics-service` must be on as well), every window appends one `straggler/<seg> rank{g}_dp{d}_tp{t}_pp{p}` event per rank per non-zero segment (`pid` = 2³⁰ + global rank, above any real pid; `tid` = segment index). In Perfetto that is one row per rank, so a longer `bwd` bar or a shorter `dp_grad_sync` bar is visible at a glance.
 
+### Sampled-step trace (Perfetto)
+
+With `RELAX_STRAGGLER_TRACE_DIR` set, or `--timeline-dump-dir` (the default is `straggler/` under it), the first rollout of every window after the first is placed on a real time axis: the step starts with one device synchronize and an anchor event, and every timer bracket keeps its start and end relative to that anchor. When the window closes, every rank hands the step to the primary rank (a `gather_object` to the primary only), which writes `straggler_trace_rollout{N}.json` (Chrome trace format; open it in [ui.perfetto.dev](https://ui.perfetto.dev)) from its background thread and keeps the newest `RELAX_STRAGGLER_TRACE_KEEP` (50 by default). The metrics service is not needed.
+
+Each rank is a row, ordered by (dp, pp, tp) so the stages of a pipeline sit next to each other. The row name carries the rank's measured PP wait and the bubble a balanced 1F1B pipeline would have with its own measured forward and backward (`(PP − 1) × (mean fwd + mean bwd)` × optimizer steps); the difference is extra bubble. On the slowest stage the estimate exceeds the measurement (a negative difference); read the other stages there. Within a row, slices nest by time:
+
+| Level | Content |
+| --- | --- |
+| 1 (PP) | `busy`: back-to-back compute and communication; `bubble fill` / `up` / `down` / `drain`: PP waits named by 1F1B phase, with `waits_for` saying whether the previous or the next stage is awaited; `untimed`: more than 0.5 ms covered by no bracket (host-side stalls) |
+| 2 (fwd / bwd) | Inside `busy`: `F{i}` / `B{i}` (`i` is the micro-batch number; forwards carry their token count), `send`, `grad sync`, `param gather`, `optimizer`; log-prob passes show `lp F{i}` and so on |
+
+The primary rank's own CPU-side timers (`Timer` events such as `actor_train` and the per-micro-batch `get_data_batch_*`, without call stacks) get a `primary CPU` row; timers still running when the sampled step ends are absent.
+
+| Metric | Meaning |
+|--------|---------|
+| `straggler/trace/ranks`, `straggler/trace/lost` | Ranks that delivered a sample; brackets lost (dropped from a full queue, or beyond the 4096-bracket cap per step) |
+| `straggler/trace/align_spread_ms` | The largest difference between the wall-clock end of the same gradient sync on the ranks of a DP group, i.e. the cross-rank alignment error |
+| `straggler/trace/bubble_excess_ms_max`, `straggler/trace/bubble_excess_rank` | The largest excess of measured PP wait over the balanced 1F1B bubble, and its rank |
+
+Cost and limits:
+
+- One extra device synchronize per window (at the start of the sampled step) and one gather to the primary rank only (24 B per bracket); building and writing the file happen on the primary's background thread.
+- Ranks are aligned by their wall clocks (`time.time()`), so across machines NTP accuracy applies; `align_spread_ms` shows the error.
+- Phase names and the bubble estimate assume non-interleaved 1F1B; with VPP or `combined_1f1b` read level 2 only. With one-rollout windows the sampled step may still be in flight when the window closes, and that window has no sample.
+
 ## Coverage
 
 The timings reuse the 22 timer call sites Megatron already has, so they cover the **scheduling plane**:
@@ -159,5 +184,6 @@ The alert line is logged as soon as the analysis finishes (`straggler/latency/an
 - `relax/utils/straggler/detector.py`: pure-numpy window analysis (including uncertain verdicts and alert clearing), unit-testable without a GPU.
 - `relax/utils/straggler/health.py`: the profiler's own health (active → degraded → disabled).
 - `relax/utils/straggler/reporter.py`: metrics / timeline output (training thread) and log output (background thread).
+- `relax/utils/straggler/trace.py`: the sampled-step trace: lays every rank's brackets out as nested slices and writes the Perfetto JSON (on the primary's background thread).
 - `relax/utils/straggler/runtime.py`: the only module that touches the accelerator (through `relax.utils.device`, so CUDA and NPU alike), the process groups or Megatron's parallel state; `StragglerProfiler` does the per-step reporting around `log_perf_data`.
 - Wiring: `relax/backends/megatron/model.py` (`config.timers = straggler_timers(...)` at three sites) and `relax/backends/megatron/actor.py` (`install_straggler_profiler`, per-step `_log_perf_data`).

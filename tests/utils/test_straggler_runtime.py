@@ -3,12 +3,14 @@
 the profiler gets installed."""
 
 from argparse import Namespace
+from dataclasses import replace
 
 import pytest
 
 from relax.utils.straggler import runtime
 from relax.utils.straggler.detector import WindowReport
 from relax.utils.straggler.runtime import StragglerProfiler, install_straggler_profiler
+from relax.utils.timer import TimelineEvent, Timer
 from relax.utils.training import train_metric_utils
 from tests.utils.straggler_helpers import FakeEvent, bracket, make_collector, meta
 
@@ -123,6 +125,51 @@ def test_micro_batch_tokens_reach_the_profiler_only_as_host_lists(monkeypatch):
     for lengths in ([100, 250], (7,), None, _DeviceLengths()):
         runtime.note_microbatch_tokens(lengths)
     assert noted == [350, 7]
+
+
+def test_traces_go_to_the_env_dir_or_under_the_timeline_dir(monkeypatch):
+    monkeypatch.delenv("RELAX_STRAGGLER_TRACE_DIR", raising=False)
+    assert runtime.trace_dir(Namespace(timeline_dump_dir=None)) == ""
+    assert runtime.trace_dir(Namespace(timeline_dump_dir="/runs/x/timeline")) == "/runs/x/timeline/straggler"
+    monkeypatch.setenv("RELAX_STRAGGLER_TRACE_DIR", "/traces")
+    assert runtime.trace_dir(Namespace(timeline_dump_dir="/runs/x/timeline")) == "/traces"
+
+
+@pytest.fixture
+def timer_records():
+    Timer().records.clear()
+    yield Timer().records
+    Timer().records.clear()
+
+
+def test_cpu_events_are_the_finished_timers_overlapping_the_step_without_call_stacks(timer_records):
+    timer_records.extend(
+        [
+            TimelineEvent("train_wait", 1.0, 2.0, pid=1, tid=1),
+            TimelineEvent("get_data_batch_a", 9.0, 11.0, pid=1, tid=1, call_stack="  File ..."),
+            TimelineEvent("straggler/fwd rank0_dp0_tp0_pp0", 10.0, 12.0, pid=1, tid=1),
+            TimelineEvent("next_step", 21.0, 22.0, pid=1, tid=1),
+        ]
+    )
+    events = runtime._cpu_events(10.0, 20.0)
+    assert [event["name"] for event in events] == ["get_data_batch_a"]
+    assert events[0]["args"] == {}
+
+
+def test_the_primary_hands_its_cpu_events_to_the_sample_after_the_traced_step(monkeypatch):
+    monkeypatch.setattr(runtime, "_cpu_events", lambda start, end: [{"name": "get_data_batch"}])
+    samples = []
+    profiler = _profiler(
+        interval=2,
+        world=1,
+        trace=True,
+        gather_objects=lambda obj: [replace(meta(1)[0], primary=True)],
+        gather_to=lambda sample, dst: samples.append(sample) or [sample],
+    )
+    for rollout_id in range(4):
+        _step(profiler, rollout_id)
+    assert samples[0] is None
+    assert samples[1].cpu_events == [{"name": "get_data_batch"}]
 
 
 def test_only_the_latest_of_several_ready_windows_reaches_the_metrics(monkeypatch):

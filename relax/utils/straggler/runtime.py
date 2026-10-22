@@ -9,8 +9,10 @@ so the rest of the package runs (and is tested) on CPU with fakes.
 
 from __future__ import annotations
 
+import os
 import pickle
 import socket
+from dataclasses import replace
 from functools import partial
 from typing import Any, Callable
 
@@ -19,6 +21,8 @@ from relax.utils.straggler.collector import StragglerCollector
 from relax.utils.straggler.detector import DetectorConfig, RankMeta, WindowReport
 from relax.utils.straggler.reporter import log_straggler_window, report_straggler_window
 from relax.utils.straggler.timers import StragglerTimers
+from relax.utils.straggler.trace import write_window_trace
+from relax.utils.timer import Timer
 
 
 logger = get_logger(__name__)
@@ -50,6 +54,13 @@ def stream_capture_check() -> Callable[[], bool]:
 
 def _never() -> bool:
     return False
+
+
+def device_synchronize() -> Callable[[], None]:
+    """The active accelerator's synchronize, which anchors a sampled step."""
+    from relax.utils import device
+
+    return device.device_module.synchronize if device.is_available() else (lambda: None)
 
 
 _STALL_GATHER_GROUP: Any = None
@@ -131,6 +142,28 @@ def gloo_all_gather_objects(obj: Any) -> list[Any]:
     return [pickle.loads(row.numpy().tobytes()) for row in gathered]
 
 
+def gloo_gather_objects_to(obj: Any, dst: int) -> list[Any] | None:
+    """Gather one picklable object per rank on rank ``dst`` (``None``
+    elsewhere) over the straggler Gloo group.
+
+    The object is pickled before the collective so that a rank whose pickling
+    fails still joins it, with ``None``; it raises after the gather.
+    """
+    import torch.distributed as dist
+
+    group = get_straggler_gather_group()
+    error = None
+    try:
+        data = pickle.dumps(obj)
+    except Exception as exc:
+        error, data = exc, pickle.dumps(None)
+    gathered = [None] * dist.get_world_size(group) if dist.get_rank() == dst else None
+    dist.gather_object(data, gathered, dst=dst, group=group)
+    if error is not None:
+        raise error
+    return [pickle.loads(item) for item in gathered] if gathered is not None else None
+
+
 def local_rank_meta() -> RankMeta:
     import torch.distributed as dist
     from megatron.core import mpu
@@ -176,6 +209,12 @@ class StragglerProfiler:
         """
         self.collector.add_tokens(tokens)
         reports = self.collector.end_step(rollout_id, final=rollout_id + 1 == self._args.num_rollout)
+        span = self.collector.take_cpu_span()
+        if span is not None:
+            try:
+                self.collector.attach_cpu_events(_cpu_events(*span))
+            except Exception as exc:
+                self.collector.on_error("trace", exc)
         metrics: dict[str, float] | None = None
         returned: WindowReport | None = None
         superseded: list[WindowReport] = []
@@ -207,6 +246,33 @@ class StragglerProfiler:
         return metrics
 
 
+def _cpu_events(start: float, end: float) -> list[dict[str, Any]]:
+    """This process's finished ``Timer`` events that overlap the wall-clock
+    span ``[start, end]``, without their call stacks; timers still running when
+    the step ended are not among them."""
+    events = []
+    for record in reversed(Timer().records):
+        if record.end_ts < start:
+            break
+        if record.start_ts <= end and not record.name.startswith("straggler/"):
+            event = record.to_trace_event()
+            event.get("args", {}).pop("call_stack", None)
+            events.append(event)
+    return events
+
+
+def trace_dir(args: Any) -> str:
+    """Where the primary rank writes sampled-step traces (empty: no tracing).
+
+    ``RELAX_STRAGGLER_TRACE_DIR``, else ``straggler/`` under the timeline dump
+    directory.
+    """
+    from relax.utils.env import Envs
+
+    timeline_dir = getattr(args, "timeline_dump_dir", None)
+    return Envs.RELAX_STRAGGLER_TRACE_DIR or (os.path.join(timeline_dir, "straggler") if timeline_dir else "")
+
+
 _PROFILER: StragglerProfiler | None = None
 
 
@@ -233,8 +299,9 @@ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None
     # The window scalars are logged through ``log_perf_data``, which drops them
     # on every other rank.
     is_primary = is_metrics_primary_rank()
+    traces_to = trace_dir(args)
     collector = StragglerCollector(
-        rank_meta=local_rank_meta(),
+        rank_meta=replace(local_rank_meta(), primary=is_primary),
         is_primary=is_primary,
         report_interval=Envs.RELAX_STRAGGLER_REPORT_INTERVAL,
         detector_config=DetectorConfig(
@@ -248,12 +315,17 @@ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None
         gather_objects=gloo_all_gather_objects,
         is_capturing=stream_capture_check(),
         on_report=partial(log_straggler_window, args),
+        trace=bool(traces_to),
+        synchronize=device_synchronize(),
+        gather_to=gloo_gather_objects_to,
+        trace_sink=partial(write_window_trace, traces_to, Envs.RELAX_STRAGGLER_TRACE_KEEP) if traces_to else None,
     )
     _PROFILER = StragglerProfiler(collector, args)
     logger.info(
-        "Straggler profiler enabled: report_interval=%d primary=%s meta=%s",
+        "Straggler profiler enabled: report_interval=%d primary=%s trace_dir=%s meta=%s",
         collector.report_interval,
         is_primary,
+        traces_to or "-",
         collector.rank_meta,
     )
     return _PROFILER

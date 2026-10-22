@@ -4,12 +4,14 @@ hook."""
 
 import gc
 import threading
+from dataclasses import replace
 
 import pytest
 
 from relax.utils.straggler import collector as collector_module
 from relax.utils.straggler.health import HEALTH_DISABLE
 from relax.utils.straggler.stats import FIELD_INDEX, PP_PHASE_FIELDS
+from relax.utils.straggler.trace import RECORD_WIDTH
 from tests.utils.straggler_helpers import FakeEvent, bracket, make_collector, meta
 
 
@@ -284,6 +286,96 @@ def test_micro_batch_extremes_follow_the_slowest_forward_and_its_tokens():
     collector.end_step(rollout_id=1)
     assert (window.get("mb_fwd_argmax"), window.get("mb_fwd_argmax_tokens")) == (1.0, -1.0)
     assert window.get("mb_fwd_min") == 1.0
+
+
+def _tracing_collector(world=2, interval=2, trace=True, primary=True, **kwargs):
+    """A tracing collector for rank 0 (the primary unless ``primary`` is False)
+    that records its synchronizes, trace gathers and sink calls."""
+    calls = {"sync": 0, "gathered": [], "sunk": []}
+
+    def synchronize():
+        calls["sync"] += 1
+
+    def gather_to(sample, dst):
+        calls["gathered"].append((sample, dst))
+        return [sample] * world
+
+    def sink(traces, metas, first_rollout):
+        calls["sunk"].append(first_rollout)
+        return {"straggler/trace/ranks": float(sum(t is not None for t in traces))}
+
+    metas = [replace(m, primary=primary and m.rank == 0) for m in meta(world)]
+    collector = make_collector(
+        world,
+        interval,
+        gather_objects=lambda obj: metas,
+        trace=trace,
+        synchronize=synchronize,
+        gather_to=gather_to,
+        trace_sink=sink,
+        **kwargs,
+    )
+    return collector, calls
+
+
+def _rows(sample):
+    values = list(sample.records)
+    return [values[i : i + RECORD_WIDTH] for i in range(0, len(values), RECORD_WIDTH)]
+
+
+def test_tracing_samples_the_first_step_of_every_window_after_the_first():
+    collector, calls = _tracing_collector()
+    reports = []
+    for rollout_id in range(4):
+        bracket(collector)
+        bracket(collector, "backward-compute")
+        reports += collector.end_step(rollout_id=rollout_id)
+    assert calls["sync"] == 1
+    (first, first_dst), (second, second_dst) = calls["gathered"]
+    assert (first, first_dst, second_dst) == (None, 0, 0)
+    # Only rollout 2; FakeEvent stamps the anchor, then each start / stop one apart.
+    assert [(int(row[0]), int(row[2]), row[4], row[5]) for row in _rows(second)] == [
+        (FIELD_INDEX["fwd"], 0, 1.0, 2.0),
+        (FIELD_INDEX["bwd"], 0, 3.0, 4.0),
+    ]
+    assert calls["sunk"] == [0, 2]
+    assert reports[-1].metrics["straggler/trace/ranks"] == 2.0
+
+
+def test_a_sample_is_capped_and_carries_the_cpu_events_handed_over_after_its_step():
+    collector, calls = _tracing_collector(max_trace_brackets=2)
+    for rollout_id in range(2):
+        collector.end_step(rollout_id=rollout_id)
+    for _ in range(3):
+        bracket(collector)
+    collector.end_step(rollout_id=2)
+    assert collector.take_cpu_span() is not None and collector.take_cpu_span() is None
+    collector.attach_cpu_events([{"name": "get_data_batch"}])
+    collector.end_step(rollout_id=3)
+    sample, _ = calls["gathered"][-1]
+    assert (len(_rows(sample)), sample.lost) == (2, 1)
+    assert sample.cpu_events == [{"name": "get_data_batch"}]
+
+
+def test_a_sample_still_in_flight_at_the_close_is_dropped():
+    collector, calls = _tracing_collector(interval=1)
+    collector.end_step(rollout_id=0)
+    bracket(collector)
+    _, _, _, end, _, _, _ = collector._pending[0]
+    end.done = False
+    collector.end_step(rollout_id=1)
+    assert calls["gathered"][-1][0] is None
+    # The anchor is back in the pool; the unread pair still holds its two events.
+    assert len(collector._pool) == 2
+
+
+@pytest.mark.parametrize(("trace", "primary"), [(False, True), (True, False)])
+def test_nothing_is_sampled_without_tracing_or_without_a_primary_rank(trace, primary):
+    collector, calls = _tracing_collector(trace=trace, primary=primary)
+    for rollout_id in range(4):
+        bracket(collector)
+        collector.end_step(rollout_id=rollout_id)
+    assert calls == {"sync": 0, "gathered": [], "sunk": []}
 
 
 def test_report_interval_must_be_positive():

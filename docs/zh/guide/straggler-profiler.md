@@ -25,7 +25,7 @@ env_vars:
 | `RELAX_STRAGGLER_RECOVER_WINDOWS` | int | 2 | 已告警的 rank 要连续多少个干净窗口才解除告警，避免告警反复开关；「不确定」的窗口不算干净；必须 ≥ 1。 |
 | `RELAX_STRAGGLER_GATHER_TIMEOUT_S` | float | 60.0 | profiler 专用 Gloo 组的超时（秒）。单次 gather 是几毫秒的 CPU 小张量汇聚；这个值只限制「有 rank 已经消失」时其余 rank 阻塞多久。 |
 
-开启后每个 actor 角色的进程启动时打一行 `Straggler profiler enabled: report_interval=… primary=… meta=RankMeta(rank=…, dp=…, tp=…, pp=…, cp=…, ep=…, host=…, device=…)`；critic / reference / `actor_fwd` 不跑训练步，不会被采样。
+开启后每个 actor 角色的进程启动时打一行 `Straggler profiler enabled: report_interval=… primary=… trace_dir=… meta=RankMeta(rank=…, dp=…, tp=…, pp=…, cp=…, ep=…, host=…, device=…, primary=…)`（`trace_dir=-` 表示不采样明细，见下文「采样步明细」）；critic / reference / `actor_fwd` 不跑训练步，不会被采样。
 
 ## 看什么
 
@@ -97,6 +97,31 @@ closed; their time lands in the next window
 
 已开 `--timeline-dump-dir` 时（timeline 经 metrics-service adapter 落盘，所以还需要 `--use-metrics-service`），每个窗口会给每个 rank 的每个非零段追加一条 `straggler/<seg> rank{g}_dp{d}_tp{t}_pp{p}` 事件（`pid` = 2³⁰ + 全局 rank，高于任何真实 pid；`tid` = 段序号），在 Perfetto 里一行一个 rank，肉眼就能看出谁的 `bwd` 条更长、谁的 `dp_grad_sync` 条最短。
 
+### 采样步明细（Perfetto）
+
+设置了 `RELAX_STRAGGLER_TRACE_DIR`，或已开 `--timeline-dump-dir`（默认写到它下面的 `straggler/`）时，从第二个窗口起，每个窗口的第一个 rollout 会放到真实时间轴上：这一步开头同步一次 GPU 并记一个锚点事件，之后每个计时区间相对锚点的起止时间都被保留；窗口结束时各 rank 把这一步交给 primary（只发给 primary 的 `gather_object`），primary 在后台线程写一个 `straggler_trace_rollout{N}.json`（Chrome trace 格式，用 [ui.perfetto.dev](https://ui.perfetto.dev) 打开），只保留最新的 `RELAX_STRAGGLER_TRACE_KEEP`（默认 50）个。这个功能不需要 metrics service。
+
+每个 rank 一行，按 (dp, pp, tp) 排序，同一条流水线的各 stage 相邻。行名里带上该 rank 的实测 PP 等待，以及按它自己实测的前向 / 反向推算的均衡 1F1B 气泡（`(PP − 1) × (平均 fwd + 平均 bwd)` × 优化器步数），两者之差就是额外的气泡；最慢的那个 stage 推算值会大于实测（差为负），这时看其他 stage 的差值。行内按时间嵌套：
+
+| 层 | 内容 |
+| --- | --- |
+| 第 1 层（PP） | `busy`：连续的计算和通信；`bubble fill` / `up` / `down` / `drain`：PP 等待，按 1F1B 阶段命名，`waits_for` 写明在等上一个还是下一个 stage；`untimed`：超过 0.5 ms、没有任何计时区间覆盖的时间（CPU 侧停顿） |
+| 第 2 层（fwd / bwd） | `busy` 里面的 `F{i}` / `B{i}`（`i` 是 micro-batch 序号，前向带 token 数）、`send`、`grad sync`、`param gather`、`optimizer`；log-prob 阶段是 `lp F{i}` 等 |
+
+primary 自己的 CPU 侧计时（`Timer` 事件，例如 `actor_train` 和每个 micro-batch 的 `get_data_batch_*`，去掉调用栈）另起一行 `primary CPU`；采样步结束时仍在计时的不在其中。
+
+| 指标 | 含义 |
+|------|------|
+| `straggler/trace/ranks`、`straggler/trace/lost` | 交来明细的 rank 数；丢失的区间数（队列满被丢弃，或超过每步 4096 个区间的上限） |
+| `straggler/trace/align_spread_ms` | 同一 DP 组的梯度同步结束时刻在各 rank 墙钟上的最大差，也就是跨卡对齐误差 |
+| `straggler/trace/bubble_excess_ms_max`、`straggler/trace/bubble_excess_rank` | 实测 PP 等待超出均衡 1F1B 气泡最多的量和它的 rank |
+
+开销与限制：
+
+- 每个窗口多一次 GPU 同步（采样步开头）和一次只发往 primary 的 gather（每个区间 24 B）；生成和写文件在 primary 的后台线程。
+- 跨卡对齐用的是各 rank 的墙钟（`time.time()`），跨机器时受 NTP 精度影响，误差看 `align_spread_ms`。
+- 阶段命名和气泡推算只适用于非交错 1F1B；VPP 和 `combined_1f1b` 下只看第 2 层。窗口只有 1 个 rollout 时，采样步可能在窗口结束时还没读完，这一窗口就没有明细。
+
 ## 覆盖范围
 
 计时复用 Megatron 已有的 22 个计时点，覆盖**调度面**：
@@ -163,5 +188,6 @@ gather 本身失败时只有本 rank 知道。处理方式是**不退出集合�
 - `relax/utils/straggler/detector.py`：纯 numpy 的窗口分析与判定（含「不确定」与告警解除），可在无 GPU 环境单测。
 - `relax/utils/straggler/health.py`：分析器自身的健康状态（active → degraded → disabled）。
 - `relax/utils/straggler/reporter.py`：指标 / timeline 输出（训练线程）与日志输出（后台线程）。
+- `relax/utils/straggler/trace.py`：采样步明细：把各 rank 的区间排成嵌套切片，写出 Perfetto 能打开的 JSON（在 primary 的后台线程）。
 - `relax/utils/straggler/runtime.py`：唯一接触加速器（经 `relax.utils.device`，CUDA / NPU 通用）、进程组和 Megatron 并行状态的模块；`StragglerProfiler` 负责每步在 `log_perf_data` 前后的上报。
 - 接线：`relax/backends/megatron/model.py`（`config.timers = straggler_timers(...)` 三处）、`relax/backends/megatron/actor.py`（`install_straggler_profiler`，每步 `_log_perf_data`）。

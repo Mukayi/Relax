@@ -92,6 +92,8 @@ class RankMeta:
     ep: int = 0
     host: str = ""
     device: int = -1
+    # The rank that logs metrics and receives the sampled-step traces.
+    primary: bool = False
 
     @property
     def tag(self) -> str:

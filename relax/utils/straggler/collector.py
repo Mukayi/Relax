@@ -10,14 +10,20 @@ rank queues the table for the background analysis, whose reports a later
 
 A "step" in this package is one ``end_step`` call, i.e. one rollout, which may
 contain several optimizer steps.
+
+With tracing on, the first step of every window after the first is also
+placed on a real time axis (see ``trace``): it starts with one device
+synchronize and an anchor event, its brackets keep their offsets from that
+anchor, and the window close gathers every rank's sample to the primary rank.
 """
 
 from __future__ import annotations
 
 import gc
 import threading
+from array import array
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import perf_counter, time
 from typing import Any, Callable
 
@@ -33,6 +39,7 @@ from relax.utils.straggler.stats import (
     disabled_row,
 )
 from relax.utils.straggler.timers import EventPool, StragglerTimers
+from relax.utils.straggler.trace import RECORD_WIDTH, RankTrace
 from relax.utils.straggler.worker import AnalysisWorker
 
 
@@ -40,6 +47,9 @@ logger = get_logger(__name__)
 
 _FWD_INDEX = FIELD_INDEX["fwd"]
 _BWD_INDEX = FIELD_INDEX["bwd"]
+_LP_FWD_INDEX = FIELD_INDEX["lp_fwd"]
+# Segments whose brackets are numbered within the step (micro-batch order).
+_NUMBERED = (_FWD_INDEX, _BWD_INDEX, _LP_FWD_INDEX)
 _CPU_FWD_INDEX = FIELD_INDEX["cpu_fwd"]
 _CPU_BWD_INDEX = FIELD_INDEX["cpu_bwd"]
 _NUM_FWD_INDEX = FIELD_INDEX["num_fwd"]
@@ -61,6 +71,10 @@ _FINAL_FLUSH_TIMEOUT_S = 10.0
 
 GatherFn = Callable[[list[float]], list[list[float]]]
 GatherObjectsFn = Callable[[Any], list[Any]]
+# (object, destination rank) -> every rank's object on the destination, None elsewhere.
+GatherToFn = Callable[[Any, int], list[Any] | None]
+# (gathered traces, rank metadata, first rollout of the window) -> trace scalars.
+TraceSink = Callable[[list[RankTrace | None], list[RankMeta], int], dict[str, float]]
 
 
 @dataclass
@@ -77,6 +91,24 @@ class _WindowJob:
     closed_wall: float = 0.0
     gather_ms: float = 0.0
     ready: WindowReport | None = None
+    traces: list[RankTrace | None] | None = None
+
+
+@dataclass
+class _TraceCapture:
+    """The sampled step being read out: its anchor event and wall-clock time,
+    the sequence numbers of its first pair and one past its last (set when the
+    step ends), its brackets so far and how many of them were lost."""
+
+    anchor: Any
+    wall: float
+    first: int
+    end: int | None = None
+    records: array = field(default_factory=lambda: array("f"))
+    lost: int = 0
+
+    def covers(self, seq: int) -> bool:
+        return self.first <= seq and (self.end is None or seq < self.end)
 
 
 class StragglerCollector:
@@ -107,6 +139,11 @@ class StragglerCollector:
         on_report: Callable[[WindowReport], None] | None = None,
         max_backlog: int = 4,
         wall_clock: Callable[[], float] = time,
+        trace: bool = False,
+        synchronize: Callable[[], None] = lambda: None,
+        gather_to: GatherToFn | None = None,
+        trace_sink: TraceSink | None = None,
+        max_trace_brackets: int = 4096,
     ) -> None:
         if report_interval < 1:
             raise ValueError(
@@ -120,13 +157,30 @@ class StragglerCollector:
         self.detector_state = DetectorState()
         self._pool = EventPool(pool_size, event_factory)
         self._max_pending = max_pending
-        # (segment, PP phase field or -1, start event, end event, CPU ms, micro-batch, tokens);
-        # the last two only mean something for a training forward.
+        # (segment, PP phase field or -1, start event, end event, CPU ms, micro-batch or -1, tokens or -1);
+        # tokens only for a training forward.
         self._pending: deque[tuple[int, int, Any, Any, float, int, float]] = deque()
-        # Training forwards pushed in this step, and the token count reported
-        # for the forward bracket that is open (-1 when none was).
-        self._step_fwd = 0
+        # Pairs ever pushed and ever popped (folded or dropped): the sequence number of the queue head.
+        self._pushed = 0
+        self._popped = 0
+        # Brackets of each numbered segment pushed in this step, and the token
+        # count reported for the training forward bracket that is open (-1 when none was).
+        self._step_numbers = dict.fromkeys(_NUMBERED, 0)
         self._next_tokens = -1.0
+        self._trace_enabled = trace
+        self._synchronize = synchronize
+        self._gather_to = gather_to
+        self._trace_sink = trace_sink
+        self._max_trace_brackets = max_trace_brackets
+        # The first window has no sample: its first step carries the warm-up.
+        self._trace_next = False
+        self._trace: _TraceCapture | None = None
+        self._trace_done: RankTrace | None = None
+        self._primary_rank: int | None = None
+        # Primary rank only: the wall-clock span of the step traced last, until
+        # the runtime hands over the CPU events in it.
+        self._cpu_span: tuple[float, float] | None = None
+        self._cpu_events: list[dict[str, Any]] = []
         self._window = WindowStats()
         self._wall = wall_clock
         self.window_start_wall = wall_clock()
@@ -174,7 +228,10 @@ class StragglerCollector:
         """
         if self._disabled or self._is_capturing():
             return None
-        self._step_open = True
+        if not self._step_open:
+            self._step_open = True
+            if self._trace_next:
+                self._begin_trace()
         if self._train_thread is None:
             self._train_thread = threading.get_ident()
         event = self._pool.acquire()
@@ -195,20 +252,36 @@ class StragglerCollector:
         oldest pair and count it in ``dropped``, so a rank that stops draining
         cannot grow without bound.
 
-        A training forward takes the next micro-batch number of the step and
-        the token count reported while it was open.
+        A fwd / bwd / log-prob fwd bracket takes the next micro-batch number of
+        its segment in the step; a training forward also takes the token count
+        reported while it was open.
         """
         if len(self._pending) >= self._max_pending:
             _, _, old_start, old_end, _, _, _ = self._pending.popleft()
             self._pool.release(old_start)
             self._pool.release(old_end)
             self._window.add_index(_DROPPED_INDEX, 1.0)
-        micro_batch, tokens = -1, -1.0
-        if segment_index == _FWD_INDEX:
-            micro_batch, tokens = self._step_fwd, self._next_tokens
-            self._step_fwd += 1
-            self._next_tokens = -1.0
+            if self._trace is not None and self._trace.covers(self._popped):
+                self._trace.lost += 1
+            self._popped += 1
+        micro_batch = self._step_numbers.get(segment_index, -1)
+        tokens = -1.0
+        if micro_batch >= 0:
+            self._step_numbers[segment_index] = micro_batch + 1
+            if segment_index == _FWD_INDEX:
+                tokens, self._next_tokens = self._next_tokens, -1.0
         self._pending.append((segment_index, phase_index, start_event, end_event, cpu_ms, micro_batch, tokens))
+        self._pushed += 1
+
+    def _begin_trace(self) -> None:
+        """Anchor the sampled step: an event recorded on an idle device marks
+        the wall-clock time that every bracket of the step is placed
+        against."""
+        self._trace_next = False
+        self._synchronize()
+        anchor = self._pool.acquire()
+        anchor.record()
+        self._trace = _TraceCapture(anchor=anchor, wall=self._wall(), first=self._pushed)
 
     def note_tokens(self, tokens: int) -> None:
         """Take the token count of the training micro-batch whose forward
@@ -218,6 +291,16 @@ class StragglerCollector:
     def add_tokens(self, tokens: int) -> None:
         """Count the tokens this rank trained on in the current step."""
         self._window.add("tokens", float(tokens))
+
+    def take_cpu_span(self) -> tuple[float, float] | None:
+        """The wall-clock span of the step traced last, once (primary rank)."""
+        span, self._cpu_span = self._cpu_span, None
+        return span
+
+    def attach_cpu_events(self, events: list[dict[str, Any]]) -> None:
+        """CPU timeline events of the traced step, sent with this rank's
+        sample."""
+        self._cpu_events = events
 
     def _on_gc(self, phase: str, info: dict[str, Any]) -> None:
         if self._train_thread is not None and threading.get_ident() != self._train_thread:
@@ -251,11 +334,16 @@ class StragglerCollector:
         folded = 0
         pending = self._pending
         window = self._window
+        trace = self._trace
         while pending:
             segment_index, phase_index, start_event, end_event, cpu_ms, micro_batch, tokens = pending[0]
             if not (end_event.query() and start_event.query()):
                 break
             ms = start_event.elapsed_time(end_event)
+            # Read before anything is folded, so a failing readout leaves no partial update.
+            traced = trace is not None and trace.covers(self._popped)
+            if traced:
+                offsets = (trace.anchor.elapsed_time(start_event), trace.anchor.elapsed_time(end_event))
             window.add_index(segment_index, ms)
             if phase_index >= 0:
                 window.add_index(phase_index, ms)
@@ -273,12 +361,28 @@ class StragglerCollector:
                 window.add_index(_CPU_BWD_INDEX, cpu_ms)
                 window.max_index(_MB_BWD_MAX_INDEX, ms)
                 window.min_index(_MB_BWD_MIN_INDEX, ms)
+            if traced:
+                if len(trace.records) < self._max_trace_brackets * RECORD_WIDTH:
+                    trace.records.extend((segment_index, phase_index, micro_batch, tokens, *offsets))
+                else:
+                    trace.lost += 1
             pending.popleft()
             self._pool.release(start_event)
             self._pool.release(end_event)
+            self._popped += 1
             folded += 1
+        self._finish_trace()
         window.add("overhead", (self._clock() - started) * 1e3)
         return folded
+
+    def _finish_trace(self) -> None:
+        """Hand the sampled step over once every pair of it has been read."""
+        trace = self._trace
+        if trace is None or trace.end is None or self._popped < trace.end:
+            return
+        self._pool.release(trace.anchor)
+        self._trace = None
+        self._trace_done = RankTrace(wall=trace.wall, records=trace.records, lost=trace.lost)
 
     @property
     def disabled(self) -> bool:
@@ -301,7 +405,12 @@ class StragglerCollector:
         except Exception as exc:
             self.on_error("drain", exc)
         self._step_open = False
-        self._step_fwd = 0
+        self._step_numbers = dict.fromkeys(_NUMBERED, 0)
+        if self._trace is not None and self._trace.end is None:
+            self._trace.end = self._pushed
+            if self.is_primary:
+                self._cpu_span = (self._trace.wall, self._wall())
+            self._finish_trace()
         self._window.add("num_steps", 1.0)
         if self._window_first_rollout is None:
             self._window_first_rollout = rollout_id
@@ -327,12 +436,39 @@ class StragglerCollector:
             gathered = self._clock()
             if self._handle_switch_off(table, closed_wall):
                 return
+            traces = self._gather_traces() if self._trace_enabled and not self._disabled else None
             # A switched-off primary has already stopped its worker, so there
             # is nothing to analyse.
             if self.is_primary and not self._disabled:
-                self._submit(self._job(table, closed_wall=closed_wall, gather_ms=(gathered - started) * 1e3))
+                self._submit(
+                    self._job(table, closed_wall=closed_wall, gather_ms=(gathered - started) * 1e3, traces=traces)
+                )
         finally:
             self._reset_window()
+
+    def _gather_traces(self) -> list[RankTrace | None] | None:
+        """Hand this window's sample to the primary rank: every rank joins the
+        gather in the same window, with ``None`` when it has no complete
+        sample.
+
+        Returns the gathered list on the primary rank, ``None`` elsewhere or on
+        failure.
+        """
+        if self._trace is not None:
+            # Still in flight at the close (only with very short windows): dropped.
+            self._pool.release(self._trace.anchor)
+            self._trace = None
+        sample, self._trace_done = self._trace_done, None
+        if sample is not None:
+            sample.cpu_events = self._cpu_events
+        self._cpu_events = []
+        if self._primary_rank is None:
+            return None
+        try:
+            return self._gather_to(sample, self._primary_rank)
+        except Exception as exc:
+            self.on_error("trace", exc)
+            return None
 
     def _health_code(self, code: float) -> float:
         """Return this window's ``health`` code, logging a new local switch-off
@@ -368,6 +504,7 @@ class StragglerCollector:
             self._meta_gathered = True
             try:
                 self._all_meta = list(self._gather_objects(self.rank_meta))
+                self._primary_rank = next((meta.rank for meta in self._all_meta if meta.primary), None)
             except Exception as exc:
                 self.on_error("gather", exc)
                 logger.warning(
@@ -423,6 +560,7 @@ class StragglerCollector:
         self._window.reset()
         self.window_start_wall = self._wall()
         self._window_first_rollout = None
+        self._trace_next = self._trace_enabled and not self._disabled and self._primary_rank is not None
 
     def _job(self, table: list[list[float]] | None, **kwargs: Any) -> _WindowJob:
         first = self._window_first_rollout
@@ -472,6 +610,11 @@ class StragglerCollector:
             report.metrics["straggler/gather_ms"] = job.gather_ms
             report.metrics["straggler/analyze_ms"] = (self._clock() - started) * 1e3
             report.window_start_wall = job.window_start_wall
+            if job.traces is not None and self._trace_sink is not None:
+                try:
+                    report.metrics.update(self._trace_sink(job.traces, job.meta, job.first_rollout))
+                except Exception as exc:
+                    self.on_error("trace", exc)
         report.first_rollout = job.first_rollout
         report.last_rollout = job.last_rollout
         report.closed_wall = job.closed_wall
@@ -503,6 +646,9 @@ class StragglerCollector:
             _, _, start_event, end_event, _, _, _ = self._pending.popleft()
             self._pool.release(start_event)
             self._pool.release(end_event)
+        if self._trace is not None:
+            self._pool.release(self._trace.anchor)
+            self._trace = None
         self.close()
         logger.warning(
             "[straggler] profiler disabled on rank %d: %s. Training continues; config.timers now records nothing.",
