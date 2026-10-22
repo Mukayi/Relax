@@ -37,8 +37,8 @@ class EventSink(Protocol):
 
     def push(self, segment_index: int, phase_index: int, start_event: Any, end_event: Any, cpu_ms: float) -> None:
         """Hand over one completed bracket for later, lazy readout;
-        ``phase_index`` is a PP phase field, -1, or a module bracket's layer
-        number."""
+        ``phase_index`` is a PP phase field, a gradient sync's position in
+        ``GRAD_SYNC_TIMERS``, -1, or a module bracket's layer number."""
 
     def discard_event(self, event: Any) -> None:
         """Return an event whose bracket could not be completed."""
@@ -89,8 +89,8 @@ class _NullTimer:
 
 
 class _SegmentTimer:
-    """One Megatron timer name bound to one straggler segment, and to a PP
-    phase field when it has one (``phase_index`` -1 otherwise).
+    """One Megatron timer name bound to one straggler segment and to the phase
+    slot of its brackets (see ``TIMER_PHASES``; -1 if it has none).
 
     ``barrier`` is accepted for protocol compatibility and ignored: a barrier
     here would reintroduce exactly the synchronization we are avoiding. A
@@ -155,7 +155,7 @@ class StragglerTimers:
     """
 
     def __init__(
-        self, sink: EventSink, name_to_segment: Mapping[str, str], name_to_phase: Mapping[str, str] | None = None
+        self, sink: EventSink, name_to_segment: Mapping[str, str], name_to_phase: Mapping[str, int] | None = None
     ) -> None:
         self._sink = sink
         self._name_to_segment = dict(name_to_segment)
@@ -175,8 +175,7 @@ class StragglerTimers:
         if timer is None:
             segment = self._name_to_segment.get(name)
             if segment is not None:
-                phase = self._name_to_phase.get(name)
-                timer = _SegmentTimer(FIELD_INDEX[segment], FIELD_INDEX[phase] if phase else -1, self._sink)
+                timer = _SegmentTimer(FIELD_INDEX[segment], self._name_to_phase.get(name, -1), self._sink)
             else:
                 timer = self._null
                 if name not in _IGNORED_TIMER_NAMES:

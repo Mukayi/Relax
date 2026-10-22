@@ -41,7 +41,7 @@ from relax.utils.straggler.stats import (
     FORWARD_ONLY_TIMER_SEGMENTS,
     MEGATRON_TIMER_SEGMENTS,
     NUM_FIELDS,
-    PP_PHASE_TIMERS,
+    TIMER_PHASES,
     WindowStats,
     disabled_row,
 )
@@ -55,6 +55,7 @@ logger = get_logger(__name__)
 _FWD_INDEX = FIELD_INDEX["fwd"]
 _BWD_INDEX = FIELD_INDEX["bwd"]
 _LP_FWD_INDEX = FIELD_INDEX["lp_fwd"]
+_PP_RECV_INDEX = FIELD_INDEX["pp_recv"]
 # Segments whose brackets are numbered within the step (micro-batch order).
 _NUMBERED = (_FWD_INDEX, _BWD_INDEX, _LP_FWD_INDEX)
 _CPU_FWD_INDEX = FIELD_INDEX["cpu_fwd"]
@@ -251,7 +252,7 @@ class StragglerCollector:
             gc.callbacks.append(self._on_gc)
         # One timers object per phase so the same Megatron call sites land in
         # different buckets during training vs. forward-only passes.
-        self.train_timers = StragglerTimers(self, MEGATRON_TIMER_SEGMENTS, PP_PHASE_TIMERS)
+        self.train_timers = StragglerTimers(self, MEGATRON_TIMER_SEGMENTS, TIMER_PHASES)
         self.forward_only_timers = StragglerTimers(self, FORWARD_ONLY_TIMER_SEGMENTS)
 
     # ---- hot path -----------------------------------------------------------------------------------------------
@@ -408,7 +409,8 @@ class StragglerCollector:
                 offsets = (trace.anchor.elapsed_time(start_event), trace.anchor.elapsed_time(end_event))
             if not module:
                 window.add_index(segment_index, ms)
-                if phase_index >= 0:
+                # Only a PP wait's phase is a field; a gradient sync's names its timer, for the trace.
+                if segment_index == _PP_RECV_INDEX and phase_index >= 0:
                     window.add_index(phase_index, ms)
             if segment_index == _FWD_INDEX:
                 window.add_index(_CPU_FWD_INDEX, cpu_ms)

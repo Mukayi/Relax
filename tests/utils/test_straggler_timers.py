@@ -7,9 +7,11 @@ from relax.utils.straggler import timers as timers_module
 from relax.utils.straggler.stats import (
     FIELD_INDEX,
     FORWARD_ONLY_TIMER_SEGMENTS,
+    GRAD_SYNC_TIMERS,
     MEGATRON_TIMER_SEGMENTS,
     PP_PHASE_FIELDS,
     PP_PHASE_TIMERS,
+    TIMER_PHASES,
 )
 from relax.utils.straggler.timers import EventPool, StragglerTimers, _NullTimer, _SegmentTimer
 from tests.utils.straggler_helpers import FakeEvent
@@ -76,16 +78,18 @@ def test_segment_timer_start_stop_pushes_pair_with_segment_index():
     assert cpu_ms >= 0.0
 
 
-def test_training_pp_recv_names_carry_their_1f1b_phase():
+def test_training_pp_recv_names_carry_their_1f1b_phase_and_gradient_syncs_their_timer():
     sink = _FakeSink()
-    timers = StragglerTimers(sink, MEGATRON_TIMER_SEGMENTS, PP_PHASE_TIMERS)
-    names = [*PP_PHASE_TIMERS, "forward-send-forward-recv"]
+    timers = StragglerTimers(sink, MEGATRON_TIMER_SEGMENTS, TIMER_PHASES)
+    names = [*PP_PHASE_TIMERS, "forward-send-forward-recv", *GRAD_SYNC_TIMERS]
     for name in names:
         timers(name).start()
         timers(name).stop()
     pushed = [(segment_index, phase_index) for segment_index, phase_index, *_ in sink.pushed]
-    assert pushed == [(FIELD_INDEX["pp_recv"], FIELD_INDEX[PP_PHASE_TIMERS[name]]) for name in PP_PHASE_TIMERS] + [
-        (FIELD_INDEX["pp_recv"], -1)
+    assert pushed == [
+        *[(FIELD_INDEX["pp_recv"], FIELD_INDEX[PP_PHASE_TIMERS[name]]) for name in PP_PHASE_TIMERS],
+        (FIELD_INDEX["pp_recv"], -1),
+        *[(FIELD_INDEX["dp_grad_sync"], position) for position in range(len(GRAD_SYNC_TIMERS))],
     ]
 
 

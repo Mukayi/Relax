@@ -94,6 +94,16 @@ def disabled_row() -> list[float]:
 SELF_SEGMENTS: tuple[str, ...] = ("fwd", "bwd", "optim")
 WAIT_SEGMENTS: tuple[str, ...] = ("pp_recv", "dp_grad_sync", "dp_param_gather")
 
+# The Megatron timers of ``dp_grad_sync``, in the order finalize_model_grads
+# runs them. Only ``all-grads-sync`` waits for the DP reduction; the others
+# reduce over pipeline-stage or tensor-parallel peers.
+GRAD_SYNC_TIMERS: tuple[str, ...] = (
+    "all-grads-sync",
+    "conditional-embedder-grads-all-reduce",
+    "non-tensor-parallel-grads-all-reduce",
+    "embedding-grads-all-reduce",
+)
+
 # Megatron timer name -> segment, for the training phase. Names come from
 # megatron/core/pipeline_parallel/schedules.py, p2p_communication.py,
 # distributed/finalize_model_grads.py, optimizer/optimizer.py and
@@ -111,10 +121,7 @@ MEGATRON_TIMER_SEGMENTS: Mapping[str, str] = {
     "forward-backward-send-forward-backward-recv": "pp_recv",
     "forward-send": "pp_send",
     "backward-send": "pp_send",
-    "all-grads-sync": "dp_grad_sync",
-    "embedding-grads-all-reduce": "dp_grad_sync",
-    "non-tensor-parallel-grads-all-reduce": "dp_grad_sync",
-    "conditional-embedder-grads-all-reduce": "dp_grad_sync",
+    **dict.fromkeys(GRAD_SYNC_TIMERS, "dp_grad_sync"),
     "params-all-gather": "dp_param_gather",
     "optimizer-copy-to-main-grad": "optim",
     "optimizer-unscale-and-check-inf": "optim",
@@ -137,6 +144,14 @@ PP_PHASE_TIMERS: Mapping[str, str] = {
     "backward-send-forward-recv": "pp_wait_up",
     "forward-send-backward-recv": "pp_wait_down",
     "backward-recv": "pp_wait_drain",
+}
+
+# Megatron timer name -> phase slot of its brackets, training phase only: the
+# PP_PHASE_FIELDS index of a PP wait, or a gradient sync's position in
+# GRAD_SYNC_TIMERS. Other brackets carry -1.
+TIMER_PHASES: Mapping[str, int] = {
+    **{name: FIELD_INDEX[phase] for name, phase in PP_PHASE_TIMERS.items()},
+    **{name: position for position, name in enumerate(GRAD_SYNC_TIMERS)},
 }
 
 # Same call sites during ``forward_only`` land in their own buckets so a slow

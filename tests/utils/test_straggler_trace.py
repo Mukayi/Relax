@@ -6,7 +6,7 @@ from array import array
 
 import pytest
 
-from relax.utils.straggler.stats import FIELD_INDEX, MODULE_INDEX
+from relax.utils.straggler.stats import FIELD_INDEX, GRAD_SYNC_TIMERS, MODULE_INDEX
 from relax.utils.straggler.trace import (
     FILE_PREFIX,
     TIMELINE_PID_BASE,
@@ -21,6 +21,10 @@ def _bracket(segment, start, end, phase=None, micro_batch=-1, tokens=-1):
     return (FIELD_INDEX[segment], FIELD_INDEX[phase] if phase else -1, micro_batch, tokens, start, end)
 
 
+def _sync(start, end, timer="all-grads-sync"):
+    return (FIELD_INDEX["dp_grad_sync"], GRAD_SYNC_TIMERS.index(timer), -1, -1, start, end)
+
+
 # Stage 0 of a two-stage 1F1B step: two forwards, a drain wait, two backwards,
 # an 8 ms host-side gap, then the gradient sync and the optimizer.
 _FIRST_STAGE = [
@@ -32,7 +36,7 @@ _FIRST_STAGE = [
     _bracket("bwd", 40, 60, micro_batch=0),
     _bracket("pp_recv", 60, 62, phase="pp_wait_drain"),
     _bracket("bwd", 62, 82, micro_batch=1),
-    _bracket("dp_grad_sync", 90, 95),
+    _sync(90, 95),
     _bracket("optim", 95, 100),
 ]
 _LAST_STAGE = [
@@ -42,7 +46,7 @@ _LAST_STAGE = [
     _bracket("pp_recv", 41, 42, phase="pp_wait_up"),
     _bracket("fwd", 42, 52, micro_batch=1),
     _bracket("bwd", 52, 72, micro_batch=1),
-    _bracket("dp_grad_sync", 90, 95),
+    _sync(90, 95),
     _bracket("optim", 95, 100),
 ]
 
@@ -133,6 +137,19 @@ def test_scalars_report_ranks_alignment_and_the_largest_extra_bubble():
         pytest.approx(-10.0),
         0.0,
     )
+
+
+def test_ranks_align_on_the_dp_gradient_sync_and_the_other_syncs_keep_their_timer_names():
+    # Both ranks end the DP sync together; rank 1's embedding sync, which waits for its own pipeline, ends 3 ms later.
+    steps = [
+        [*_FIRST_STAGE[:-2], _sync(90, 95), _sync(95, end, "embedding-grads-all-reduce"), _bracket("optim", end, 100)]
+        for end in (96, 99)
+    ]
+    trace, metrics = build_trace([_trace(steps[0]), _trace(steps[1], wall=1000.0005)], _meta(2))
+    assert metrics["straggler/trace/align_spread_ms"] == pytest.approx(0.5, abs=1e-3)
+    (dp_sync,) = _slices(trace, 1, "grad sync")
+    (embedding_sync,) = _slices(trace, 1, "embedding-grads-all-reduce")
+    assert (dp_sync["dur"], embedding_sync["dur"]) == (5000, 4000)
 
 
 def test_missing_samples_are_skipped_and_cpu_events_get_their_own_row():

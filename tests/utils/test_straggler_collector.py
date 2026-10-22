@@ -10,7 +10,7 @@ import pytest
 
 from relax.utils.straggler import collector as collector_module
 from relax.utils.straggler.health import HEALTH_DISABLE
-from relax.utils.straggler.stats import FIELD_INDEX, MODULE_INDEX, PP_PHASE_FIELDS
+from relax.utils.straggler.stats import FIELD_INDEX, GPU_SEGMENTS, GRAD_SYNC_TIMERS, MODULE_INDEX, PP_PHASE_FIELDS
 from relax.utils.straggler.trace import RECORD_WIDTH
 from tests.utils.straggler_helpers import FakeEvent, bracket, make_collector, meta
 
@@ -270,6 +270,16 @@ def test_under_interleaved_pp_brackets_carry_no_micro_batch_number_but_keep_thei
         (FIELD_INDEX["fwd"], -1, 300),
         (FIELD_INDEX["fwd"], -1, 900),
         (FIELD_INDEX["bwd"], -1, -1),
+    ]
+
+
+def test_gradient_syncs_count_in_dp_grad_sync_only():
+    collector = _collector(world=1)
+    for name in GRAD_SYNC_TIMERS:
+        bracket(collector, name)
+    collector.drain()
+    assert [collector.window.get(name) for name in GPU_SEGMENTS] == [
+        float(len(GRAD_SYNC_TIMERS)) if name == "dp_grad_sync" else 0.0 for name in GPU_SEGMENTS
     ]
 
 

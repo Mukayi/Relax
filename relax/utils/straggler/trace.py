@@ -9,7 +9,9 @@ pipeline sit next to each other. Within a row the slices nest by time:
   plus ``untimed`` gaps that no bracket covers (host-side time);
 * level 2 (fwd / bwd): inside a busy run, ``F{i}`` / ``B{i}`` per micro-batch
   (``F`` / ``B`` without a number under interleaved PP, where the calls are
-  not in micro-batch order), sends, the gradient sync and the optimizer;
+  not in micro-batch order), sends, the gradient syncs and the optimizer;
+  ``grad sync`` is the DP reduction, the other syncs keep their Megatron timer
+  names;
 * level 3 (modules, only at the ``modules`` level): inside ``F{i}`` / ``B{i}``,
   the forward / backward of the attention and the MLP (``moe``) of every
   layer, e.g. ``attn fwd L3``; a forward inside a ``B{i}`` is an activation
@@ -26,7 +28,14 @@ from typing import Any, Sequence
 
 from relax.utils.logging_utils import get_logger
 from relax.utils.straggler.detector import RankMeta
-from relax.utils.straggler.stats import FIELD_INDEX, GPU_SEGMENTS, MODULE_INDEX, NUM_FIELDS, PP_PHASE_FIELDS
+from relax.utils.straggler.stats import (
+    FIELD_INDEX,
+    GPU_SEGMENTS,
+    GRAD_SYNC_TIMERS,
+    MODULE_INDEX,
+    NUM_FIELDS,
+    PP_PHASE_FIELDS,
+)
 
 
 logger = get_logger(__name__)
@@ -46,6 +55,8 @@ _BWD = FIELD_INDEX["bwd"]
 _LP_FWD = FIELD_INDEX["lp_fwd"]
 _OPTIM = FIELD_INDEX["optim"]
 _GRAD_SYNC = FIELD_INDEX["dp_grad_sync"]
+_DP_GRAD_SYNC = GRAD_SYNC_TIMERS.index("all-grads-sync")
+_GRAD_SYNC_NAMES = dict(enumerate(GRAD_SYNC_TIMERS)) | {_DP_GRAD_SYNC: "grad sync"}
 _RECV = FIELD_INDEX["pp_recv"]
 _LP_RECV = FIELD_INDEX["lp_pp_recv"]
 _SEGMENT_NAMES = {FIELD_INDEX[name]: name for name in GPU_SEGMENTS}
@@ -57,7 +68,6 @@ _MICRO_BATCH_NAMES = {_FWD: "F", _BWD: "B", _LP_FWD: "lp F"}
 _LEVEL2_NAMES = {
     "pp_send": "send",
     "lp_pp_send": "lp send",
-    "dp_grad_sync": "grad sync",
     "dp_param_gather": "param gather",
     "optim": "optimizer",
 }
@@ -109,6 +119,8 @@ def _name(bracket: _Bracket) -> str:
         return "lp bubble"
     if bracket.segment == _RECV:
         return f"bubble {_PHASE_NAMES.get(bracket.phase, 'recv')}"
+    if bracket.segment == _GRAD_SYNC:
+        return _GRAD_SYNC_NAMES[bracket.phase]
     return _LEVEL2_NAMES[_SEGMENT_NAMES[bracket.segment]]
 
 
@@ -254,7 +266,8 @@ def build_trace(
         ]
         events += _rank_events(brackets, pid, wall_us)
         events += _module_events(modules, brackets, pid, wall_us)
-        syncs = [b.end for b in brackets if b.segment == _GRAD_SYNC]
+        # Only the DP reduction ends at the same time on DP peers (see ``GRAD_SYNC_TIMERS``).
+        syncs = [b.end for b in brackets if b.segment == _GRAD_SYNC and b.phase == _DP_GRAD_SYNC]
         if syncs:
             grad_sync_ends.setdefault((rank_meta.pp, rank_meta.tp), []).append(trace.wall * 1e3 + syncs[-1])
         events += trace.cpu_events
