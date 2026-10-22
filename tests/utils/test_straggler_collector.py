@@ -515,6 +515,22 @@ def test_a_module_bracket_finding_the_queue_full_is_dropped_instead_of_a_window_
     assert collector.health.errors_total == 0
 
 
+def test_module_brackets_take_at_most_half_the_queue_and_make_room_without_counting_as_dropped():
+    collector, _ = _tracing_collector(level=3, interval=1, max_pending=4)
+    for layer in (1, 2, 3):
+        _module_bracket(collector, layer)
+    assert collector.pending_events == 2, "the third module bracket found half the queue taken"
+    for _ in range(4):
+        bracket(collector)
+    # Two window brackets filled the queue; the next two pushed out the module brackets.
+    assert (collector.pending_events, collector.window.get("dropped")) == (4, 0.0)
+    bracket(collector)
+    assert collector.window.get("dropped") == 1.0, "only a window bracket counts once the queue is all its own"
+    collector.drain()
+    _module_bracket(collector, 4)
+    assert collector.pending_events == 1
+
+
 @pytest.mark.parametrize(
     ("requested", "trace", "expected"), [(2, True, 2), (2, False, 1), (3, True, 3), (3, False, 1)]
 )

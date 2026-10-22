@@ -159,7 +159,7 @@ class StragglerCollector:
         trace_sink: TraceSink | None = None,
         cpu_events: CpuEventsFn | None = None,
         max_trace_brackets: int = 4096,
-        max_module_brackets: int = 16384,
+        max_module_brackets: int = 8192,
         level: int = 1,
         level_request: Callable[[], int | None] = lambda: None,
     ) -> None:
@@ -186,6 +186,8 @@ class StragglerCollector:
         # Pairs ever pushed and ever popped (folded or dropped): the sequence number of the queue head.
         self._pushed = 0
         self._popped = 0
+        # Module brackets in the queue: at most half of it, so the window's own brackets always have room.
+        self._queued_modules = 0
         # Brackets of each numbered segment pushed in this step, and the token
         # count reported for the training forward bracket that is open (-1 when none was).
         self._step_numbers = dict.fromkeys(_NUMBERED, 0)
@@ -281,25 +283,33 @@ class StragglerCollector:
 
     def push(self, segment_index: int, phase_index: int, start_event: Any, end_event: Any, cpu_ms: float) -> None:
         """Queue one bracket for ``drain``; when the queue is full drop the
-        oldest pair and count it in ``dropped``, so a rank that stops draining
-        cannot grow without bound.
+        oldest pair, so a rank that stops draining cannot grow without bound.
+
+        A dropped window bracket counts in ``dropped``; a dropped module
+        bracket only in the sample's ``lost``. A module bracket that finds the
+        queue full, or half of it taken by module brackets, is dropped itself,
+        so module brackets never cost the window one of its own.
 
         A fwd / bwd / log-prob fwd bracket takes the next micro-batch number of
         its segment in the step; a training forward also takes the token count
-        reported while it was open. A module bracket that finds the queue full
-        is dropped itself, so it never costs the window a bracket.
+        reported while it was open.
         """
-        if len(self._pending) >= self._max_pending:
-            if segment_index >= NUM_FIELDS:
-                self._pool.release(start_event)
-                self._pool.release(end_event)
-                if self._trace is not None:
-                    self._trace.lost += 1
-                return
-            _, _, old_start, old_end, _, _, _ = self._pending.popleft()
+        module = segment_index >= NUM_FIELDS
+        full = len(self._pending) >= self._max_pending
+        if module and (full or 2 * self._queued_modules >= self._max_pending):
+            self._pool.release(start_event)
+            self._pool.release(end_event)
+            if self._trace is not None:
+                self._trace.lost += 1
+            return
+        if full:
+            old_segment, _, old_start, old_end, _, _, _ = self._pending.popleft()
             self._pool.release(old_start)
             self._pool.release(old_end)
-            self._window.add_index(_DROPPED_INDEX, 1.0)
+            if old_segment >= NUM_FIELDS:
+                self._queued_modules -= 1
+            else:
+                self._window.add_index(_DROPPED_INDEX, 1.0)
             if self._trace is not None and self._trace.covers(self._popped):
                 self._trace.lost += 1
             self._popped += 1
@@ -310,6 +320,7 @@ class StragglerCollector:
             if segment_index == _FWD_INDEX:
                 tokens, self._next_tokens = self._next_tokens, -1.0
         self._pending.append((segment_index, phase_index, start_event, end_event, cpu_ms, micro_batch, tokens))
+        self._queued_modules += module
         self._pushed += 1
 
     def _begin_trace(self) -> None:
@@ -418,6 +429,7 @@ class StragglerCollector:
                 else:
                     trace.lost += 1
             pending.popleft()
+            self._queued_modules -= module
             self._pool.release(start_event)
             self._pool.release(end_event)
             self._popped += 1
@@ -756,6 +768,7 @@ class StragglerCollector:
             _, _, start_event, end_event, _, _, _ = self._pending.popleft()
             self._pool.release(start_event)
             self._pool.release(end_event)
+        self._queued_modules = 0
         if self._trace is not None:
             self._pool.release(self._trace.anchor)
             self._trace = None
