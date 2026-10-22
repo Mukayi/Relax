@@ -239,8 +239,10 @@ def test_the_superseded_warning_names_the_window_that_is_returned(monkeypatch):
     assert profiler.collector.health.errors_total == 2, "window 0 superseded, window 2 failed"
 
 
-@pytest.mark.parametrize("primary", [True, False])
-def test_install_uses_the_shared_metrics_primary_rank(monkeypatch, primary):
+@pytest.mark.parametrize(("primary", "vpp"), [(True, None), (False, 2)])
+def test_install_uses_the_shared_metrics_primary_rank_and_numbers_micro_batches_only_without_vpp(
+    monkeypatch, primary, vpp
+):
     monkeypatch.setenv("RELAX_STRAGGLER_PROFILER", "1")
     monkeypatch.setattr(train_metric_utils, "is_metrics_primary_rank", lambda: primary)
     monkeypatch.setattr(runtime, "local_rank_meta", lambda: meta(1)[0])
@@ -249,9 +251,12 @@ def test_install_uses_the_shared_metrics_primary_rank(monkeypatch, primary):
     # The gather group is a collective; its creation is covered separately.
     monkeypatch.setattr(runtime, "init_straggler_gather_group", lambda timeout_s: None)
     monkeypatch.setattr(runtime, "_PROFILER", None)
-    profiler = install_straggler_profiler("actor", _args())
+    args = _args()
+    args.virtual_pipeline_model_parallel_size = vpp
+    profiler = install_straggler_profiler("actor", args)
     try:
         assert profiler.collector.is_primary is primary
         assert profiler.collector._cpu_events_source is runtime._cpu_events
+        assert profiler.collector._number_micro_batches is (vpp is None)
     finally:
         profiler.collector.close()

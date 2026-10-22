@@ -162,6 +162,7 @@ class StragglerCollector:
         max_module_brackets: int = 8192,
         level: int = 1,
         level_request: Callable[[], int | None] = lambda: None,
+        number_micro_batches: bool = True,
     ) -> None:
         if report_interval < 1:
             raise ValueError(
@@ -192,6 +193,9 @@ class StragglerCollector:
         # count reported for the training forward bracket that is open (-1 when none was).
         self._step_numbers = dict.fromkeys(_NUMBERED, 0)
         self._next_tokens = -1.0
+        # Off under interleaved PP, where the n-th forward / backward is not micro-batch n and Megatron's backward
+        # step has no micro-batch or model chunk to number by: brackets then carry -1.
+        self._number_micro_batches = number_micro_batches
         self._trace_enabled = trace
         self.level = self._usable(level)
         # Plain attribute because ``record_event`` checks it on every bracket.
@@ -291,8 +295,8 @@ class StragglerCollector:
         so module brackets never cost the window one of its own.
 
         A fwd / bwd / log-prob fwd bracket takes the next micro-batch number of
-        its segment in the step; a training forward also takes the token count
-        reported while it was open.
+        its segment in the step (none under interleaved PP); a training forward
+        also takes the token count reported while it was open.
         """
         module = segment_index >= NUM_FIELDS
         full = len(self._pending) >= self._max_pending
@@ -319,6 +323,8 @@ class StragglerCollector:
             self._step_numbers[segment_index] = micro_batch + 1
             if segment_index == _FWD_INDEX:
                 tokens, self._next_tokens = self._next_tokens, -1.0
+            if not self._number_micro_batches:
+                micro_batch = -1
         self._pending.append((segment_index, phase_index, start_event, end_event, cpu_ms, micro_batch, tokens))
         self._queued_modules += module
         self._pushed += 1

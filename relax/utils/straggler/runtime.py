@@ -347,6 +347,7 @@ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None
         level=initial_level(bool(traces_to)),
         # Read at window closes; the poller is created below, once there is a collector to report.
         level_request=lambda: poller.requested if poller is not None else None,
+        number_micro_batches=(getattr(args, "virtual_pipeline_model_parallel_size", None) or 1) == 1,
     )
     if is_primary and getattr(args, "use_metrics_service", False):
         from relax.utils.utils import get_serve_url

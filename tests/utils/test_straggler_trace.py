@@ -185,6 +185,13 @@ def test_module_brackets_nest_in_their_micro_batch_and_mark_recompute_and_log_pr
     }
 
 
+def test_brackets_without_a_micro_batch_number_are_named_without_one():
+    brackets = [_bracket("fwd", 0, 10, tokens=300), _bracket("bwd", 10, 30), _module("attn_fwd", 1, 1, 4)]
+    trace, _ = build_trace([_trace(brackets)], _meta(1))
+    named = {e["name"]: e.get("args", {}) for e in _slices(trace, 0) if e["name"] != "busy"}
+    assert named == {"F": {"tokens": 300}, "B": {}, "attn fwd L1": {"layer": 1}}
+
+
 def test_without_pp_there_is_no_bubble_estimate():
     trace, metrics = build_trace([_trace(_FIRST_STAGE[:4])], _meta(1))
     assert _meta_name(trace, 0)["name"] == "pp0 dp0 tp0 · rank 0"

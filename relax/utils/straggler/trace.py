@@ -7,8 +7,9 @@ pipeline sit next to each other. Within a row the slices nest by time:
 
 * level 1 (PP): busy runs and the PP waits between them (``bubble <phase>``),
   plus ``untimed`` gaps that no bracket covers (host-side time);
-* level 2 (fwd / bwd): inside a busy run, ``F{i}`` / ``B{i}`` per micro-batch,
-  sends, the gradient sync and the optimizer;
+* level 2 (fwd / bwd): inside a busy run, ``F{i}`` / ``B{i}`` per micro-batch
+  (``F`` / ``B`` without a number under interleaved PP, where the calls are
+  not in micro-batch order), sends, the gradient sync and the optimizer;
 * level 3 (modules, only at the ``modules`` level): inside ``F{i}`` / ``B{i}``,
   the forward / backward of the attention and the MLP (``moe``) of every
   layer, e.g. ``attn fwd L3``; a forward inside a ``B{i}`` is an activation
@@ -52,6 +53,7 @@ _PHASE_NAMES = {FIELD_INDEX[name]: name.removeprefix("pp_wait_") for name in PP_
 _MODULE_NAMES = {index: name.replace("_", " ") for name, index in MODULE_INDEX.items()}
 _MODULE_FORWARDS = frozenset(index for name, index in MODULE_INDEX.items() if name.endswith("_fwd"))
 _WAITS_FOR = {"fill": "previous stage", "up": "previous stage", "down": "next stage", "drain": "next stage"}
+_MICRO_BATCH_NAMES = {_FWD: "F", _BWD: "B", _LP_FWD: "lp F"}
 _LEVEL2_NAMES = {
     "pp_send": "send",
     "lp_pp_send": "lp send",
@@ -100,12 +102,9 @@ def _brackets(trace: RankTrace) -> list[_Bracket]:
 
 
 def _name(bracket: _Bracket) -> str:
-    if bracket.segment == _FWD:
-        return f"F{bracket.micro_batch}"
-    if bracket.segment == _BWD:
-        return f"B{bracket.micro_batch}"
-    if bracket.segment == _LP_FWD:
-        return f"lp F{bracket.micro_batch}"
+    name = _MICRO_BATCH_NAMES.get(bracket.segment)
+    if name is not None:
+        return name if bracket.micro_batch < 0 else f"{name}{bracket.micro_batch}"
     if bracket.segment == _LP_RECV:
         return "lp bubble"
     if bracket.segment == _RECV:
@@ -189,7 +188,8 @@ def _module_events(
         name = f"{_MODULE_NAMES[module.segment]} L{module.phase}"
         args: dict[str, Any] = {"layer": module.phase}
         if outer is not None:
-            args["micro_batch"] = outer.micro_batch
+            if outer.micro_batch >= 0:
+                args["micro_batch"] = outer.micro_batch
             if outer.segment == _BWD and module.segment in _MODULE_FORWARDS:
                 name += " (recompute)"
             elif outer.segment == _LP_FWD:

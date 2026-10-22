@@ -254,6 +254,25 @@ def _timed(collector, name, ms, tokens=None):
     timer.stop()
 
 
+def test_under_interleaved_pp_brackets_carry_no_micro_batch_number_but_keep_their_tokens():
+    collector, calls = _tracing_collector(number_micro_batches=False)
+    for rollout_id in range(2):
+        collector.end_step(rollout_id=rollout_id)
+    _timed(collector, "forward-compute", 3, tokens=300)
+    _timed(collector, "forward-compute", 7, tokens=900)
+    _timed(collector, "backward-compute", 5)
+    collector.end_step(rollout_id=2)
+    window = collector.window
+    assert [window.get(name) for name in ("mb_fwd_max", "mb_fwd_argmax", "mb_fwd_argmax_tokens")] == [7.0, -1.0, 900.0]
+    collector.end_step(rollout_id=3)
+    sample, _ = calls["gathered"][-1]
+    assert [(int(r[0]), int(r[2]), int(r[3])) for r in _rows(sample)] == [
+        (FIELD_INDEX["fwd"], -1, 300),
+        (FIELD_INDEX["fwd"], -1, 900),
+        (FIELD_INDEX["bwd"], -1, -1),
+    ]
+
+
 def test_training_pp_waits_are_also_split_by_1f1b_phase():
     collector = _collector(world=1)
     for name in ("forward-recv", "backward-send-forward-recv", "forward-send-backward-recv", "backward-recv"):
