@@ -1,0 +1,6 @@
+[straggler] step=9 no straggler (uncertain 0); self median 988.7 ms max 991.9 ms (rank 1, +0%), latest to grad-sync rank 5 by 8.1 ms (peers idle 100.9 ms), pp_stage_imbalance 1.00, overhead 0.16 ms/step
+[straggler] step=19 no straggler (uncertain 0); self median 792.4 ms max 794.6 ms (rank 1, +0%), latest to grad-sync rank 4 by 9.4 ms (peers idle 16.2 ms), pp_stage_imbalance 1.00, overhead 0.14 ms/step
+[straggler] step=29 no straggler (uncertain 0); self median 794.6 ms max 796.0 ms (rank 6, +0%), latest to grad-sync rank 7 by 11.5 ms (peers idle 17.8 ms), pp_stage_imbalance 1.00, overhead 0.14 ms/step
+[straggler] step=39 no straggler (uncertain 0); self median 805.9 ms max 807.2 ms (rank 1, +0%), latest to grad-sync rank 0 by 12.9 ms (peers idle 20.3 ms), pp_stage_imbalance 1.00, overhead 0.13 ms/step
+[straggler] step=49 no straggler (uncertain 0); self median 817.7 ms max 819.2 ms (rank 1, +0%), latest to grad-sync rank 0 by 9.2 ms (peers idle 17.1 ms), pp_stage_imbalance 1.00, overhead 0.13 ms/step
+[straggler] step=59 no straggler (uncertain 0); self median 811.7 ms max 813.8 ms (rank 1, +0%), latest to grad-sync rank 0 by 7.8 ms (peers idle 15.6 ms), pp_stage_imbalance 1.00, overhead 0.14 ms/step

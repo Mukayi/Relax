@@ -1,0 +1,56 @@
+{
+  "verdict": "PASS",
+  "overlap": {
+    "off": 0.6326261976715978,
+    "on": 0.5557064753611854,
+    "off2": 0.5910993102517934,
+    "drop": 0.07691972231041233,
+    "tolerance": 0.08305377483960874,
+    "tolerance_source": "2 x |off - off2|",
+    "pass": true
+  },
+  "syncs": {
+    "per_call": {
+      "cudaDeviceSynchronize": {
+        "off": 3,
+        "on": 3,
+        "slack": 0,
+        "pass": true
+      },
+      "cudaEventSynchronize": {
+        "off": 0.75,
+        "on": 0.75,
+        "slack": 0.0,
+        "pass": true
+      },
+      "cudaStreamSynchronize": {
+        "off": 280.75,
+        "on": 280.75,
+        "slack": 0.0,
+        "pass": true
+      }
+    },
+    "pass": true
+  },
+  "nccl_kernels": {
+    "off": 79.25,
+    "on": 82.75,
+    "slack": 3.625,
+    "pass": true
+  },
+  "event_calls": {
+    "off": {
+      "records": 2745,
+      "queries": 11770.375
+    },
+    "on": {
+      "records": 2793,
+      "queries": 10526.375
+    }
+  },
+  "n_traces": {
+    "off": 8,
+    "on": 8,
+    "off2": 8
+  }
+}

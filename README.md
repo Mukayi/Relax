@@ -33,3 +33,17 @@ The measurements were taken on `f203bff`; `fig_mechanism` and `fig_detector` sho
 | `figures/fig_loss` | Same-seed loss off vs on |
 | `figures/make_figures.py` | Regenerates every figure (PNG + SVG) |
 | `scripts/` | Microbenchmark, crossover driver, holders, experiment-only toggle patch (set `WORKDIR` before running) |
+
+## Follow-up on the final code (2026-10-23)
+
+PR head `a829f13` plus #462 (the torch 2.13 fix) and #463 (the metrics-service fix, as in the acceptance version); Qwen3-0.6B SFT DP8, overlap on.
+
+- **Numbers** (`followup/acceptance/numbers_*`): 40 rollouts with the same seed, every run saving its grad norms. With the profiler at its most intrusive setting (modules level, trace, a window every rollout) against a profiler-off run: grad norm max 2.39 % / median 0.27 %, loss max 0.053 % / median 0.013 %. Two profiler-off runs: 2.31 % / 0.34 % and 0.070 % / 0.018 %.
+- **Overlap** (`followup/acceptance/overlap_*`, metrics service on, torch.profiler on two rollouts): at level 1 and on the ordinary steps of level 2, the overlap ratio, the synchronizing calls and the NCCL kernels stay within the spread of two profiler-off runs; the sampled step of level 2 (once per window) adds its one `cudaDeviceSynchronize`.
+- **Detection with reporting on** (`followup/acceptance/detection_*.log`): no injection, 0 alerts in 6 windows; GPU 5 SM hog, rank 5 `slow_device` at step 29; rank 3 sleeping 200 ms per step, rank 3 `late_arrival` at step 29.
+- **VPP identity** (`followup/vpp/`): PP2 with 2 model chunks per rank and DP4, modules level; `check_vpp_trace.py` checks layer ranges, token counts and cross-stage order. With `--microbatch-group-size-per-virtual-pipeline-stage 3`, which Bridge does not copy into the model config, the code before `e8d3dae` put half of the module slices in the wrong chunk; from `e8d3dae` on, all of them are right.
+
+| File | Content |
+| --- | --- |
+| `followup/acceptance/` | Per-step grad norm / loss and their summary (`compare_numbers.py`); overlap verdicts (`overlap_check.py`); detection log lines; the run scripts (set `WORKDIR`, `RELAX_CODE`, `RELAX_ENV`) |
+| `followup/vpp/` | VPP check outputs, merged traces before and after the group-size fix, the checker and the run script |

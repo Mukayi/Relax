@@ -1,0 +1,4 @@
+grad norm A/A: steps 40, identical 0, max 2.313%, median 0.339%, check fails 2 (first (20, 0))
+grad norm A/B: steps 40, identical 0, max 2.388%, median 0.271%, check fails 4 (first (13, 0))
+loss A/A: steps 40, identical 1, max 0.070%, median 0.018%, check fails 0
+loss A/B: steps 40, identical 1, max 0.053%, median 0.013%, check fails 0
