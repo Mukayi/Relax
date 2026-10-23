@@ -147,7 +147,7 @@ def test_the_model_reaches_the_collector_only_with_a_profiler(monkeypatch):
     profiler = _profiler()
     monkeypatch.setattr(runtime, "_PROFILER", profiler)
     runtime.register_straggler_model([])
-    assert profiler.collector.module_timers.blocks == 0
+    assert not profiler.collector.module_timers.counts()
     runtime.register_straggler_model([object()])
     assert profiler.collector.health.errors_total == 1, "a model without modules() is a profiler error"
 

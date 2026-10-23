@@ -1,71 +1,162 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Module brackets for the ``modules`` level: forward and backward of the
-attention and of the MLP / MoE block of every transformer layer, recorded on
+blocks that ``MODULE_SPECS`` names inside every transformer layer (by default
+the attention, the MLP / MoE block and the parts of a MoE layer), recorded on
 the sampled step only.
 
 The hooks are attached when a sampled step at that level starts and removed
-when it ends, so no other step pays for them. Forward uses module pre / post
-hooks. Backward uses gradient hooks on the block's output (its gradient
-arriving opens the bracket) and on its input (closes it), which also holds
-under activation recompute, where the block's forward runs again inside the
-backward. Which micro-batch a bracket belongs to, and whether a forward was a
-recompute, is read off the trace by containment (see ``trace``).
+when it ends, so no other step pays for them. A block that is a module is
+timed with module pre / post hooks; a block that is a method (such as the token
+exchange of a MoE layer) is timed by a wrapper that exists only while attached.
+Backward uses gradient hooks on the block's output (its gradient arriving opens
+the bracket) and on its input (closes it), which also holds under activation
+recompute, where the block's forward runs again inside the backward. Which
+micro-batch a bracket belongs to, and whether a forward was a recompute, is
+read off the trace by containment (see ``trace``).
+
+Timing the blocks of another model means adding specs to ``MODULE_SPECS``.
 """
 
 from __future__ import annotations
 
+from collections import Counter
+from dataclasses import dataclass
 from typing import Any, Iterable
 
-from relax.utils.straggler.stats import MODULE_INDEX
+from relax.utils.straggler.stats import NUM_FIELDS
 from relax.utils.straggler.timers import EventSink
 
 
-_SKIPPED_BLOCKS = frozenset({"IdentityOp", "IdentityFuncOp"})
+@dataclass(frozen=True)
+class ModuleSpec:
+    """One kind of block: the object at attribute ``path`` of a transformer
+    layer (any module with ``layer_number``), named ``name`` in the trace.
+
+    ``method`` times that method of the object instead of its forward, for a
+    part that is not a module; ``when`` requires the object's class name to
+    contain it. The first spec that matches a (path, method) pair wins.
+    """
+
+    path: str
+    name: str
+    method: str | None = None
+    when: str | None = None
+
+
+MODULE_SPECS: tuple[ModuleSpec, ...] = (
+    ModuleSpec("self_attention", "attn"),
+    ModuleSpec("mlp", "moe", when="MoE"),
+    ModuleSpec("mlp", "mlp"),
+    # Inside a MoE layer: routing, the token exchange around the experts (the EP all-to-all) and the experts.
+    ModuleSpec("mlp.router", "router"),
+    ModuleSpec("mlp.token_dispatcher", "dispatch", method="token_dispatch"),
+    ModuleSpec("mlp.experts", "experts"),
+    ModuleSpec("mlp.token_dispatcher", "combine", method="token_combine"),
+    ModuleSpec("mlp.shared_experts", "shared experts"),
+)
+# Block names; a block's forward and backward brackets are record segments NUM_FIELDS + 2 * index (+ 1).
+MODULE_NAMES: tuple[str, ...] = tuple(dict.fromkeys(spec.name for spec in MODULE_SPECS))
+
+# Megatron's placeholders for blocks a layer does not have.
+PLACEHOLDERS = frozenset({"IdentityOp", "IdentityFuncOp"})
+
+
+def module_segment(name: str, backward: bool) -> int:
+    """The record segment of a block's forward or backward bracket."""
+    return NUM_FIELDS + 2 * MODULE_NAMES.index(name) + backward
+
+
+def module_block(segment: int) -> tuple[str, bool]:
+    """Block name of a module record segment and whether it is a backward."""
+    offset = segment - NUM_FIELDS
+    return MODULE_NAMES[offset // 2], bool(offset % 2)
+
+
+def _resolve(obj: Any, path: str) -> Any:
+    for part in path.split("."):
+        obj = getattr(obj, part, None)
+        if obj is None:
+            return None
+    return obj
 
 
 class ModuleTimers:
-    """The attention and MLP / MoE blocks of the transformer layers found in
+    """The ``MODULE_SPECS`` blocks of the transformer layers found in
     ``model_chunks``, bracketed into ``sink`` (the collector) while attached.
 
-    A layer is any module with ``self_attention``, ``mlp`` and ``layer_number``
-    (Megatron's ``TransformerLayer``, including the one inside an MTP layer,
-    whose numbers start at 1 again and are recorded negated); identity
-    placeholders are skipped.
+    The layers inside an MTP layer number from 1 again and are recorded
+    negated; identity placeholders are skipped.
     """
 
     def __init__(self, model_chunks: Iterable[Any], sink: EventSink) -> None:
         self._sink = sink
-        self._blocks: list[tuple[Any, str, int]] = []
+        # (object, method or None, block name, layer)
+        self._blocks: list[tuple[Any, str | None, str, int]] = []
         for chunk in model_chunks:
             for module in chunk.modules():
                 layer = getattr(module, "layer_number", None)
                 if layer is None:
                     continue
                 layer = -int(layer) if getattr(module, "is_mtp_layer", False) else int(layer)
-                for name in ("self_attention", "mlp"):
-                    block = getattr(module, name, None)
-                    if block is None or type(block).__name__ in _SKIPPED_BLOCKS:
+                taken = set()
+                for spec in MODULE_SPECS:
+                    key = (spec.path, spec.method)
+                    block = None if key in taken else _resolve(module, spec.path)
+                    if block is None or type(block).__name__ in PLACEHOLDERS:
                         continue
-                    kind = "attn" if name == "self_attention" else ("moe" if "MoE" in type(block).__name__ else "mlp")
-                    self._blocks.append((block, kind, layer))
+                    if spec.method is not None and not callable(getattr(block, spec.method, None)):
+                        continue
+                    if spec.when is None or spec.when in type(block).__name__:
+                        taken.add(key)
+                        self._blocks.append((block, spec.method, spec.name, layer))
         self._handles: list[Any] = []
 
-    @property
-    def blocks(self) -> int:
-        return len(self._blocks)
+    def counts(self) -> Counter:
+        """Blocks found, by name."""
+        return Counter(name for _, _, name, _ in self._blocks)
 
     def attach(self) -> None:
         if self._handles:
             return
-        for block, kind, layer in self._blocks:
-            hooks = _BlockHooks(self._sink, MODULE_INDEX[f"{kind}_fwd"], MODULE_INDEX[f"{kind}_bwd"], layer)
-            self._handles.append(block.register_forward_pre_hook(hooks.pre, with_kwargs=True))
-            self._handles.append(block.register_forward_hook(hooks.post, with_kwargs=True))
+        for block, method, name, layer in self._blocks:
+            hooks = _BlockHooks(self._sink, module_segment(name, False), module_segment(name, True), layer)
+            if method is None:
+                self._handles.append(block.register_forward_pre_hook(hooks.pre, with_kwargs=True))
+                self._handles.append(block.register_forward_hook(hooks.post, with_kwargs=True))
+            else:
+                self._handles.append(_MethodWrapper(block, method, hooks))
 
     def detach(self) -> None:
         handles, self._handles = self._handles, []
         for handle in handles:
             handle.remove()
+
+
+class _MethodWrapper:
+    """Brackets the calls of ``owner.<method>`` with ``hooks`` by shadowing the
+    method with an instance attribute until ``remove``."""
+
+    __slots__ = ("_owner", "_method", "_saved")
+
+    def __init__(self, owner: Any, method: str, hooks: _BlockHooks) -> None:
+        self._owner = owner
+        self._method = method
+        self._saved = owner.__dict__.get(method)
+        original = getattr(owner, method)
+
+        def timed(*args: Any, **kwargs: Any) -> Any:
+            hooks.pre(owner, args, kwargs)
+            output = original(*args, **kwargs)
+            hooks.post(owner, args, kwargs, output)
+            return output
+
+        setattr(owner, method, timed)
+
+    def remove(self) -> None:
+        if self._saved is None:
+            delattr(self._owner, self._method)
+        else:
+            setattr(self._owner, self._method, self._saved)
 
 
 def _grad_tensor(value: Any) -> Any:

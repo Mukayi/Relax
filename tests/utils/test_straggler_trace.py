@@ -6,7 +6,8 @@ from array import array
 
 import pytest
 
-from relax.utils.straggler.stats import FIELD_INDEX, GRAD_SYNC_TIMERS, MODULE_INDEX
+from relax.utils.straggler.modules import module_segment
+from relax.utils.straggler.stats import FIELD_INDEX, GRAD_SYNC_TIMERS
 from relax.utils.straggler.trace import (
     FILE_PREFIX,
     TIMELINE_PID_BASE,
@@ -167,7 +168,8 @@ def test_missing_samples_are_skipped_and_cpu_events_get_their_own_row():
 
 
 def _module(name, layer, start, end):
-    return (MODULE_INDEX[name], layer, -1, -1, start, end)
+    block, direction = name.rsplit("_", 1)
+    return (module_segment(block, direction == "bwd"), layer, -1, -1, start, end)
 
 
 def test_module_brackets_nest_in_their_micro_batch_and_mark_recompute_and_log_prob_forwards():

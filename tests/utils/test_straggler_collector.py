@@ -10,9 +10,13 @@ import pytest
 
 from relax.utils.straggler import collector as collector_module
 from relax.utils.straggler.health import HEALTH_DISABLE
-from relax.utils.straggler.stats import FIELD_INDEX, GPU_SEGMENTS, GRAD_SYNC_TIMERS, MODULE_INDEX, PP_PHASE_FIELDS
+from relax.utils.straggler.modules import module_segment
+from relax.utils.straggler.stats import FIELD_INDEX, GPU_SEGMENTS, GRAD_SYNC_TIMERS, PP_PHASE_FIELDS
 from relax.utils.straggler.trace import RECORD_WIDTH
 from tests.utils.straggler_helpers import FakeEvent, bracket, make_collector, meta
+
+
+_ATTN_FWD = module_segment("attn", False)
 
 
 class _FakeCapture:
@@ -545,7 +549,7 @@ def _module_bracket(collector, layer):
     start = collector.record_event()
     end = collector.record_event()
     if start is not None:
-        collector.push(MODULE_INDEX["attn_fwd"], layer, start, end, 0.0)
+        collector.push(_ATTN_FWD, layer, start, end, 0.0)
 
 
 def test_the_modules_level_hooks_only_the_sampled_step_and_keeps_module_brackets_out_of_the_window():
@@ -563,7 +567,7 @@ def test_the_modules_level_hooks_only_the_sampled_step_and_keeps_module_brackets
     sample, _ = calls["gathered"][-1]
     # The fwd bracket and the first module bracket, each under its own cap; the second module bracket is lost.
     rows = _rows(sample)
-    assert [int(r[0]) for r in rows] == [FIELD_INDEX["fwd"], MODULE_INDEX["attn_fwd"]] and rows[1][1] == 1.0
+    assert [int(r[0]) for r in rows] == [FIELD_INDEX["fwd"], _ATTN_FWD] and rows[1][1] == 1.0
     assert sample.lost == 1
     assert [row[FIELD_INDEX["fwd"]] for row in gathered] == [2.0, 2.0]
     assert collector.health.errors_total == 0
@@ -619,7 +623,7 @@ def test_a_window_bracket_pushes_out_a_module_bracket_queued_after_older_window_
         FIELD_INDEX["pp_recv"],
         FIELD_INDEX["fwd"],
         FIELD_INDEX["bwd"],
-        MODULE_INDEX["attn_fwd"],
+        _ATTN_FWD,
     ]
     assert records[-1][1] == 2 and sample.lost == 1
 
@@ -632,7 +636,7 @@ def test_module_brackets_in_flight_at_the_close_do_not_count_as_unread():
     start = collector.record_event()
     end = collector.record_event()
     end.done = False
-    collector.push(MODULE_INDEX["attn_fwd"], 1, start, end, 0.0)
+    collector.push(_ATTN_FWD, 1, start, end, 0.0)
     collector.end_step(rollout_id=1)
     assert rows[-1][FIELD_INDEX["unread"]] == 0.0
     # The sample is dropped, its module bracket with it.

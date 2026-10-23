@@ -16,8 +16,8 @@ from relax.utils.straggler.health import HEALTH_DISABLE
 # Compute-stream time (ms, summed over the window) per coarse segment. The
 # first block is fed by Megatron's own ``config.timers`` call sites (see
 # MEGATRON_TIMER_SEGMENTS); the ``lp_*`` block is the same call sites during
-# ``forward_only`` (log-prob passes). Adding a segment (e.g. for MoE dispatch
-# hooks) is one entry here plus one mapping below.
+# ``forward_only`` (log-prob passes). Adding a segment is one entry here plus
+# one mapping below.
 GPU_SEGMENTS: tuple[str, ...] = (
     "fwd",
     "bwd",
@@ -67,13 +67,6 @@ FIELDS: tuple[str, ...] = (
 )
 FIELD_INDEX: Mapping[str, int] = {name: index for index, name in enumerate(FIELDS)}
 NUM_FIELDS: int = len(FIELDS)
-
-# Module brackets of a sampled step at the ``modules`` level: the attention and
-# the MLP (``moe`` when it is a MoE layer) of every transformer layer, forward
-# and backward. They only go into the trace, never into a window, so their
-# indices start after the last field.
-MODULE_SEGMENTS: tuple[str, ...] = ("attn_fwd", "attn_bwd", "mlp_fwd", "mlp_bwd", "moe_fwd", "moe_bwd")
-MODULE_INDEX: Mapping[str, int] = {name: NUM_FIELDS + index for index, name in enumerate(MODULE_SEGMENTS)}
 
 
 def disabled_row() -> list[float]:

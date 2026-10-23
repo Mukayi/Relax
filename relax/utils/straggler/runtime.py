@@ -363,7 +363,12 @@ def register_straggler_model(model_chunks: Sequence[Any]) -> None:
         return
     collector.module_timers = timers
     if collector.is_primary:
-        logger.info("[straggler] modules level: %d attention / MLP blocks on this rank", timers.blocks)
+        counts = timers.counts()
+        logger.info(
+            "[straggler] modules level: %d blocks on this rank (%s)",
+            counts.total(),
+            ", ".join(f"{name} {count}" for name, count in counts.items()),
+        )
 
 
 def initial_level(trace_on: bool) -> int:

@@ -13,9 +13,9 @@ pipeline sit next to each other. Within a row the slices nest by time:
   ``grad sync`` is the DP reduction, the other syncs keep their Megatron timer
   names;
 * level 3 (modules, only at the ``modules`` level): inside ``F{i}`` / ``B{i}``,
-  the forward / backward of the attention and the MLP (``moe``) of every
-  layer, e.g. ``attn fwd L3`` (``attn fwd MTP L1`` for an MTP layer); a
-  forward inside a ``B{i}`` is an activation recompute.
+  the forward / backward of the blocks ``modules.MODULE_SPECS`` names in
+  every layer, e.g. ``attn fwd L3``, ``dispatch bwd L3`` (``attn fwd MTP L1``
+  for an MTP layer); a forward inside a ``B{i}`` is an activation recompute.
 """
 
 from __future__ import annotations
@@ -28,11 +28,11 @@ from typing import Any, Sequence
 
 from relax.utils.logging_utils import get_logger
 from relax.utils.straggler.detector import RankMeta
+from relax.utils.straggler.modules import module_block
 from relax.utils.straggler.stats import (
     FIELD_INDEX,
     GPU_SEGMENTS,
     GRAD_SYNC_TIMERS,
-    MODULE_INDEX,
     NUM_FIELDS,
     PP_PHASE_FIELDS,
 )
@@ -61,8 +61,6 @@ _RECV = FIELD_INDEX["pp_recv"]
 _LP_RECV = FIELD_INDEX["lp_pp_recv"]
 _SEGMENT_NAMES = {FIELD_INDEX[name]: name for name in GPU_SEGMENTS}
 _PHASE_NAMES = {FIELD_INDEX[name]: name.removeprefix("pp_wait_") for name in PP_PHASE_FIELDS}
-_MODULE_NAMES = {index: name.replace("_", " ") for name, index in MODULE_INDEX.items()}
-_MODULE_FORWARDS = frozenset(index for name, index in MODULE_INDEX.items() if name.endswith("_fwd"))
 _WAITS_FOR = {"fill": "previous stage", "up": "previous stage", "down": "next stage", "drain": "next stage"}
 _MICRO_BATCH_NAMES = {_FWD: "F", _BWD: "B", _LP_FWD: "lp F"}
 _LEVEL2_NAMES = {
@@ -212,11 +210,12 @@ def _module_events(
             outers[j] if j < len(outers) and outers[j].start <= module.start <= module.end <= outers[j].end else None
         )
         layer, mtp = abs(module.phase), module.phase < 0
-        name = f"{_MODULE_NAMES[module.segment]} {'MTP ' if mtp else ''}L{layer}"
+        block, backward = module_block(module.segment)
+        name = f"{block} {'bwd' if backward else 'fwd'} {'MTP ' if mtp else ''}L{layer}"
         args: dict[str, Any] = {"layer": layer, "mtp": True} if mtp else {"layer": layer}
         if outer is not None:
             args.update(_micro_batch_args(outer))
-            if outer.segment == _BWD and module.segment in _MODULE_FORWARDS:
+            if outer.segment == _BWD and not backward:
                 name += " (recompute)"
             elif outer.segment == _LP_FWD:
                 name = f"lp {name}"

@@ -5,7 +5,7 @@ for it on a daemon thread, and the window gather hands it to every rank.
 
 Levels: 0 paused (no brackets recorded, windows not analyzed), 1 coarse (the
 per-window statistics), 2 detail (plus the sampled-step trace), 3 modules
-(plus the attention / MLP forward and backward of every layer in that trace;
+(plus the forward and backward of the blocks of every layer in that trace;
 never the default).
 """
 
@@ -135,7 +135,7 @@ button.current { font-weight: bold; }
 <button data-level="0">Pause</button>
 <button data-level="1">Coarse</button>
 <button data-level="2">Detail (sampled-step trace)</button>
-<button data-level="3">Modules (detail + attention / MLP per layer)</button>
+<button data-level="3">Modules (detail + per-layer blocks)</button>
 </p>
 <p>A change takes effect at the next window boundary, at most RELAX_STRAGGLER_REPORT_INTERVAL rollouts
 later. Detail and modules need a trace directory (RELAX_STRAGGLER_TRACE_DIR or --timeline-dump-dir);

@@ -10,11 +10,7 @@ torch = pytest.importorskip("torch")
 from torch import nn  # noqa: E402
 from torch.utils.checkpoint import checkpoint  # noqa: E402
 
-from relax.utils.straggler.modules import ModuleTimers  # noqa: E402
-from relax.utils.straggler.stats import MODULE_INDEX  # noqa: E402
-
-
-_NAMES = {index: name for name, index in MODULE_INDEX.items()}
+from relax.utils.straggler.modules import ModuleTimers, module_block  # noqa: E402
 
 
 class _Sink:
@@ -34,7 +30,8 @@ class _Sink:
         return self.clock
 
     def push(self, segment, layer, start, end, cpu_ms):
-        self.pushed.append((_NAMES[segment], layer, start, end))
+        name, backward = module_block(segment)
+        self.pushed.append((f"{name}_{'bwd' if backward else 'fwd'}", layer, start, end))
 
     def discard_event(self, event):
         self.discarded.append(event)
@@ -60,6 +57,54 @@ class _Block(nn.Module):
 
 class MoELayer(_Block):
     pass
+
+
+class _Router(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate = nn.Linear(4, 2)
+
+    def forward(self, hidden_states):
+        return self.gate(hidden_states).softmax(-1)
+
+
+class _Dispatcher:
+    """A plain object with the token exchange as methods, like Megatron's token
+    dispatchers."""
+
+    def token_dispatch(self, hidden_states, probs):
+        return hidden_states * 1.0, probs
+
+    def token_combine(self, hidden_states):
+        return hidden_states * 1.0
+
+
+class _Experts(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(4, 4)
+
+    def forward(self, hidden_states, probs):
+        return self.proj(hidden_states) * probs[..., :1], None
+
+
+class _RoutedMoELayer(nn.Module):
+    """Megatron's MoE layer in miniature: route, dispatch, experts, combine,
+    shared experts."""
+
+    def __init__(self):
+        super().__init__()
+        self.router = _Router()
+        self.token_dispatcher = _Dispatcher()
+        self.experts = _Experts()
+        self.shared_experts = nn.Linear(4, 4)
+
+    def forward(self, hidden_states, padding_mask=None):
+        probs = self.router(hidden_states)
+        tokens, probs = self.token_dispatcher.token_dispatch(hidden_states.clone(), probs)
+        output, _ = self.experts(tokens, probs)
+        output = self.token_dispatcher.token_combine(output).view_as(hidden_states)
+        return output + self.shared_experts(hidden_states), None
 
 
 class IdentityOp(nn.Module):
@@ -93,7 +138,7 @@ def _run(model, x):
 
 def test_attention_and_mlp_of_every_layer_are_found_and_identity_blocks_skipped():
     model = nn.Sequential(_Layer(1), _Layer(2, mlp=MoELayer()), _Layer(3, mlp=IdentityOp()))
-    assert ModuleTimers([model], _Sink()).blocks == 5
+    assert ModuleTimers([model], _Sink()).counts() == {"attn": 3, "mlp": 1, "moe": 1}
 
 
 def test_forward_and_backward_brackets_follow_the_execution_order_and_leave_gradients_unchanged():
@@ -127,6 +172,40 @@ def test_forward_and_backward_brackets_follow_the_execution_order_and_leave_grad
     timers.detach()
     _run(model, x)
     assert len(sink.pushed) == 8
+
+
+def test_the_parts_of_a_moe_layer_nest_inside_it_forward_and_backward_and_leave_gradients_unchanged():
+    torch.manual_seed(0)
+    model = nn.Sequential(_Layer(1, mlp=_RoutedMoELayer()))
+    x = torch.randn(2, 4, requires_grad=True)
+    _run(model, x)
+    expected = [p.grad.clone() for p in model.parameters()]
+    model.zero_grad()
+
+    parts = ("router", "dispatch", "experts", "combine", "shared experts")
+    sink = _Sink()
+    timers = ModuleTimers([model], sink)
+    assert timers.counts() == {"attn": 1, "moe": 1, **dict.fromkeys(parts, 1)}
+    timers.attach()
+    _run(model, x)
+    spans = {name: (start, end) for name, _, start, end in sink.pushed}
+    for direction in ("fwd", "bwd"):
+        outer_start, outer_end = spans[f"moe_{direction}"]
+        for part in parts:
+            start, end = spans[f"{part}_{direction}"]
+            assert outer_start < start < end < outer_end, (part, direction, spans)
+    assert all(torch.equal(p.grad, e) for p, e in zip(model.parameters(), expected))
+    assert (sink.discarded, sink.errors) == ([], [])
+
+    timers.detach()
+    assert "token_dispatch" not in model[0].mlp.token_dispatcher.__dict__
+
+
+def test_a_method_spec_finds_nothing_on_an_object_without_the_method():
+    moe = _RoutedMoELayer()
+    moe.token_dispatcher = object()
+    counts = ModuleTimers([_Layer(1, mlp=moe)], _Sink()).counts()
+    assert counts == {"attn": 1, "moe": 1, "router": 1, "experts": 1, "shared experts": 1}
 
 
 def test_an_mtp_layer_is_recorded_apart_from_the_decoder_layer_with_the_same_number():
