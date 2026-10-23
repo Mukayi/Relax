@@ -1,0 +1,19 @@
+pf-p4-ph0: full collections (all ranks) in on blocks 3, in off blocks 8
+pf-p4-ph1: full collections (all ranks) in on blocks 8, in off blocks 3
+pf-p4: dropped steps [95, 96, 166, 237]; with a full collection in that or the previous step [95, 96, 166, 237]
+pf-p5-ph0: full collections (all ranks) in on blocks 3, in off blocks 8
+pf-p5-ph1: full collections (all ranks) in on blocks 8, in off blocks 3
+pf-p5: dropped steps [95, 96, 163, 165, 166, 167, 227, 228, 233, 236, 256, 258]; with a full collection in that or the previous step [95, 96, 163, 165, 166, 167, 227, 228, 233, 236, 256, 258]
+pf-p6-ph0: full collections (all ranks) in on blocks 3, in off blocks 11
+pf-p6-ph1: full collections (all ranks) in on blocks 9, in off blocks 3
+pf-p6: dropped steps [163, 166, 171, 234, 236, 262]; with a full collection in that or the previous step [163, 166, 171, 234, 236, 262]
+pf-p7-ph0: full collections (all ranks) in on blocks 3, in off blocks 9
+pf-p7-ph1: full collections (all ranks) in on blocks 9, in off blocks 3
+pf-p7: dropped steps [170, 171, 260, 262]; with a full collection in that or the previous step [170, 171, 260, 262]
+pf-p8-ph0: full collections (all ranks) in on blocks 1, in off blocks 8
+pf-p8-ph1: full collections (all ranks) in on blocks 9, in off blocks 3
+pf-p8: dropped steps [95, 96, 170, 260, 261]; with a full collection in that or the previous step [95, 96, 170, 260, 261]
+pf-p9-ph0: full collections (all ranks) in on blocks 3, in off blocks 9
+pf-p9-ph1: full collections (all ranks) in on blocks 8, in off blocks 2
+pf-p9: dropped steps [165, 166, 227, 236, 237, 299]; with a full collection in that or the previous step [165, 166, 227, 236, 237, 299]
+total: 37 of 37 dropped steps had a full collection; full collections in on blocks 67, in off blocks 70

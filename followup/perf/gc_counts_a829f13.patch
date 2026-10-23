@@ -1,0 +1,75 @@
+From 2918b9e36095dabf8ed6e70f2d03315a2696ab9c Mon Sep 17 00:00:00 2001
+From: Mukayi <1515982581@qq.com>
+Date: Fri, 23 Oct 2026 18:11:53 +0800
+Subject: [PATCH] EXPERIMENT ONLY: per-step GC counts (GCSTAT=1) for comparing
+ runs with the profiler on and off (do not merge)
+
+---
+ relax/backends/megatron/actor.py |  3 +++
+ relax/utils/straggler/runtime.py | 36 ++++++++++++++++++++++++++++++++
+ 2 files changed, 39 insertions(+)
+
+diff --git a/relax/backends/megatron/actor.py b/relax/backends/megatron/actor.py
+index 6c9be0f..ac27d38 100644
+--- a/relax/backends/megatron/actor.py
++++ b/relax/backends/megatron/actor.py
+@@ -2803,6 +2803,9 @@ class MegatronTrainRayActor(TrainRayActor):
+         if active:
+             extra = self.straggler.step_metrics(rollout_id, int(sum(total_lengths)))
+         log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter, extra_metrics=extra)
++        from ...utils.straggler.runtime import straggler_gc_log  # EXPERIMENT ONLY
++
++        straggler_gc_log(rollout_id)
+         straggler_ab_set_step(rollout_id + 1)
+         # EXPERIMENT ONLY: injection clock + end-of-rollout sleep
+         from ...utils.straggler.runtime import straggler_inject_set_rollout, straggler_inject_sleep
+diff --git a/relax/utils/straggler/runtime.py b/relax/utils/straggler/runtime.py
+index 10ae384..661353e 100644
+--- a/relax/utils/straggler/runtime.py
++++ b/relax/utils/straggler/runtime.py
+@@ -344,6 +344,42 @@ def straggler_ab_active() -> bool:
+     return _AB_ON
+ 
+ 
++# EXPERIMENT ONLY (not for the PR): GCSTAT=1 logs, on every rank and step, the collections of each
++# generation and the time spent in full (generation-2) collections, to compare runs with the profiler on
++# and off. Independent of the profiler and of the A/B toggle.
++_GCSTAT = os.environ.get("GCSTAT", "0") == "1"
++_GC_STEP = [0, 0, 0, 0.0]  # collections of generation 0, 1, 2 this step; ms in generation-2 collections
++_GC_START = [0.0]
++
++
++def _gc_probe(phase: str, info: dict) -> None:
++    if phase == "start":
++        _GC_START[0] = _perf_counter()
++        return
++    _GC_STEP[info["generation"]] += 1
++    if info["generation"] == 2:
++        _GC_STEP[3] += (_perf_counter() - _GC_START[0]) * 1000.0
++
++
++if _GCSTAT:
++    import gc as _gc
++    from time import perf_counter as _perf_counter
++
++    _gc.callbacks.append(_gc_probe)
++
++
++def straggler_gc_log(rollout_id: int) -> None:
++    if not _GCSTAT:
++        return
++    import torch.distributed as dist
++
++    rank = dist.get_rank() if dist.is_initialized() else -1
++    if rollout_id == 0:
++        logger.info("[gcstat] rank=%d threshold=%s tracked=%d", rank, _gc.get_threshold(), len(_gc.get_objects()))
++    logger.info("[gcstat] rank=%d step=%d gen0=%d gen1=%d gen2=%d gen2_ms=%.1f", rank, rollout_id, *_GC_STEP)
++    _GC_STEP[:] = [0, 0, 0, 0.0]
++
++
+ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None:
+     """Create the process-wide profiler if it is enabled and ``role`` runs
+     training steps; ``None`` otherwise.
+-- 
+2.43.0
+

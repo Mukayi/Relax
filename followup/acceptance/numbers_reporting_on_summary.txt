@@ -1,0 +1,4 @@
+40 common steps
+A/A off2 vs off | loss max 0.059% median 0.018% | grad_norm max 3.197% median 0.350%
+A/B on vs off | loss max 0.069% median 0.017% | grad_norm max 2.128% median 0.208%
+A/B on vs off2 | loss max 0.074% median 0.024% | grad_norm max 1.803% median 0.353%
