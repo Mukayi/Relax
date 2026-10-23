@@ -347,7 +347,7 @@ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None
         level=initial_level(bool(traces_to)),
         # Read at window closes; the poller is created below, once there is a collector to report.
         level_request=lambda: poller.requested if poller is not None else None,
-        schedule_table=interleaved_schedule_table(args),
+        interleaved=(getattr(args, "virtual_pipeline_model_parallel_size", None) or 1) > 1,
     )
     if is_primary and getattr(args, "use_metrics_service", False):
         from relax.utils.utils import get_serve_url
@@ -411,28 +411,34 @@ def straggler_timers(phase: str) -> StragglerTimers | None:
     return _timers_for(_PROFILER.collector, phase) if _PROFILER is not None else None
 
 
-def interleaved_schedule_table(args: Any) -> Callable[[int], Sequence[tuple[int, int]]] | None:
-    """Megatron's interleaved schedule table for a micro-batch count; ``None``
-    without interleaved PP."""
-    chunks = getattr(args, "virtual_pipeline_model_parallel_size", None) or 1
-    if chunks == 1:
-        return None
-    if getattr(args, "overlap_moe_expert_parallel_comm", False):
-        # Combined 1F1B merges forward and backward steps, so no bracket has a micro-batch or model chunk.
-        return lambda num_microbatches: ()
+def interleaved_schedule_table(
+    model: Sequence[Any], num_microbatches: int, forward_only: bool
+) -> Sequence[tuple[int, int]]:
+    """Megatron's interleaved schedule table for one forward-backward call,
+    from the inputs its schedule reads: the model's own config and chunk count,
+    not the launch arguments (Bridge does not copy every argument into the
+    model config).
+
+    Empty for training under combined 1F1B, which merges forward and backward
+    steps.
+    """
     from megatron.core.pipeline_parallel.schedules import get_schedule_table
+    from megatron.core.utils import get_model_config
 
-    # Megatron's default group size is the PP size.
-    group = getattr(args, "microbatch_group_size_per_vp_stage", None) or args.pipeline_model_parallel_size
-    return partial(get_schedule_table, num_model_chunks=chunks, microbatch_group_size_per_vp_stage=group)
+    config = get_model_config(model[0])
+    if config.overlap_moe_expert_parallel_comm and not forward_only:
+        return ()
+    return get_schedule_table(num_microbatches, len(model), config.microbatch_group_size_per_vp_stage)
 
 
-def note_schedule(num_microbatches: int) -> None:
-    """Report the micro-batch count of the forward-backward call about to run,
-    which names each bracket's micro-batch and model chunk under interleaved
-    PP; a no-op without a profiler."""
+def note_schedule(model: Sequence[Any], num_microbatches: int, forward_only: bool) -> None:
+    """Report the forward-backward call about to run, so that under interleaved
+    PP each bracket takes its micro-batch and model chunk; a no-op without a
+    profiler."""
     if _PROFILER is not None:
-        _PROFILER.collector.note_schedule(num_microbatches)
+        _PROFILER.collector.note_schedule(
+            partial(interleaved_schedule_table, model, num_microbatches, forward_only), forward_only
+        )
 
 
 def note_microbatch_tokens(total_lengths: Any) -> None:

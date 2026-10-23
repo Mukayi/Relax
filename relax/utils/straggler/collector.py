@@ -163,7 +163,7 @@ class StragglerCollector:
         max_module_brackets: int = 8192,
         level: int = 1,
         level_request: Callable[[], int | None] = lambda: None,
-        schedule_table: Callable[[int], Sequence[tuple[int, int]]] | None = None,
+        interleaved: bool = False,
     ) -> None:
         if report_interval < 1:
             raise ValueError(
@@ -195,10 +195,10 @@ class StragglerCollector:
         # count reported for the training forward bracket that is open (-1 when none was).
         self._step_numbers = dict.fromkeys(_NUMBERED, 0)
         self._next_tokens = -1.0
-        # Under interleaved PP the n-th forward / backward of a step is not micro-batch n: Megatron's schedule table
-        # for a micro-batch count names each bracket instead (``None`` without interleaved PP).
-        self._schedule_table = schedule_table
-        # The noted forward-backward call: bracket counts of the step at its start, its table, model chunks.
+        # Under interleaved PP the n-th forward / backward of a step is not micro-batch n: brackets take the
+        # micro-batch and model chunk of the schedule table that ``note_schedule`` takes, or -1 outside it.
+        self._interleaved = interleaved
+        # The noted forward-backward call: bracket counts of its segments at its start, its table, model chunks.
         self._schedule: tuple[dict[int, int], Sequence[tuple[int, int]], int] | None = None
         self._trace_enabled = trace
         self.level = self._usable(level)
@@ -332,29 +332,31 @@ class StragglerCollector:
             self._step_numbers[segment_index] = micro_batch + 1
             if segment_index == _FWD_INDEX:
                 tokens, self._next_tokens = self._next_tokens, -1.0
-            if self._schedule_table is not None:
+            if self._interleaved:
                 # The phase slot of a micro-batch bracket holds its model chunk.
                 micro_batch, phase_index = self._scheduled(segment_index, micro_batch)
         self._pending.append((segment_index, phase_index, start_event, end_event, cpu_ms, micro_batch, tokens))
         self._pushed += 1
 
-    def note_schedule(self, num_microbatches: int) -> None:
-        """Take the micro-batch count of the forward-backward call about to
-        run.
+    def note_schedule(self, schedule_table: Callable[[], Sequence[tuple[int, int]]], forward_only: bool) -> None:
+        """Take the schedule table of the forward-backward call about to run
+        under interleaved PP: the (micro-batch, model chunk) of each forward
+        step in call order. Megatron runs the call's backward steps in the same
+        order with the model chunks reversed; an empty table names no bracket.
 
-        Under interleaved PP Megatron runs the call's forward steps in the
-        order of its schedule table and its backward steps in the same order
-        with the model chunks reversed, so the table names the micro-batch and
-        model chunk of each of the call's brackets.
+        ``schedule_table`` builds the table; it is only called under
+        interleaved PP.
         """
-        if self._schedule_table is None:
+        if not self._interleaved:
             return
         try:
-            table = self._schedule_table(num_microbatches)
-            self._schedule = (dict(self._step_numbers), table, len(table) // num_microbatches)
+            table = schedule_table()
         except Exception as exc:
-            self._schedule = None
+            table = ()
             self.on_error("schedule", exc)
+        segments = (_LP_FWD_INDEX,) if forward_only else (_FWD_INDEX, _BWD_INDEX)
+        chunks = 1 + max((chunk for _, chunk in table), default=-1)
+        self._schedule = ({segment: self._step_numbers[segment] for segment in segments}, table, chunks)
 
     def _scheduled(self, segment_index: int, count: int) -> tuple[int, int]:
         """Micro-batch and model chunk of the ``count``-th bracket of a
@@ -362,8 +364,8 @@ class StragglerCollector:
         if self._schedule is None:
             return -1, -1
         starts, table, chunks = self._schedule
-        start = starts[segment_index]
-        if count - start >= len(table):
+        start = starts.get(segment_index)
+        if start is None or count - start >= len(table):
             return -1, -1
         micro_batch, chunk = table[count - start]
         if segment_index == _BWD_INDEX:

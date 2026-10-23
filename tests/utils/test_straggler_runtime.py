@@ -239,9 +239,9 @@ def test_the_superseded_warning_names_the_window_that_is_returned(monkeypatch):
     assert profiler.collector.health.errors_total == 2, "window 0 superseded, window 2 failed"
 
 
-@pytest.mark.parametrize(("primary", "vpp", "combined"), [(True, None, False), (False, 2, False), (False, 2, True)])
-def test_install_uses_the_shared_metrics_primary_rank_and_megatrons_schedule_table_under_vpp(
-    monkeypatch, primary, vpp, combined
+@pytest.mark.parametrize(("primary", "vpp"), [(True, None), (False, 2)])
+def test_install_uses_the_shared_metrics_primary_rank_and_names_brackets_by_schedule_only_under_vpp(
+    monkeypatch, primary, vpp
 ):
     monkeypatch.setenv("RELAX_STRAGGLER_PROFILER", "1")
     monkeypatch.setattr(train_metric_utils, "is_metrics_primary_rank", lambda: primary)
@@ -253,17 +253,29 @@ def test_install_uses_the_shared_metrics_primary_rank_and_megatrons_schedule_tab
     monkeypatch.setattr(runtime, "_PROFILER", None)
     args = _args()
     args.virtual_pipeline_model_parallel_size = vpp
-    args.pipeline_model_parallel_size = 2
-    args.overlap_moe_expert_parallel_comm = combined
     profiler = install_straggler_profiler("actor", args)
     try:
         assert profiler.collector.is_primary is primary
         assert profiler.collector._cpu_events_source is runtime._cpu_events
-        table = profiler.collector._schedule_table
-        if vpp is None:
-            assert table is None
-        else:
-            # Megatron's own table, with micro-batches grouped by the PP size; empty under combined 1F1B.
-            assert list(table(3)) == ([] if combined else [(0, 0), (1, 0), (0, 1), (1, 1), (2, 0), (2, 1)])
+        assert profiler.collector._interleaved is (vpp is not None)
     finally:
         profiler.collector.close()
+
+
+@pytest.mark.parametrize(
+    ("forward_only", "combined", "expected"),
+    [
+        (False, False, [(0, 0), (1, 0), (0, 1), (1, 1), (2, 0), (3, 0), (2, 1), (3, 1)]),
+        (True, True, [(0, 0), (1, 0), (0, 1), (1, 1), (2, 0), (3, 0), (2, 1), (3, 1)]),
+        (False, True, []),
+    ],
+)
+def test_the_schedule_table_comes_from_the_model_config(monkeypatch, forward_only, combined, expected):
+    profiler = _profiler(interleaved=True)
+    monkeypatch.setattr(runtime, "_PROFILER", profiler)
+    # The launch arguments may ask for groups of 3; Megatron's schedule reads the wrapped model's config.
+    config = Namespace(microbatch_group_size_per_vp_stage=2, overlap_moe_expert_parallel_comm=combined)
+    chunk = Namespace(module=Namespace(config=config))
+    runtime.note_schedule([chunk, chunk], 4, forward_only)
+    _, table, _ = profiler.collector._schedule
+    assert list(table) == expected

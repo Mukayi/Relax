@@ -954,7 +954,7 @@ def forward_only(
     forward_data_store = []
     num_steps_per_rollout = len(num_microbatches)
     for step_id in range(num_steps_per_rollout):
-        note_schedule(num_microbatches[step_id])
+        note_schedule(model, num_microbatches[step_id], forward_only=True)
         forward_data_store += forward_backward_func(
             forward_step_func=forward_step,
             data_iterator=data_iterator,
@@ -1326,7 +1326,7 @@ def train_one_step(
             forward_backward_func = streaming_forward_backward_pipelining_without_interleaving
     else:
         forward_backward_func = get_forward_backward_func()
-    note_schedule(num_microbatches)
+    note_schedule(model, num_microbatches, forward_only=False)
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step,
         data_iterator=data_iterator,

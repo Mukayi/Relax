@@ -255,11 +255,11 @@ def _timed(collector, name, ms, tokens=None):
 
 
 def test_unnumbered_brackets_carry_no_micro_batch_number_but_keep_their_tokens():
-    # Combined 1F1B under interleaved PP: the schedule table names no bracket.
-    collector, calls = _tracing_collector(schedule_table=lambda num_microbatches: ())
+    # Training under combined 1F1B: the schedule table names no bracket.
+    collector, calls = _tracing_collector(interleaved=True)
     for rollout_id in range(2):
         collector.end_step(rollout_id=rollout_id)
-    collector.note_schedule(2)
+    collector.note_schedule(lambda: (), forward_only=False)
     _timed(collector, "forward-compute", 3, tokens=300)
     _timed(collector, "forward-compute", 7, tokens=900)
     _timed(collector, "backward-compute", 5)
@@ -280,18 +280,19 @@ _TABLE_5 = [(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1), (3, 0), (4, 0), (3, 
 
 
 def test_under_interleaved_pp_brackets_take_the_micro_batch_and_model_chunk_of_the_schedule_table():
-    tables = {5: _TABLE_5, 1: [(0, 0), (0, 1)]}
-    collector, calls = _tracing_collector(schedule_table=tables.__getitem__)
+    collector, calls = _tracing_collector(interleaved=True)
     for rollout_id in range(2):
         collector.end_step(rollout_id=rollout_id)
-    collector.note_schedule(5)
+    collector.note_schedule(lambda: _TABLE_5, forward_only=False)
     for name in ("forward-compute", "backward-compute"):
         for _ in _TABLE_5:
             bracket(collector, name)
-    # The next call of the step continues the micro-batch numbers; a bracket beyond its table has none.
-    collector.note_schedule(1)
+    # The next call of the step continues the micro-batch numbers; a bracket beyond its table has none,
+    # and neither has a log-prob forward, which a training call's table does not cover.
+    collector.note_schedule(lambda: [(0, 0), (0, 1)], forward_only=False)
     for _ in range(3):
         bracket(collector)
+    bracket(collector, timers=collector.forward_only_timers)
     collector.end_step(rollout_id=2)
     collector.end_step(rollout_id=3)
     sample, _ = calls["gathered"][-1]
@@ -303,6 +304,7 @@ def test_under_interleaved_pp_brackets_take_the_micro_batch_and_model_chunk_of_t
         (fwd, 5, 0),
         (fwd, 5, 1),
         (fwd, -1, -1),
+        (FIELD_INDEX["lp_fwd"], -1, -1),
     ]
 
 
