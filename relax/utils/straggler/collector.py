@@ -195,8 +195,8 @@ class StragglerCollector:
         # count reported for the training forward bracket that is open (-1 when none was).
         self._step_numbers = dict.fromkeys(_NUMBERED, 0)
         self._next_tokens = -1.0
-        # Under interleaved PP the n-th forward / backward of a step is not micro-batch n: brackets take the
-        # micro-batch and model chunk of the schedule table that ``note_schedule`` takes, or -1 outside it.
+        # Under interleaved PP the n-th forward / backward of a step is not micro-batch n: ``note_schedule`` names
+        # the brackets of each forward-backward call, and the rest carry -1.
         self._interleaved = interleaved
         # The noted forward-backward call: bracket counts of its segments at its start, its table, model chunks.
         self._schedule: tuple[dict[int, int], Sequence[tuple[int, int]], int] | None = None
@@ -338,19 +338,18 @@ class StragglerCollector:
         self._pending.append((segment_index, phase_index, start_event, end_event, cpu_ms, micro_batch, tokens))
         self._pushed += 1
 
-    def note_schedule(self, schedule_table: Callable[[], Sequence[tuple[int, int]]], forward_only: bool) -> None:
-        """Take the schedule table of the forward-backward call about to run
-        under interleaved PP: the (micro-batch, model chunk) of each forward
-        step in call order. Megatron runs the call's backward steps in the same
-        order with the model chunks reversed; an empty table names no bracket.
+    def note_schedule(self, build_table: Callable[[], Sequence[tuple[int, int]]], forward_only: bool) -> None:
+        """Take the schedule table of the forward-backward call about to run:
+        the (micro-batch, model chunk) of each forward step in call order.
 
-        ``schedule_table`` builds the table; it is only called under
-        interleaved PP.
+        Megatron runs the backward steps in the same order with the model
+        chunks reversed; an empty table names no bracket. ``build_table`` is
+        only called under interleaved PP.
         """
         if not self._interleaved:
             return
         try:
-            table = schedule_table()
+            table = build_table()
         except Exception as exc:
             table = ()
             self.on_error("schedule", exc)

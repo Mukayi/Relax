@@ -262,13 +262,12 @@ def test_install_uses_the_shared_metrics_primary_rank_and_names_brackets_by_sche
         profiler.collector.close()
 
 
+# Megatron's schedule table for 4 micro-batches over 2 model chunks, in groups of 2.
+_TABLE_4 = [(0, 0), (1, 0), (0, 1), (1, 1), (2, 0), (3, 0), (2, 1), (3, 1)]
+
+
 @pytest.mark.parametrize(
-    ("forward_only", "combined", "expected"),
-    [
-        (False, False, [(0, 0), (1, 0), (0, 1), (1, 1), (2, 0), (3, 0), (2, 1), (3, 1)]),
-        (True, True, [(0, 0), (1, 0), (0, 1), (1, 1), (2, 0), (3, 0), (2, 1), (3, 1)]),
-        (False, True, []),
-    ],
+    ("forward_only", "combined", "expected"), [(False, False, _TABLE_4), (True, True, _TABLE_4), (False, True, [])]
 )
 def test_the_schedule_table_comes_from_the_model_config(monkeypatch, forward_only, combined, expected):
     profiler = _profiler(interleaved=True)
