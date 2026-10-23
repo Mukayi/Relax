@@ -311,20 +311,17 @@ class StragglerCollector:
             if trace is not None and not full and 2 * len(self._modules) < self._max_pending:
                 self._modules.append((segment_index, phase_index, start_event, end_event))
                 return
-            self._pool.release(start_event)
-            self._pool.release(end_event)
+            self._pool.release(start_event, end_event)
             if trace is not None:
                 trace.lost += 1
             return
         if full and trace is not None and self._modules:
             _, _, old_start, old_end = self._modules.popleft()
-            self._pool.release(old_start)
-            self._pool.release(old_end)
+            self._pool.release(old_start, old_end)
             trace.lost += 1
         elif full:
             _, _, old_start, old_end, _, _, _ = self._pending.popleft()
-            self._pool.release(old_start)
-            self._pool.release(old_end)
+            self._pool.release(old_start, old_end)
             self._window.add_index(_DROPPED_INDEX, 1.0)
             if trace is not None and trace.covers(self._popped):
                 trace.lost += 1
@@ -473,8 +470,7 @@ class StragglerCollector:
                 else:
                     trace.lost += 1
             pending.popleft()
-            self._pool.release(start_event)
-            self._pool.release(end_event)
+            self._pool.release(start_event, end_event)
             self._popped += 1
             folded += 1
         modules = self._modules
@@ -490,8 +486,7 @@ class StragglerCollector:
             else:
                 trace.lost += 1
             modules.popleft()
-            self._pool.release(start_event)
-            self._pool.release(end_event)
+            self._pool.release(start_event, end_event)
             folded += 1
         self._finish_trace()
         window.add("overhead", (self._clock() - started) * 1e3)
@@ -518,8 +513,7 @@ class StragglerCollector:
         """Empty ``queue`` and return its events to the pool."""
         while queue:
             _, _, start_event, end_event, *_ = queue.popleft()
-            self._pool.release(start_event)
-            self._pool.release(end_event)
+            self._pool.release(start_event, end_event)
 
     @property
     def disabled(self) -> bool:

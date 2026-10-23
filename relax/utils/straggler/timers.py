@@ -69,8 +69,8 @@ class EventPool:
         self.created += 1
         return self._factory()
 
-    def release(self, event: Any) -> None:
-        self._free.append(event)
+    def release(self, *events: Any) -> None:
+        self._free.extend(events)
 
     def __len__(self) -> int:
         return len(self._free)
