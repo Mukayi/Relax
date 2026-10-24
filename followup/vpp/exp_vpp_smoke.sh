@@ -2,7 +2,7 @@
 # 2026-10-23 review-3 VPP smoke: the micro-batch / model-chunk identity under interleaved PP on Qwen3-0.6B
 # TP1 x PP2 x DP4 with 2 virtual stages per PP rank (7 layers per chunk), overlap on, STRAGGLER_LEVEL=3,
 # REPORT_INTERVAL=5, TIMELINE=1 (sampled steps 5, 10, 15 under the run's timeline/straggler/), metrics service off.
-# Code: relax_exp_vpp = PR head + #462 (b57d72c), no experiment-only commits. TAG names the run (default vpp-modules); EXTRA_ARGS are appended to the launch arguments.
+# Code: ${RELAX_CODE} = PR head + #462 (b57d72c), no experiment-only commits. TAG names the run (default vpp-modules); EXTRA_ARGS are appended to the launch arguments.
 # Check: check_vpp_trace.py on the run's traces.
 # Usage: setsid nohup bash exp_vpp_smoke.sh > logs/exp_vpp_smoke-driver.log 2>&1 < /dev/null &
 set -uo pipefail

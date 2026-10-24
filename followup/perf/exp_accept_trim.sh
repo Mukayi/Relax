@@ -1,6 +1,6 @@
 #!/bin/bash
-# 2026-10-24 Overhead after trimming the window scalars (07934fe): four in-run crossover pairs as in exp_accept_f19.sh
-# (600 rollouts per run, full-rollout intervals, GC counts), to see where it lands before more changes.
+# 2026-10-24 Overhead of 07934fe: four in-run crossover pairs as in exp_accept_f19.sh (600 rollouts per run,
+# full-rollout intervals, GC counts).
 # Code: ${RELAX_CODE} = 07934fe + #462 + #463 + the experiment-only patches of exp_accept_f19.sh and the cost probes
 # (off here). Qwen3-0.6B SFT DP8, GBS 32, overlap on, metrics service on, trace dir on, default level, REPORT_INTERVAL=10.
 # Usage: setsid nohup bash exp_accept_trim.sh > logs/exp_accept_trim-driver.log 2>&1 < /dev/null &

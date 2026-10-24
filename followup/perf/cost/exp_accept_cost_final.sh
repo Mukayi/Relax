@@ -1,8 +1,8 @@
 #!/bin/bash
-# 2026-10-24 The cost probes again on f0e28bc (window scalars trimmed to REPORTED_METRICS): profiler on only; the
+# 2026-10-24 The cost probes on the final code (0c9afc1 and later: documentation only), profiler on; the
 # baseline is cost-off from exp_accept_cost.sh.
-# Code: ${RELAX_CODE} rebased onto f0e28bc (d922da5). Settings as exp_accept_cost.sh, 200 rollouts.
-# Usage: setsid nohup bash exp_accept_cost.sh > logs/exp_accept_cost2-driver.log 2>&1 < /dev/null &
+# Code: ${RELAX_CODE} rebased onto the PR head. Settings as exp_accept_cost.sh, 200 rollouts.
+# Usage: setsid nohup bash exp_accept_cost_final.sh > logs/exp_accept_cost_final-driver.log 2>&1 < /dev/null &
 set -uo pipefail
 umask 000
 
@@ -40,6 +40,6 @@ run() {  # run <tag> <straggler 0|1>
 }
 
 echo "$(date +%T) code ${RELAX_CODE} $(git -c safe.directory='*' -C "${RELAX_CODE}" rev-parse --short HEAD)"
-run cost2-on 1
+run cost-final 1
 
 echo "$(date +%T) done"

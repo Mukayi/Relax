@@ -1,7 +1,7 @@
 #!/bin/bash
 # 2026-10-23 Acceptance reruns on the final code (bot review of a829f13: the numbers, the overlap and detection with
 # reporting on were last measured on older versions).
-# Code: relax_exp_accept = PR head a829f13 + #462 + #463 (the metrics-service fix, as in the acceptance version
+# Code: ${RELAX_CODE} = PR head a829f13 + #462 + #463 (the metrics-service fix, as in the acceptance version
 # d8d8c39) + the experiment-only sleep injection. Qwen3-0.6B DP8, overlap on in every run, same seed.
 #   Numbers (metrics service off, 40 rollouts; every run saves its grad norms, nothing asserts):
 #     ac-num-off1, ac-num-off2   profiler off                                              -> A/A
