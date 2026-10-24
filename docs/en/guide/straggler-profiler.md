@@ -80,6 +80,8 @@ its own GPU forward is 0.99x peers, gc 1.8 ms, cpu/gpu fwd 1.56x -> late_arrival
 
 Only two rows are shown; the real table has a row per rank. `steady_ms` is the steady-state PP wait (`pp_wait_up + pp_wait_down`) and `mb_fwd_max` the slowest single forward of the window (ms).
 
+Every window also logs an INFO line with the numbers that are not sent as scalars (the second table under Metrics), for example `[straggler] step=29 other metrics: analyze_ms 2.9, bwd/max_ms 401.2, …`.
+
 A rank whose data cannot support a verdict is reported as uncertain, with a cause:
 
 ```text
@@ -98,7 +100,7 @@ An uncertain window breaks the run of abnormal windows and does not count toward
 
 ### Metrics
 
-These scalars use the same step as `perf/*` and go to TensorBoard / WandB / ClearML. The analysis runs on a background thread, so a window's scalars normally go out with the next rollout's `perf/*`; `straggler/window/{first,last}_rollout` name the window they belong to.
+A window sends only the scalars in the first table below; they use the same step as `perf/*` and go to TensorBoard / WandB / ClearML. Every extra scalar adds training-thread time to that step's flush. The analysis runs on a background thread, so a window's scalars normally go out with the next rollout's `perf/*`; `straggler/window/{first,last}_rollout` name the window they belong to. The background thread logs the rest of the window's numbers in the `other metrics` line (the second table, keys without the `straggler/` prefix).
 
 The timings reuse the 22 timer call sites Megatron already has, grouped into these segments:
 
@@ -111,27 +113,37 @@ The timings reuse the 22 timer call sites Megatron already has, grouped into the
 | `optim` | The optimizer (6 timers; includes the grad-norm reduction when gradient clipping is on) |
 | `lp_fwd` / `lp_pp_recv` / `lp_pp_send` | The same segments during log-prob / forward-only passes |
 
-| Metric | Meaning |
+| Scalar | Meaning |
 |--------|---------|
-| `straggler/<segment>/{median_ms,max_ms,max_rank,spread}` | Per-segment GPU time (ms/step): median and maximum across all ranks; `max_rank` / `spread` are the rank with the largest excess over the other ranks of its PP stage and that excess (`value/peer_median − 1`) |
-| `straggler/self/*`, `straggler/self_per_ktok/*` | Own compute time (`fwd + bwd + optim`) and the same per 1000 tokens; the latter is omitted when any rank reports zero tokens |
-| `straggler/wait/{median_ms,max_ms,max_rank,spread}` | Time spent waiting for other ranks (`pp_recv + dp_grad_sync + dp_param_gather`) |
-| `straggler/late/{max_ms,max_rank,peer_idle_ms}` | The rank that reaches the DP gradient sync last, by how much, and how long the rest of its DP group idles for it per step |
-| `straggler/tokens/{median,max,spread}` | Token-count imbalance across ranks; omitted when any rank reports zero tokens |
-| `straggler/pp_stage_imbalance` | `max/min` of the per-stage median compute time |
-| `straggler/{pp_wait_fill,pp_wait_up,pp_wait_down,pp_wait_drain}/{max_ms,max_rank}` | The training-phase PP wait split by non-interleaved 1F1B phase: `fill` waits for upstream activations while the pipeline fills, `up` / `down` wait for upstream activations / downstream gradients in the steady state, `drain` waits for downstream gradients while it drains. A balanced pipeline does not idle in the steady state, so `up + down` beyond the transfer time is extra bubble; an upstream rank stalling at the start of the step shows up in the downstream stages' `fill`. Only with PP |
-| `straggler/pp_bubble/ratio` | `pp_recv` as a share of the timed training time; the largest per-stage median. Only with PP |
-| `straggler/micro_batch/{fwd_max_ms,fwd_max_rank,fwd_argmax,fwd_argmax_tokens,fwd_min_ms,bwd_max_ms,bwd_max_rank,tokens_max,tokens_min}` | Extremes of single training micro-batches over the window: the slowest forward and its rank, its micro-batch number in its rollout (from 0) and its token count (−1 when not reported), the fastest forward, the slowest backward and its rank, and the largest / smallest token count of a micro-batch (omitted without token counts) |
-| `straggler/gc/{median_ms,max_ms}` | Python GC pauses |
 | `straggler/flagged/{count,rank,reason}` | Alert state; rank is −1 if none. Reason codes: 0 none, 1 slow_device, 2 data_imbalance, 3 upstream_wait, 4 cpu_bound, 5 late_arrival |
-| `straggler/waiting/count` | Ranks waiting on a slow upstream PP stage; they are held up, not slow, and do not count in `flagged` |
-| `straggler/uncertain/{count,rank,cause}` | Number of uncertain ranks, the first one (−1 if none) and its cause. Cause codes: 0 none, 1 dropped_events, 2 unread_events, 3 profiler_errors, 4 no_peers, 5 missing_tokens, 6 no_wait_reference |
-| `straggler/recovered/count` | Ranks whose alert cleared in this window |
-| `straggler/window/{first_rollout,last_rollout}` | The window these scalars belong to |
+| `straggler/uncertain/count` | Number of uncertain ranks |
+| `straggler/self/{median_ms,max_ms,max_rank}` | Own compute time (`fwd + bwd + optim`, ms/step): median, maximum and the rank with the maximum |
+| `straggler/late/max_ms` | How late the rank that reaches the DP gradient sync last is |
+| `straggler/health/{state,errors,requested_by}` | The profiler's own health: the worst state across ranks (0 active, 1 degraded, 2 disabled), errors caught in the window, and the rank that asked to switch the profiler off (only then) |
+| `straggler/{dropped_events,unread_events}`, `straggler/trace/lost` | Spans dropped from a full queue, spans still unread when the window closed, and spans lost from the sampled-step trace (all normally 0) |
 | `straggler/control/level` | The window's level: 0 paused, 1 coarse, 2 detail, 3 modules |
+| `straggler/self_overhead_ms` | CPU time per step the profiler spends reading the timings |
+| `straggler/window/{first_rollout,last_rollout}` | The window these scalars belong to |
 | `straggler/latency/analyzed_ms` | Milliseconds from the window close to the end of its analysis, when the alert lines are logged |
-| `straggler/health/{state,errors,degraded_ranks}` | The profiler's own health: the worst state across ranks (0 active, 1 degraded, 2 disabled), errors caught in the window, ranks currently degraded |
-| `straggler/{self_overhead_ms,gather_ms,analyze_ms,dropped_events,unread_events}` | The profiler's own cost: CPU time per step spent reading the timings, gather and analysis time per window on the primary rank, spans dropped from a full queue, spans still unread when the window closed (the last two are normally 0) |
+
+| In the log | Meaning |
+|--------|---------|
+| `<segment>/{median_ms,max_ms,max_rank,spread}` | Per-segment GPU time (ms/step): median and maximum across all ranks; `max_rank` / `spread` are the rank with the largest excess over the other ranks of its PP stage and that excess (`value/peer_median − 1`) |
+| `self/spread`, `self_per_ktok/*` | How far own compute time exceeds the other ranks of the PP stage at most; own compute time per 1000 tokens, omitted when any rank reports zero tokens |
+| `wait/{median_ms,max_ms,max_rank,spread}` | Time spent waiting for other ranks (`pp_recv + dp_grad_sync + dp_param_gather`) |
+| `late/{max_rank,peer_idle_ms}` | The rank that reaches the DP gradient sync last, and how long the rest of its DP group idles per step waiting for it |
+| `tokens/{median,max,spread}` | Token-count imbalance across ranks; omitted when any rank reports zero tokens |
+| `pp_stage_imbalance` | `max/min` of the per-stage median compute time |
+| `{pp_wait_fill,pp_wait_up,pp_wait_down,pp_wait_drain}/{max_ms,max_rank}` | The training-phase PP wait split by non-interleaved 1F1B phase: `fill` waits for upstream activations while the pipeline fills, `up` / `down` wait for upstream activations / downstream gradients in the steady state, `drain` waits for downstream gradients while it drains. A balanced pipeline does not idle in the steady state, so `up + down` beyond the transfer time is extra bubble; an upstream rank stalling at the start of the step shows up in the downstream stages' `fill`. Only with PP |
+| `pp_bubble/ratio` | `pp_recv` as a share of the timed training time; the largest per-stage median. Only with PP |
+| `micro_batch/{fwd_max_ms,fwd_max_rank,fwd_argmax,fwd_argmax_tokens,fwd_min_ms,bwd_max_ms,bwd_max_rank,tokens_max,tokens_min}` | Extremes of single training micro-batches over the window: the slowest forward and its rank, its micro-batch number in its rollout (from 0) and its token count (−1 when not reported), the fastest forward, the slowest backward and its rank, and the largest / smallest token count of a micro-batch (omitted without token counts) |
+| `gc/{median_ms,max_ms}` | Python GC pauses |
+| `waiting/count` | Ranks waiting on a slow upstream PP stage; they are held up, not slow, and do not count in `flagged` |
+| `uncertain/{rank,cause}` | The first uncertain rank (−1 if none) and its cause. Cause codes: 0 none, 1 dropped_events, 2 unread_events, 3 profiler_errors, 4 no_peers, 5 missing_tokens, 6 no_wait_reference |
+| `recovered/count` | Ranks whose alert cleared in this window |
+| `health/degraded_ranks` | Ranks currently degraded |
+| `gather_ms`, `analyze_ms` | Gather and analysis time per window on the primary rank |
+| `trace/{ranks,module_brackets,align_spread_ms,bubble_excess_ms_max,bubble_excess_rank}` | Sampled-step trace numbers, see the next section |
 
 ### Sampled-step trace (Perfetto)
 
@@ -147,7 +159,9 @@ Each rank is a row, ordered by (dp, pp, tp) so the stages of a pipeline sit next
 
 The primary rank's own CPU-side timers (such as `actor_train` and the per-micro-batch `get_data_batch_*`) get a separate `primary CPU` row.
 
-| Metric | Meaning |
+Of the numbers below only `straggler/trace/lost` is a scalar; the rest are in the `other metrics` log line.
+
+| Number | Meaning |
 |--------|---------|
 | `straggler/trace/ranks`, `straggler/trace/lost` | Ranks that delivered a trace; timed spans lost (from a full queue, or beyond the per-step cap of 4096 spans plus 8192 module spans; module spans queue separately, take at most half of the queue, are pushed out first when it is full, and count here only, not in `dropped_events`) |
 | `straggler/trace/module_brackets` | Module spans in the trace, summed over ranks (`modules` level only) |
@@ -183,6 +197,6 @@ With both `--timeline-dump-dir` and `--use-metrics-service` set, every window ap
 - The timings reuse Megatron's existing timer call sites. In the window statistics, the internals of attention, MoE, head / logits and MTP are part of `fwd` / `bwd`, and the `modules` level only adds whole attention and MLP / MoE blocks to the trace; EP all-to-all counts as compute; there is no real compute/communication overlap ratio, and a smaller `dp_grad_sync` does not mean better overlap.
 - Ranks of the same TP group wait for each other inside forward and backward, so when one of them slows down the whole group is reported; when every rank slows down at once (whole-machine clock throttling, a shared-storage stall) nothing is detected.
 - The PP phase split, the phase names in the trace and the bubble estimate assume non-interleaved 1F1B; the transfers of the interleaved (VPP) schedule count in `pp_recv` only. With VPP, the micro-batch number and model chunk come from Megatron's interleaved schedule table (`get_schedule_table`, built from the model's own config) by call order; training calls under `combined_1f1b` merge forward and backward steps and are not numbered.
-- Ranks are aligned by their wall clocks, so across machines NTP accuracy applies; `straggler/trace/align_spread_ms` shows the error. With one-rollout windows the sampled step may not be fully read when the window closes, and that window has no trace. Nothing is timed under CUDA graph capture.
+- Ranks are aligned by their wall clocks, so across machines NTP accuracy applies; `trace/align_spread_ms` in the `other metrics` log line shows the error. With one-rollout windows the sampled step may not be fully read when the window closes, and that window has no trace. Nothing is timed under CUDA graph capture.
 - Alerts lag: with the defaults an alert appears about 21–30 rollouts after a rank starts slowing down. Lowering `REPORT_INTERVAL` or `PERSIST_WINDOWS` alerts sooner, at the cost of reacting to one-off spikes.
 - When a rank process disappears entirely, every gather on the other ranks waits for the `RELAX_STRAGGLER_GATHER_TIMEOUT_S` timeout, and after repeated failures each rank switches the profiler off locally.

@@ -8,6 +8,7 @@ import pytest
 
 from relax.utils.straggler import runtime
 from relax.utils.straggler.detector import WindowReport
+from relax.utils.straggler.reporter import REPORTED_METRICS
 from relax.utils.straggler.runtime import StragglerProfiler, install_straggler_profiler
 from relax.utils.timer import TimelineEvent, Timer
 from relax.utils.training import train_metric_utils
@@ -32,7 +33,7 @@ def test_scalars_arrive_when_a_window_closes_and_carry_its_rollout_range():
     assert _step(profiler, 0) is None
     metrics = _step(profiler, 1)
     assert metrics["straggler/window/first_rollout"] == 0.0 and metrics["straggler/window/last_rollout"] == 1.0
-    assert metrics["straggler/tokens/median"] == pytest.approx(1000.0)
+    assert set(metrics) <= REPORTED_METRICS
 
 
 def test_a_failing_reporter_is_counted_and_never_raises(monkeypatch):

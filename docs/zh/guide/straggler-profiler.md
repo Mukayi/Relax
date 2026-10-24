@@ -80,6 +80,8 @@ its own GPU forward is 0.99x peers, gc 1.8 ms, cpu/gpu fwd 1.56x -> late_arrival
 
 表里只列出两行，实际每个 rank 一行。`steady_ms` 是稳态 PP 等待（`pp_wait_up + pp_wait_down`），`mb_fwd_max` 是本窗口最慢的单个前向（ms）。
 
+每个窗口另打印一行 INFO，列出没有作为标量发出的统计（见「指标」的第二张表），例如 `[straggler] step=29 other metrics: analyze_ms 2.9, bwd/max_ms 401.2, …`。
+
 数据不足以下结论的 rank 标为「不确定」并给出原因：
 
 ```text
@@ -98,7 +100,7 @@ closed; their time lands in the next window
 
 ### 指标
 
-标量和 `perf/*` 使用同一个 step，写入 TensorBoard / WandB / ClearML。判定在后台线程上进行，一个窗口的标量通常随下一个 rollout 的 `perf/*` 发出，所属窗口见 `straggler/window/{first,last}_rollout`。
+每个窗口只发出下面第一张表里的标量，和 `perf/*` 使用同一个 step，写入 TensorBoard / WandB / ClearML；每多一个标量，训练线程在这一步 flush 时就多花一点时间。判定在后台线程上进行，一个窗口的标量通常随下一个 rollout 的 `perf/*` 发出，所属窗口见 `straggler/window/{first,last}_rollout`。其余统计由后台线程写进日志的 `other metrics` 一行（第二张表，键名省去 `straggler/` 前缀）。
 
 计时复用 Megatron 已有的 22 个计时点，分成以下几段：
 
@@ -111,27 +113,37 @@ closed; their time lands in the next window
 | `optim` | 优化器（6 个计时器；开启梯度裁剪时包含 grad-norm 归约） |
 | `lp_fwd` / `lp_pp_recv` / `lp_pp_send` | log-prob / forward-only 阶段的同名段 |
 
-| 指标 | 含义 |
+| 标量 | 含义 |
 |------|------|
-| `straggler/<段>/{median_ms,max_ms,max_rank,spread}` | 每段 GPU 时间（ms/step）的全局中位数和最大值；`max_rank` / `spread` 是相对同 PP stage 其他 rank 超出最多的 rank 及超出比例（`value/peer_median − 1`） |
-| `straggler/self/*`、`straggler/self_per_ktok/*` | 自身计算时间（`fwd + bwd + optim`）及每千 token 的值；后者在任一 rank 的 token 数为 0 时不输出 |
-| `straggler/wait/{median_ms,max_ms,max_rank,spread}` | 等待其他 rank 的时间（`pp_recv + dp_grad_sync + dp_param_gather`） |
-| `straggler/late/{max_ms,max_rank,peer_idle_ms}` | 最晚到达 DP 梯度同步的 rank、晚了多少，以及同组其他 rank 每步因此空等的时间 |
-| `straggler/tokens/{median,max,spread}` | 各 rank 每步 token 数的不均衡程度；任一 rank 的 token 数为 0 时不输出 |
-| `straggler/pp_stage_imbalance` | 各 PP stage 计算时间中位数的 `max/min` |
-| `straggler/{pp_wait_fill,pp_wait_up,pp_wait_down,pp_wait_drain}/{max_ms,max_rank}` | 训练阶段的 PP 等待按非交错 1F1B 的阶段拆开：`fill` 填充时等上游激活，`up` / `down` 稳态时等上游激活 / 下游梯度，`drain` 排空时等下游梯度。均衡的流水线在稳态不空等，`up + down` 超出传输时间的部分就是多出来的气泡；上游 rank 在一步开头停顿时体现在下游 stage 的 `fill` 上。只在开 PP 时输出 |
-| `straggler/pp_bubble/ratio` | `pp_recv` 占已计时训练时间的比例，取各 PP stage 中位数的最大值；只在开 PP 时输出 |
-| `straggler/micro_batch/{fwd_max_ms,fwd_max_rank,fwd_argmax,fwd_argmax_tokens,fwd_min_ms,bwd_max_ms,bwd_max_rank,tokens_max,tokens_min}` | 本窗口单个训练 micro-batch 的极值：最慢的前向及其 rank、它在所在 rollout 里的 micro-batch 序号（从 0 起）和 token 数（拿不到时为 −1），最快的前向，最慢的反向及其 rank，单个 micro-batch 的最大 / 最小 token 数（没有 token 数时不输出） |
-| `straggler/gc/{median_ms,max_ms}` | Python GC 停顿 |
 | `straggler/flagged/{count,rank,reason}` | 告警状态，没有时 rank 为 −1。reason 编码：0 none、1 slow_device、2 data_imbalance、3 upstream_wait、4 cpu_bound、5 late_arrival |
-| `straggler/waiting/count` | 因上游 PP stage 慢而在等待的 rank 数；它们是被拖慢的，不计入 `flagged` |
-| `straggler/uncertain/{count,rank,cause}` | 「不确定」的 rank 数、第一个这样的 rank（没有时为 −1）及其原因。cause 编码：0 none、1 dropped_events、2 unread_events、3 profiler_errors、4 no_peers、5 missing_tokens、6 no_wait_reference |
-| `straggler/recovered/count` | 本窗口解除告警的 rank 数 |
-| `straggler/window/{first_rollout,last_rollout}` | 这组标量所属的窗口 |
+| `straggler/uncertain/count` | 「不确定」的 rank 数 |
+| `straggler/self/{median_ms,max_ms,max_rank}` | 自身计算时间（`fwd + bwd + optim`，ms/step）的中位数、最大值和最大的 rank |
+| `straggler/late/max_ms` | 最晚到达 DP 梯度同步的 rank 晚了多少 |
+| `straggler/health/{state,errors,requested_by}` | 分析器自身的状态：各 rank 中最差的状态（0 active、1 degraded、2 disabled）、本窗口捕获的异常数，以及请求关闭的 rank（只在关闭时有） |
+| `straggler/{dropped_events,unread_events}`、`straggler/trace/lost` | 因队列满被丢弃的计时数、窗口结束时还没读到的计时数、采样步 trace 丢失的计时数（正常都为 0） |
 | `straggler/control/level` | 本窗口的级别：0 paused、1 coarse、2 detail、3 modules |
+| `straggler/self_overhead_ms` | 分析器每步读取计时的 CPU 时间 |
+| `straggler/window/{first_rollout,last_rollout}` | 这组标量所属的窗口 |
 | `straggler/latency/analyzed_ms` | 从窗口结束到判定完成（告警日志打印）的毫秒数 |
-| `straggler/health/{state,errors,degraded_ranks}` | 分析器自身的状态：各 rank 中最差的状态（0 active、1 degraded、2 disabled）、本窗口捕获的异常数、degraded 的 rank 数 |
-| `straggler/{self_overhead_ms,gather_ms,analyze_ms,dropped_events,unread_events}` | 分析器自身的开销：每步读取计时的 CPU 时间、primary 上每个窗口的 gather 和判定耗时、因队列满被丢弃的计时数、窗口结束时还没读到的计时数（后两项正常为 0） |
+
+| 日志中的统计 | 含义 |
+|------|------|
+| `<段>/{median_ms,max_ms,max_rank,spread}` | 每段 GPU 时间（ms/step）的全局中位数和最大值；`max_rank` / `spread` 是相对同 PP stage 其他 rank 超出最多的 rank 及超出比例（`value/peer_median − 1`） |
+| `self/spread`、`self_per_ktok/*` | 自身计算时间相对同 PP stage 其他 rank 超出最多的比例；每千 token 的自身计算时间，在任一 rank 的 token 数为 0 时不输出 |
+| `wait/{median_ms,max_ms,max_rank,spread}` | 等待其他 rank 的时间（`pp_recv + dp_grad_sync + dp_param_gather`） |
+| `late/{max_rank,peer_idle_ms}` | 最晚到达 DP 梯度同步的 rank，以及同组其他 rank 每步因此空等的时间 |
+| `tokens/{median,max,spread}` | 各 rank 每步 token 数的不均衡程度；任一 rank 的 token 数为 0 时不输出 |
+| `pp_stage_imbalance` | 各 PP stage 计算时间中位数的 `max/min` |
+| `{pp_wait_fill,pp_wait_up,pp_wait_down,pp_wait_drain}/{max_ms,max_rank}` | 训练阶段的 PP 等待按非交错 1F1B 的阶段拆开：`fill` 填充时等上游激活，`up` / `down` 稳态时等上游激活 / 下游梯度，`drain` 排空时等下游梯度。均衡的流水线在稳态不空等，`up + down` 超出传输时间的部分就是多出来的气泡；上游 rank 在一步开头停顿时体现在下游 stage 的 `fill` 上。只在开 PP 时输出 |
+| `pp_bubble/ratio` | `pp_recv` 占已计时训练时间的比例，取各 PP stage 中位数的最大值；只在开 PP 时输出 |
+| `micro_batch/{fwd_max_ms,fwd_max_rank,fwd_argmax,fwd_argmax_tokens,fwd_min_ms,bwd_max_ms,bwd_max_rank,tokens_max,tokens_min}` | 本窗口单个训练 micro-batch 的极值：最慢的前向及其 rank、它在所在 rollout 里的 micro-batch 序号（从 0 起）和 token 数（拿不到时为 −1），最快的前向，最慢的反向及其 rank，单个 micro-batch 的最大 / 最小 token 数（没有 token 数时不输出） |
+| `gc/{median_ms,max_ms}` | Python GC 停顿 |
+| `waiting/count` | 因上游 PP stage 慢而在等待的 rank 数；它们是被拖慢的，不计入 `flagged` |
+| `uncertain/{rank,cause}` | 第一个「不确定」的 rank（没有时为 −1）及其原因。cause 编码：0 none、1 dropped_events、2 unread_events、3 profiler_errors、4 no_peers、5 missing_tokens、6 no_wait_reference |
+| `recovered/count` | 本窗口解除告警的 rank 数 |
+| `health/degraded_ranks` | degraded 的 rank 数 |
+| `gather_ms`、`analyze_ms` | primary 上每个窗口的 gather 和判定耗时 |
+| `trace/{ranks,module_brackets,align_spread_ms,bubble_excess_ms_max,bubble_excess_rank}` | 采样步 trace 的统计，见下节 |
 
 ### 采样步 trace（Perfetto）
 
@@ -147,7 +159,9 @@ closed; their time lands in the next window
 
 primary 自己的 CPU 侧计时（例如 `actor_train`、每个 micro-batch 的 `get_data_batch_*`）单独一行 `primary CPU`。
 
-| 指标 | 含义 |
+下表中只有 `straggler/trace/lost` 是标量，其余写在日志的 `other metrics` 一行。
+
+| 统计 | 含义 |
 |------|------|
 | `straggler/trace/ranks`、`straggler/trace/lost` | 提供了 trace 的 rank 数；丢失的计时数（队列满，或超出每步 4096 条普通计时、8192 条模块计时的上限；模块计时单独排队，最多占队列的一半，队列满时先被挤掉，只计在这里，不计入 `dropped_events`） |
 | `straggler/trace/module_brackets` | trace 中模块计时的条数，各 rank 求和（仅 `modules` 级别） |
@@ -183,6 +197,6 @@ primary 自己的 CPU 侧计时（例如 `actor_train`、每个 micro-batch 的 
 - 计时复用 Megatron 已有的计时点。窗口统计里 attention、MoE、head / logits、MTP 的内部都包含在 `fwd` / `bwd` 中，`modules` 级别也只在 trace 里给出每层 attention 和 MLP / MoE 的整块耗时；EP all-to-all 计入计算时间；不给真实的通信计算重叠比例，`dp_grad_sync` 变小不能理解为重叠变好。
 - 同一 TP 组的 rank 在前向 / 反向里互相等待，其中一个变慢时整组都会被报出；所有 rank 同时变慢时（整机降频、共享存储抖动）发现不了。
 - PP 阶段拆分、trace 里的阶段命名和气泡推算只适用于非交错 1F1B，VPP 的收发只计入 `pp_recv`。VPP 下的 micro-batch 序号和模型块按 Megatron 的交错调度表（`get_schedule_table`，用模型自己的 config 生成）由调用顺序换算；`combined_1f1b` 的训练调用把前向和反向合并执行，不编号。
-- 跨卡对齐依赖各 rank 的墙钟，跨机器时受 NTP 精度影响，误差见 `straggler/trace/align_spread_ms`。窗口只有 1 个 rollout 时，采样步可能来不及读完，这个窗口就没有 trace。CUDA graph 捕获期间不计时。
+- 跨卡对齐依赖各 rank 的墙钟，跨机器时受 NTP 精度影响，误差见日志 `other metrics` 一行里的 `trace/align_spread_ms`。窗口只有 1 个 rollout 时，采样步可能来不及读完，这个窗口就没有 trace。CUDA graph 捕获期间不计时。
 - 告警有延迟：默认参数下从开始变慢到告警约 21–30 个 rollout。调小 `REPORT_INTERVAL` 或 `PERSIST_WINDOWS` 能更早告警，但更容易被一次性抖动触发。
 - 某个 rank 进程整个消失时，其余 rank 的每次 gather 都要等到 `RELAX_STRAGGLER_GATHER_TIMEOUT_S` 超时，失败多次后各自关闭分析器。

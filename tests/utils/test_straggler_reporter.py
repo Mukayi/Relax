@@ -56,7 +56,7 @@ def test_report_returns_scalars_instead_of_logging_them(logged, captured):
     assert logged == []
     assert captured == ([], []), "logging happens on the analysis worker, not at pickup"
     assert metrics["straggler/flagged/count"] == 1
-    assert metrics["straggler/fwd/median_ms"] == 100.0
+    assert set(metrics) <= reporter.REPORTED_METRICS and "straggler/fwd/median_ms" not in metrics
     assert "rollout/step" not in metrics
 
 
@@ -98,7 +98,16 @@ def test_alert_is_logged_as_warning_with_table_at_the_window_step(captured):
     reporter.log_straggler_window(_args(), _report(flag_rank=2, last_rollout=5))
     assert len(warnings) == 1 and "rank 2" in warnings[0] and "slow_device" in warnings[0]
     assert "step=5" in warnings[0]
-    assert len(infos) == 1 and "per-rank window" in infos[0] and "slow_device" in infos[0]
+    assert len(infos) == 2 and "per-rank window" in infos[0] and "slow_device" in infos[0]
+    assert "other metrics" in infos[1]
+
+
+def test_numbers_left_out_of_the_scalars_are_logged_once_per_window(captured):
+    _, infos = captured
+    reporter.log_straggler_window(_args(), _report())
+    others = [line for line in infos if "other metrics" in line]
+    assert len(others) == 1 and "fwd/median_ms 100" in others[0]
+    assert "flagged/count" not in others[0], "a reported scalar is not repeated in the log"
 
 
 def test_switch_off_report_logs_why_instead_of_a_healthy_summary(captured, records):
@@ -124,7 +133,8 @@ def test_new_uncertain_ranks_are_warned_once_and_counted_in_the_summary(captured
         reporter.log_straggler_window(_args(), analyze_window(table, _meta(2, pp_size=2), DetectorConfig(), state))
     assert len(warnings) == 2, "one WARNING per rank when it becomes uncertain, not every window"
     assert all("uncertain" in line and "no other rank" in line for line in warnings)
-    assert len(infos) == 2 and all("uncertain 2" in line for line in infos)
+    summaries = [line for line in infos if "no straggler" in line]
+    assert len(summaries) == 2 and all("uncertain 2" in line for line in summaries)
 
 
 def test_recovery_is_logged_as_warning(captured):

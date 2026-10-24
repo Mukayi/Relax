@@ -2,9 +2,9 @@
 """Turn one analyzed straggler window into scalars, timeline events and log
 lines.
 
-* scalars -> returned for the step's ``log_perf_data``
+* the scalars in ``REPORTED_METRICS`` -> returned for the step's ``log_perf_data``
 * per-rank segment bars -> ``Timer().records``, one Perfetto row per rank
-* alerts, recoveries, uncertain ranks -> logger, from the analysis thread
+* alerts, recoveries, uncertain ranks and the rest of the window's numbers -> logger, from the analysis thread
 """
 
 from __future__ import annotations
@@ -35,6 +35,32 @@ _TABLE_COLUMNS: tuple[str, ...] = (
     "gc_ms",
     "steady_ms",
     "mb_fwd_max",
+)
+
+# The scalars that go out with the step's ``log_perf_data``. Every key adds training-thread time to that
+# step's flush, so the analysis thread logs the rest of a window's numbers instead.
+REPORTED_METRICS: frozenset[str] = frozenset(
+    {
+        "straggler/flagged/count",
+        "straggler/flagged/rank",
+        "straggler/flagged/reason",
+        "straggler/uncertain/count",
+        "straggler/self/median_ms",
+        "straggler/self/max_ms",
+        "straggler/self/max_rank",
+        "straggler/late/max_ms",
+        "straggler/health/state",
+        "straggler/health/errors",
+        "straggler/health/requested_by",
+        "straggler/dropped_events",
+        "straggler/unread_events",
+        "straggler/trace/lost",
+        "straggler/control/level",
+        "straggler/self_overhead_ms",
+        "straggler/window/first_rollout",
+        "straggler/window/last_rollout",
+        "straggler/latency/analyzed_ms",
+    }
 )
 
 
@@ -86,8 +112,8 @@ def _ms_after_close(report: WindowReport, wall: float) -> float:
 
 
 def report_straggler_window(args: Any, report: WindowReport) -> dict[str, float]:
-    """Emit timeline events for one window and return its scalars for the
-    step's ``log_perf_data`` (primary rank, training thread).
+    """Emit timeline events for one window and return its ``REPORTED_METRICS``
+    for the step's ``log_perf_data`` (primary rank, training thread).
 
     That step can be later than the window, hence ``straggler/window/*``.
     """
@@ -99,12 +125,12 @@ def report_straggler_window(args: Any, report: WindowReport) -> dict[str, float]
     if getattr(args, "timeline_dump_dir", None) and not _switched_off(report):
         # Flushed, and stamped with the step, by the ``log_perf_data`` that follows.
         Timer().records.extend(_timeline_events(report))
-    return metrics
+    return {key: value for key, value in metrics.items() if key in REPORTED_METRICS}
 
 
 def log_straggler_window(args: Any, report: WindowReport) -> None:
-    """Log one window's alerts, recoveries, uncertain ranks and summary at the
-    window's own step.
+    """Log one window's alerts, recoveries, uncertain ranks, summary and the
+    numbers left out of ``REPORTED_METRICS`` at the window's own step.
 
     Only touches the logger, so it is safe on the analysis thread, which runs
     it as soon as the analysis ends.
@@ -146,4 +172,11 @@ def log_straggler_window(args: Any, report: WindowReport) -> None:
             metrics.get("straggler/late/peer_idle_ms", 0.0),
             metrics.get("straggler/pp_stage_imbalance", 1.0),
             metrics.get("straggler/self_overhead_ms", 0.0),
+        )
+    others = sorted(key for key in metrics if key not in REPORTED_METRICS)
+    if others:
+        logger.info(
+            "[straggler] step=%d other metrics: %s",
+            step,
+            ", ".join(f"{key.removeprefix('straggler/')} {metrics[key]:.4g}" for key in others),
         )
