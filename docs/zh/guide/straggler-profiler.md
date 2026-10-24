@@ -117,7 +117,7 @@ closed; their time lands in the next window
 |------|------|
 | `straggler/flagged/{count,rank,reason}` | 告警状态，没有时 rank 为 −1。reason 编码：0 none、1 slow_device、2 data_imbalance、3 upstream_wait、4 cpu_bound、5 late_arrival |
 | `straggler/uncertain/count` | 「不确定」的 rank 数 |
-| `straggler/self/{median_ms,max_ms,max_rank}` | 自身计算时间（`fwd + bwd + optim`，ms/step）的中位数、最大值和最大的 rank |
+| `straggler/self/{median_ms,max_ms,max_rank}` | 自身计算时间（`fwd + bwd + optim`，ms/step）的全局中位数和最大值；`max_rank` 是相对同 PP stage 其他 rank 超出最多的 rank，不一定是最大值所在的 rank |
 | `straggler/late/max_ms` | 最晚到达 DP 梯度同步的 rank 晚了多少 |
 | `straggler/health/{state,errors,requested_by}` | 分析器自身的状态：各 rank 中最差的状态（0 active、1 degraded、2 disabled）、本窗口捕获的异常数，以及请求关闭的 rank（只在关闭时有） |
 | `straggler/{dropped_events,unread_events}`、`straggler/trace/lost` | 因队列满被丢弃的计时数、窗口结束时还没读到的计时数、采样步 trace 丢失的计时数（正常都为 0） |

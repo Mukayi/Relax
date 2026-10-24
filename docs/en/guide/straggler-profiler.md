@@ -117,7 +117,7 @@ The timings reuse the 22 timer call sites Megatron already has, grouped into the
 |--------|---------|
 | `straggler/flagged/{count,rank,reason}` | Alert state; rank is −1 if none. Reason codes: 0 none, 1 slow_device, 2 data_imbalance, 3 upstream_wait, 4 cpu_bound, 5 late_arrival |
 | `straggler/uncertain/count` | Number of uncertain ranks |
-| `straggler/self/{median_ms,max_ms,max_rank}` | Own compute time (`fwd + bwd + optim`, ms/step): median, maximum and the rank with the maximum |
+| `straggler/self/{median_ms,max_ms,max_rank}` | Own compute time (`fwd + bwd + optim`, ms/step): median and maximum across all ranks; `max_rank` is the rank that exceeds the other ranks of its PP stage the most, not necessarily the one with the maximum |
 | `straggler/late/max_ms` | How late the rank that reaches the DP gradient sync last is |
 | `straggler/health/{state,errors,requested_by}` | The profiler's own health: the worst state across ranks (0 active, 1 degraded, 2 disabled), errors caught in the window, and the rank that asked to switch the profiler off (only then) |
 | `straggler/{dropped_events,unread_events}`, `straggler/trace/lost` | Spans dropped from a full queue, spans still unread when the window closed, and spans lost from the sampled-step trace (all normally 0) |
