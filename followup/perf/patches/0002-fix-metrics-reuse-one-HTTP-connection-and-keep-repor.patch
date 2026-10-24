@@ -1,0 +1,500 @@
+From 93d9fb228324dc36f7e2a0683acdd231ec01221e Mon Sep 17 00:00:00 2001
+From: Mukayi <1515982581@qq.com>
+Date: Thu, 15 Oct 2026 19:34:24 +0800
+Subject: [PATCH 02/11] fix(metrics): reuse one HTTP connection and keep
+ /report_step off the event loop
+
+The metrics service is enabled by default (`--use-metrics-service` defaults to
+True), which puts synchronous HTTP on the training thread and makes the
+logging rank arrive late at the next collective.
+
+Client side
+-----------
+`MetricsClient` called the module-level `requests.post` / `requests.get` for
+every request, so no connection was ever reused: one TCP handshake per metric
+batch, per report step, per rollout and per optimizer step, all on the rank
+that also has to reach the grad-sync reduce-scatter. Hold one
+`requests.Session` for the lifetime of the client instead.
+
+The same session sets `trust_env = False`. The metrics service is a
+cluster-local endpoint, and honoring `HTTP_PROXY` / `HTTPS_PROXY` from the
+environment would route those requests through a proxy -- the sibling
+`sglang_exporter` already does this.
+
+The eleven `print()` calls in the module become logger warnings, per the
+project logging convention.
+
+Service side
+------------
+`/report_step` was declared `async def` but ran its backend fan-out inline:
+`wandb.log`, `SummaryWriter.add_scalar`, the ClearML adapter and the timeline
+`json.dump` all block. This deployment is a single replica, so a slow backend
+stalled every `/log_metrics_batch` that arrived meanwhile -- the endpoint
+itself is cheap, its neighbours are what got slow.
+
+Move the fan-out into `_report_to_backends`, a plain synchronous method, and
+await it through `asyncio.to_thread`, serialized by a lock because none of the
+backends documents thread safety and reporting is already sequential per step.
+The package already uses `asyncio.to_thread` for its own parse/render work in
+`sglang_exporter`.
+
+Tests
+-----
+`tests/utils/test_metrics_client_transport.py` covers what the existing tests
+could not: they patch the module-level `requests` functions, so they never
+exercise the real transport. The new tests drive a real HTTP server and count
+accepted connections (one, not six), assert a proxy in the environment does
+not capture the request, and check that a deliberately slow backend leaves the
+event loop free to run other work.
+
+(cherry picked from commit fe2883651ee2fab9357113eaa04c829fbcb0e24a)
+---
+ relax/utils/metrics/client.py                |  58 ++++--
+ relax/utils/metrics/service.py               |  60 ++++--
+ tests/utils/test_metrics_client_transport.py | 197 +++++++++++++++++++
+ 3 files changed, 278 insertions(+), 37 deletions(-)
+ create mode 100644 tests/utils/test_metrics_client_transport.py
+
+diff --git a/relax/utils/metrics/client.py b/relax/utils/metrics/client.py
+index 2939cc9..70574b3 100644
+--- a/relax/utils/metrics/client.py
++++ b/relax/utils/metrics/client.py
+@@ -6,6 +6,12 @@ from collections import defaultdict
+ from typing import Any, Dict, List, Optional, Union
+ 
+ import requests
++from requests.adapters import HTTPAdapter
++
++from relax.utils.logging_utils import get_logger
++
++
++logger = get_logger(__name__)
+ 
+ 
+ def _sanitize_for_json(value: Any) -> Any:
+@@ -47,18 +53,36 @@ class MetricsClient:
+     Provides a convenient interface for logging metrics and reporting them at
+     the end of steps. Supports both synchronous and asynchronous operation
+     modes.
++
++    All requests go through one long-lived :class:`requests.Session` so that the
++    TCP connection is reused. That matters because this client is driven from
++    the training thread: one call per metric batch and one per report step, per
++    rollout and per optimizer step, on one rank. Opening a fresh connection for
++    each of those puts a handshake on the training critical path and makes that
++    rank arrive late at the next collective.
+     """
+ 
+-    def __init__(self, service_url: str = "http://localhost:8000/metrics"):
++    def __init__(self, service_url: str = "http://localhost:8000/metrics", pool_maxsize: int = 32):
+         """Initialize the metrics client.
+ 
+         Args:
+             service_url: URL of the metrics service
++            pool_maxsize: Connections kept per host. The training rank issues
++                its requests one at a time, so this only needs headroom for
++                concurrent callers of the same client instance.
+         """
+         self.service_url = service_url.rstrip("/")
+         self._buffer = defaultdict(list)
+         self._lock = threading.Lock()
+ 
++        adapter = HTTPAdapter(pool_connections=2, pool_maxsize=pool_maxsize, max_retries=0)
++        self._session = requests.Session()
++        # The metrics service is a cluster-local endpoint. Do not let
++        # HTTP_PROXY / HTTPS_PROXY from the environment redirect it.
++        self._session.trust_env = False
++        self._session.mount("http://", adapter)
++        self._session.mount("https://", adapter)
++
+     def log_metric(
+         self,
+         step: int,
+@@ -197,7 +221,7 @@ class MetricsClient:
+             True if successful, False otherwise
+         """
+         try:
+-            response = requests.post(
++            response = self._session.post(
+                 f"{self.service_url}/log_metric",
+                 json={
+                     "step": step,
+@@ -208,15 +232,15 @@ class MetricsClient:
+                 timeout=5,
+             )
+             if response.status_code != 200:
+-                print(f"[MetricsClient] log_metric failed: HTTP {response.status_code}, response: {response.text}")
++                logger.warning(f"log_metric failed: HTTP {response.status_code}, response: {response.text}")
+                 return False
+             result = response.json()
+             if result.get("status") != "success":
+-                print(f"[MetricsClient] log_metric failed: {result}")
++                logger.warning(f"log_metric failed: {result}")
+                 return False
+             return True
+         except Exception as e:
+-            print(f"[MetricsClient] log_metric exception: {e}")
++            logger.warning(f"log_metric exception: {e}")
+             return False
+ 
+     def _send_metrics_batch(
+@@ -236,23 +260,21 @@ class MetricsClient:
+             True if successful, False otherwise
+         """
+         try:
+-            response = requests.post(
++            response = self._session.post(
+                 f"{self.service_url}/log_metrics_batch",
+                 json={"step": step, "metrics": _sanitize_for_json(metrics), "tags": tags},
+                 timeout=5,
+             )
+             if response.status_code != 200:
+-                print(
+-                    f"[MetricsClient] log_metrics_batch failed: HTTP {response.status_code}, response: {response.text}"
+-                )
++                logger.warning(f"log_metrics_batch failed: HTTP {response.status_code}, response: {response.text}")
+                 return False
+             result = response.json()
+             if result.get("status") != "success":
+-                print(f"[MetricsClient] log_metrics_batch failed: {result}")
++                logger.warning(f"log_metrics_batch failed: {result}")
+                 return False
+             return True
+         except Exception as e:
+-            print(f"[MetricsClient] log_metrics_batch exception: {e}")
++            logger.warning(f"log_metrics_batch exception: {e}")
+             return False
+ 
+     def _send_report_step(self, step: int) -> Dict[str, Any]:
+@@ -267,17 +289,17 @@ class MetricsClient:
+         """
+         try:
+             # Then, trigger reporting
+-            response = requests.post(f"{self.service_url}/report_step", json={"step": step}, timeout=10)
++            response = self._session.post(f"{self.service_url}/report_step", json={"step": step}, timeout=10)
+ 
+             if response.status_code != 200:
+-                print(f"[MetricsClient] report_step failed: HTTP {response.status_code}, response: {response.text}")
++                logger.warning(f"report_step failed: HTTP {response.status_code}, response: {response.text}")
+                 return {"status": "error", "message": f"HTTP {response.status_code}: {response.text}"}
+             result = response.json()
+             if result.get("status") != "success":
+-                print(f"[MetricsClient] report_step failed: {result}")
++                logger.warning(f"report_step failed: {result}")
+             return result
+         except Exception as e:
+-            print(f"[MetricsClient] report_step exception: {e}")
++            logger.warning(f"report_step exception: {e}")
+             return {"status": "error", "message": str(e)}
+ 
+     def health_check(self) -> Dict[str, Any]:
+@@ -287,13 +309,13 @@ class MetricsClient:
+             Dict with health status information
+         """
+         try:
+-            response = requests.get(f"{self.service_url}/health", timeout=5)
++            response = self._session.get(f"{self.service_url}/health", timeout=5)
+             if response.status_code != 200:
+-                print(f"[MetricsClient] health_check failed: HTTP {response.status_code}, response: {response.text}")
++                logger.warning(f"health_check failed: HTTP {response.status_code}, response: {response.text}")
+                 return {"status": "error", "message": f"HTTP {response.status_code}: {response.text}"}
+             return response.json()
+         except Exception as e:
+-            print(f"[MetricsClient] health_check exception: {e}")
++            logger.warning(f"health_check exception: {e}")
+             return {"status": "error", "message": str(e)}
+ 
+ 
+diff --git a/relax/utils/metrics/service.py b/relax/utils/metrics/service.py
+index ab42c60..58b6649 100644
+--- a/relax/utils/metrics/service.py
++++ b/relax/utils/metrics/service.py
+@@ -136,6 +136,9 @@ class MetricsService:
+         self.role = role
+ 
+         self.metrics_buffer = MetricsBuffer()
++        # Serializes the blocking backend fan-out in `_report_to_backends`,
++        # which runs on a worker thread rather than the event loop.
++        self._report_lock = threading.Lock()
+         self._rollout_handle_task: asyncio.Task[Any] | None = None
+         self._sglang_exporter = SGLangMetricsExporter(self._discover_sglang_engines)
+         self._straggler = ControlState()
+@@ -282,16 +285,45 @@ class MetricsService:
+             step = request.step
+             metrics = self.metrics_buffer.get_metrics_for_step(step)
+ 
+-            report_results = {}
++            metrics_dict = {}
++            for metric in metrics:
++                metrics_dict[metric["name"]] = metric["value"]
+ 
+-            # Handle regular metrics reporting
+-            if metrics:
+-                metrics_dict = {}
+-                for metric in metrics:
+-                    metric_name = metric["name"]
+-                    metric_value = metric["value"]
+-                    metrics_dict[metric_name] = metric_value
++            # The backend fan-out below is blocking: `wandb.log` and
++            # `SummaryWriter.add_scalar` write through to disk, and the timeline
++            # adapter serializes JSON to a file. This service runs as a single
++            # Serve replica, so doing that work on the event loop stalls every
++            # /log_metrics_batch that arrives meanwhile -- the handler itself is
++            # cheap, its neighbours are what get slow. Hand it to a worker
++            # thread instead.
++            report_results = await asyncio.to_thread(self._report_to_backends, step, metrics_dict)
++
++            self.metrics_buffer.clear_step(step)
++            logger.info(f"Reported {len(metrics)} metrics for step {step}")
++            return {
++                "status": "success",
++                "message": f"Reported {len(metrics)} metrics for step {step}",
++                "results": report_results,
++            }
++
++        except Exception as e:
++            logger.error(f"Failed to report step {request.step}: {e}")
++            return {"status": "error", "message": str(e)}
++
++    def _report_to_backends(self, step: int, metrics_dict: Dict[str, Any]) -> Dict[str, str]:
++        """Push one step's metrics out to every configured backend.
+ 
++        This is the blocking body of :meth:`report_step` and is meant to be run
++        through ``asyncio.to_thread``; awaiting it directly would put the same
++        work back on the event loop. Adapter calls are serialized because none
++        of the backends documents thread safety, and reporting is sequential
++        per step anyway.
++        """
++        report_results: Dict[str, str] = {}
++
++        with self._report_lock:
++            # Handle regular metrics reporting
++            if metrics_dict:
+                 if self._use_wandb:
+                     try:
+                         wandb.log(metrics_dict, step=step)
+@@ -340,17 +372,7 @@ class MetricsService:
+                     report_results["timeline"] = f"error: {e}"
+                     logger.exception(f"Failed to dump timeline: {e}")
+ 
+-            self.metrics_buffer.clear_step(step)
+-            logger.info(f"Reported {len(metrics)} metrics for step {step}")
+-            return {
+-                "status": "success",
+-                "message": f"Reported {len(metrics)} metrics for step {step}",
+-                "results": report_results,
+-            }
+-
+-        except Exception as e:
+-            logger.error(f"Failed to report step {request.step}: {e}")
+-            return {"status": "error", "message": str(e)}
++        return report_results
+ 
+     async def _discover_sglang_engines(self) -> Dict[str, Any]:
+         # MetricsService starts before Rollout. Resolve lazily and retry on
+diff --git a/tests/utils/test_metrics_client_transport.py b/tests/utils/test_metrics_client_transport.py
+new file mode 100644
+index 0000000..bbc1561
+--- /dev/null
++++ b/tests/utils/test_metrics_client_transport.py
+@@ -0,0 +1,197 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 Relax Authors. All Rights Reserved.
++"""Tests for the MetricsClient transport and the MetricsService report path.
++
++Two properties are covered here that the older tests could not see, because
++they patched the module-level ``requests`` functions and therefore never
++exercised the real transport:
++
++* the client reuses one HTTP connection across calls instead of opening a new
++  one per request, and it ignores ``HTTP_PROXY`` / ``HTTPS_PROXY`` for what is a
++  cluster-local endpoint;
++* the blocking backend fan-out in ``/report_step`` runs off the event loop, so a
++  slow backend does not stall concurrent metric ingestion on the same replica.
++
++The connection-reuse test drives a real HTTP server and counts accepted TCP
++connections, so it fails if the client goes back to a fresh connection per call.
++"""
++
++import asyncio
++import threading
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from unittest.mock import patch
++
++from relax.utils.metrics.client import MetricsClient
++from relax.utils.metrics.service import MetricsService
++
++
++class _CountingHandler(BaseHTTPRequestHandler):
++    """Answer every metrics endpoint with success."""
++
++    protocol_version = "HTTP/1.1"
++
++    def _reply(self) -> None:
++        # Drain the request body first. On a keep-alive connection, bytes left
++        # unread here are parsed as the start of the next request and the server
++        # answers 400 -- which is only reachable because reuse actually happens.
++        length = int(self.headers.get("Content-Length") or 0)
++        if length:
++            self.rfile.read(length)
++        body = b'{"status": "success"}'
++        self.send_response(200)
++        self.send_header("Content-Type", "application/json")
++        self.send_header("Content-Length", str(len(body)))
++        self.end_headers()
++        self.wfile.write(body)
++
++    do_POST = _reply
++    do_GET = _reply
++
++    def log_message(self, *args):  # silence the per-request stderr line
++        pass
++
++
++class _CountingHTTPServer(ThreadingHTTPServer):
++    """Counts accepted connections, which is what connection reuse controls."""
++
++    daemon_threads = True
++
++    def __init__(self, *args, **kwargs) -> None:
++        super().__init__(*args, **kwargs)
++        self.accepted = 0
++
++    def get_request(self):
++        conn, addr = super().get_request()
++        self.accepted += 1
++        return conn, addr
++
++
++class _CountingServer:
++    """Threaded HTTP server exposing how many connections were accepted."""
++
++    def __init__(self) -> None:
++        self._server = _CountingHTTPServer(("127.0.0.1", 0), _CountingHandler)
++        self._thread = threading.Thread(target=self._server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
++
++    def __enter__(self) -> "_CountingServer":
++        self._thread.start()
++        return self
++
++    def __exit__(self, *exc) -> None:
++        self._server.shutdown()
++        self._server.server_close()
++        self._thread.join(timeout=5)
++
++    @property
++    def url(self) -> str:
++        host, port = self._server.server_address[:2]
++        return f"http://{host}:{port}/metrics"
++
++    @property
++    def accepted(self) -> int:
++        return self._server.accepted
++
++
++def test_client_reuses_one_connection_across_calls():
++    """Repeat calls must not open a new TCP connection each time.
++
++    Five POSTs plus a GET over one keep-alive session should ride a single
++    connection. A client that calls the module-level ``requests.post`` per
++    request opens one connection per call.
++    """
++    with _CountingServer() as server:
++        client = MetricsClient(server.url)
++        for step in range(5):
++            assert client.log_metrics_batch(step, {"train/loss": float(step)}, immediate=True) is True
++        assert client.health_check().get("status") == "success"
++        accepted = server.accepted
++
++    assert accepted == 1, f"expected one reused connection, the server accepted {accepted}"
++
++
++def test_client_ignores_proxy_environment_for_cluster_local_endpoint(monkeypatch):
++    """A proxy in the environment must not capture the metrics endpoint."""
++    with _CountingServer() as server:
++        monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:3128")
++        monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
++        client = MetricsClient(server.url)
++        # If trust_env were left True, this request would be sent to the proxy
++        # and fail, because nothing is listening there.
++        assert client.log_metrics_batch(1, {"train/loss": 1.0}, immediate=True) is True
++
++
++def test_client_uses_a_session_rather_than_module_level_requests():
++    client = MetricsClient("http://127.0.0.1:1/metrics")
++    assert client._session.trust_env is False
++    with patch("requests.post") as module_post:
++        with patch.object(client._session, "post", return_value=_FakeResponse()) as session_post:
++            client.log_metrics_batch(1, {"a": 1.0}, immediate=True)
++            session_post.assert_called_once()
++            module_post.assert_not_called()
++
++
++class _FakeResponse:
++    status_code = 200
++
++    def json(self):
++        return {"status": "success"}
++
++
++def test_report_step_helper_is_synchronous_so_it_can_run_on_a_thread():
++    """``report_step`` stays async while its blocking body is a plain function.
++
++    ``asyncio.to_thread`` needs a sync callable; a coroutine helper would put
++    the work straight back on the event loop.
++    """
++    cls = MetricsService.func_or_class
++    assert not asyncio.iscoroutinefunction(cls._report_to_backends)
++    assert asyncio.iscoroutinefunction(cls.report_step)
++
++
++def test_slow_backend_does_not_block_concurrent_ingestion():
++    """A slow adapter must not stop the event loop from running other handlers.
++
++    The ticker coroutine interleaves with the report; if the fan-out ran on the
++    loop, the ticker would not advance during it.
++    """
++    cls = MetricsService.func_or_class
++    service = cls.__new__(cls)
++    service._use_wandb = False
++    service._timeline_adapter = None
++    # __init__ needs a Ray Serve context; set only what _report_to_backends reads.
++    service._report_lock = threading.Lock()
++
++    ticks = {"count": 0}
++
++    class SlowAdapter:
++        def log(self, data, step):
++            # Stand-in for SummaryWriter / clearml / a network-mounted dump dir.
++            import time
++
++            time.sleep(0.3)
++
++    service._adapters = {"tensorboard": SlowAdapter()}
++
++    async def scenario():
++        async def ticker():
++            while True:
++                ticks["count"] += 1
++                await asyncio.sleep(0.01)
++
++        ticker_task = asyncio.create_task(ticker())
++        await asyncio.sleep(0.05)
++        until_ticks = ticks["count"]
++
++        results = await asyncio.to_thread(service._report_to_backends, 1, {"train/loss": 0.5})
++        during = ticks["count"] - until_ticks
++        ticker_task.cancel()
++        return results, during
++
++    results, ticks_during_report = asyncio.run(scenario())
++
++    assert results == {"tensorboard": "success"}
++    # ~0.3 s of sleep at a 10 ms period: expect on the order of 25 ticks. The
++    # point is that it is far from zero, not the exact count.
++    assert ticks_during_report > 5, (
++        f"the event loop made only {ticks_during_report} ticks during a 300 ms blocking backend call"
++    )
+-- 
+2.43.0
+

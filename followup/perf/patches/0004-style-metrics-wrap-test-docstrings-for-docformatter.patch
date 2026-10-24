@@ -1,0 +1,43 @@
+From d6fd7c416ca72c81fca2c1fb57d53ad5dbf7d2f3 Mon Sep 17 00:00:00 2001
+From: Mukayi <1515982581@qq.com>
+Date: Wed, 21 Oct 2026 20:19:19 +0800
+Subject: [PATCH 04/11] style(metrics): wrap test docstrings for docformatter
+
+(cherry picked from commit 75ea68431766fbd1583174dd0091dcb413e08caa)
+---
+ tests/utils/test_metrics_client_transport.py | 12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/tests/utils/test_metrics_client_transport.py b/tests/utils/test_metrics_client_transport.py
+index f386614..041fb10 100644
+--- a/tests/utils/test_metrics_client_transport.py
++++ b/tests/utils/test_metrics_client_transport.py
+@@ -152,10 +152,11 @@ def test_report_step_helper_is_synchronous_so_it_can_run_on_a_thread():
+ def _service_with_slow_backend(adapter):
+     """A MetricsService whose only backend is ``adapter``.
+ 
+-    The ``@serve.ingress`` wrapper makes the class unconstructible (its ``__init__``
+-    is async and the real one would open wandb / TensorBoard / ClearML), so build it
+-    with ``__new__`` and set the attributes the handlers read. ``metrics_buffer`` is
+-    the real class, so the handler bodies run their real code.
++    The ``@serve.ingress`` wrapper makes the class unconstructible (its
++    ``__init__`` is async and the real one would open wandb / TensorBoard /
++    ClearML), so build it with ``__new__`` and set the attributes the handlers
++    read. ``metrics_buffer`` is the real class, so the handler bodies run their
++    real code.
+     """
+     cls = MetricsService.func_or_class
+     service = cls.__new__(cls)
+@@ -180,7 +181,8 @@ class _SlowAdapter:
+ 
+ 
+ def test_slow_backend_does_not_block_concurrent_ingestion():
+-    """A slow report must not delay a ``/log_metrics_batch`` on the same replica.
++    """A slow report must not delay a ``/log_metrics_batch`` on the same
++    replica.
+ 
+     This drives the real ``report_step`` coroutine -- the thing that decides whether
+     the fan-out runs on the loop. Calling ``_report_to_backends`` through
+-- 
+2.43.0
+

@@ -1,8 +1,8 @@
 From 2918b9e36095dabf8ed6e70f2d03315a2696ab9c Mon Sep 17 00:00:00 2001
 From: Mukayi <1515982581@qq.com>
 Date: Fri, 23 Oct 2026 18:11:53 +0800
-Subject: [PATCH] EXPERIMENT ONLY: per-step GC counts (GCSTAT=1) for comparing
- runs with the profiler on and off (do not merge)
+Subject: [PATCH 10/11] EXPERIMENT ONLY: per-step GC counts (GCSTAT=1) for
+ comparing runs with the profiler on and off (do not merge)
 
 ---
  relax/backends/megatron/actor.py |  3 +++

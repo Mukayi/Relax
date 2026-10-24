@@ -1,7 +1,7 @@
 From c5e84daa1b52eb926ad8d1c3f5fb5dbbba1b878f Mon Sep 17 00:00:00 2001
 From: Mukayi <1515982581@qq.com>
 Date: Wed, 7 Oct 2026 13:25:43 +0800
-Subject: [PATCH] EXPERIMENT ONLY: in-run on/off A/B toggle for straggler
+Subject: [PATCH 09/11] EXPERIMENT ONLY: in-run on/off A/B toggle for straggler
  overhead, ported to a829f13 (do not merge)
 
 d8d8c39 on the final code: off rollouts also skip note_schedule and note_microbatch_tokens; the

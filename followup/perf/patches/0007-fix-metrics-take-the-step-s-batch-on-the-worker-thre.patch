@@ -1,0 +1,201 @@
+From eba0fc83ddd4cd642226fdd38844bb01f1324a71 Mon Sep 17 00:00:00 2001
+From: Mukayi <1515982581@qq.com>
+Date: Thu, 22 Oct 2026 00:57:47 +0800
+Subject: [PATCH 07/11] fix(metrics): take the step's batch on the worker
+ thread
+
+report_step took the batch before awaiting asyncio.to_thread. If Serve
+cancelled the request (client disconnect) while the job was still queued,
+the job never ran, CancelledError skipped the restore, and the batch was
+lost. Restoring on cancellation instead would repeat the batch whenever
+the job had already started.
+
+Take, report and restore now all happen in _report_buffered_step on the
+worker thread: a cancelled queued job leaves the batch buffered, and a
+running job reports it exactly once.
+
+(cherry picked from commit e4bd440761f2a0ed88906bc63c87cd9a8f636427)
+---
+ relax/utils/metrics/service.py               | 47 +++++++++---------
+ tests/utils/test_metrics_client_transport.py | 52 +++++++++++++++++---
+ 2 files changed, 71 insertions(+), 28 deletions(-)
+
+diff --git a/relax/utils/metrics/service.py b/relax/utils/metrics/service.py
+index 9d22b8c..328fca2 100644
+--- a/relax/utils/metrics/service.py
++++ b/relax/utils/metrics/service.py
+@@ -6,7 +6,7 @@ import threading
+ from argparse import Namespace
+ from collections import defaultdict
+ from collections.abc import Awaitable, Callable
+-from typing import Any, Dict, List, Optional, Union
++from typing import Any, Dict, List, Optional, Tuple, Union
+ 
+ import wandb
+ from fastapi import FastAPI, HTTPException, Request
+@@ -299,15 +299,6 @@ class MetricsService:
+     async def report_step(self, request: ReportStepRequest) -> Dict[str, Any]:
+         try:
+             step = request.step
+-            # Take the batch before the await below: a /log_metrics_batch that
+-            # lands while the backends run must stay buffered for the next report
+-            # of this step instead of being cleared unreported.
+-            metrics = self.metrics_buffer.take_step(step)
+-
+-            metrics_dict = {}
+-            for metric in metrics:
+-                metrics_dict[metric["name"]] = metric["value"]
+-
+             # The backend fan-out below is blocking: `wandb.log` and
+             # `SummaryWriter.add_scalar` write through to disk, and the timeline
+             # adapter serializes JSON to a file. This service runs as a single
+@@ -315,16 +306,12 @@ class MetricsService:
+             # /log_metrics_batch that arrives meanwhile -- the handler itself is
+             # cheap, its neighbours are what get slow. Hand it to a worker
+             # thread instead.
+-            try:
+-                report_results = await asyncio.to_thread(self._report_to_backends, step, metrics_dict)
+-            except Exception:
+-                self.metrics_buffer.restore_step(step, metrics)
+-                raise
++            count, report_results = await asyncio.to_thread(self._report_buffered_step, step)
+ 
+-            logger.info(f"Reported {len(metrics)} metrics for step {step}")
++            logger.info(f"Reported {count} metrics for step {step}")
+             return {
+                 "status": "success",
+-                "message": f"Reported {len(metrics)} metrics for step {step}",
++                "message": f"Reported {count} metrics for step {step}",
+                 "results": report_results,
+             }
+ 
+@@ -332,14 +319,30 @@ class MetricsService:
+             logger.error(f"Failed to report step {request.step}: {e}")
+             return {"status": "error", "message": str(e)}
+ 
++    def _report_buffered_step(self, step: int) -> Tuple[int, Dict[str, str]]:
++        """Take and report ``step``'s buffered metrics on a worker thread.
++
++        Taking the batch here, not before the ``await`` in :meth:`report_step`,
++        ties it to the work that reports it: if Serve cancels the request (the
++        client disconnected) while the work is still queued, the work never
++        runs and the batch stays buffered; once the work runs, it reports the
++        batch to the end. Metrics that arrive meanwhile wait for the step's
++        next report.
++        """
++        metrics = self.metrics_buffer.take_step(step)
++        metrics_dict = {metric["name"]: metric["value"] for metric in metrics}
++        try:
++            return len(metrics), self._report_to_backends(step, metrics_dict)
++        except Exception:
++            self.metrics_buffer.restore_step(step, metrics)
++            raise
++
+     def _report_to_backends(self, step: int, metrics_dict: Dict[str, Any]) -> Dict[str, str]:
+         """Push one step's metrics out to every configured backend.
+ 
+-        This is the blocking body of :meth:`report_step` and is meant to be run
+-        through ``asyncio.to_thread``; awaiting it directly would put the same
+-        work back on the event loop. Adapter calls are serialized because none
+-        of the backends documents thread safety, and reporting is sequential
+-        per step anyway.
++        Runs on the worker thread, from :meth:`_report_buffered_step`. Adapter
++        calls are serialized because none of the backends documents thread
++        safety, and reporting is sequential per step anyway.
+         """
+         report_results: Dict[str, str] = {}
+ 
+diff --git a/tests/utils/test_metrics_client_transport.py b/tests/utils/test_metrics_client_transport.py
+index 1cfcb09..3cbc90c 100644
+--- a/tests/utils/test_metrics_client_transport.py
++++ b/tests/utils/test_metrics_client_transport.py
+@@ -2,28 +2,31 @@
+ # Copyright (c) 2026 Relax Authors. All Rights Reserved.
+ """Tests for the MetricsClient transport and the MetricsService report path.
+ 
+-Two properties are covered here that the older tests could not see, because
+-they patched the module-level ``requests`` functions and therefore never
+-exercised the real transport:
++Covered here, and not by the older tests (they patched the module-level
++``requests`` functions and therefore never exercised the real transport):
+ 
+ * the client reuses one HTTP connection across calls instead of opening a new
+   one per request, and it ignores ``HTTP_PROXY`` / ``HTTPS_PROXY`` for what is a
+   cluster-local endpoint;
+ * the blocking backend fan-out in ``/report_step`` runs off the event loop, so a
+   slow backend does not stall concurrent metric ingestion on the same replica;
+-* a metric ingested while that fan-out runs is kept for the next report of the
+-  step, and goes out exactly once.
++* a metric ingested while that fan-out runs, and the batch of a request that is
++  cancelled, each go out exactly once.
+ 
+ The connection-reuse test drives a real HTTP server and counts accepted TCP
+ connections, so it fails if the client goes back to a fresh connection per call.
+ """
+ 
+ import asyncio
++import contextlib
+ import threading
+ import time
++from concurrent.futures import ThreadPoolExecutor
+ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+ from unittest.mock import patch
+ 
++import pytest
++
+ from relax.utils.metrics.client import MetricsClient
+ from relax.utils.metrics.service import LogMetricsBatchRequest, MetricsBuffer, MetricsService, ReportStepRequest
+ 
+@@ -151,7 +154,7 @@ def test_report_step_helper_is_synchronous_so_it_can_run_on_a_thread():
+     the work straight back on the event loop.
+     """
+     cls = MetricsService.func_or_class
+-    assert not asyncio.iscoroutinefunction(cls._report_to_backends)
++    assert not asyncio.iscoroutinefunction(cls._report_buffered_step)
+     assert asyncio.iscoroutinefunction(cls.report_step)
+ 
+ 
+@@ -318,3 +321,40 @@ def test_a_report_that_raises_keeps_its_batch_for_the_next_report():
+ 
+     assert result["status"] == "error"
+     assert [m["name"] for m in service.metrics_buffer.get_metrics_for_step(1)] == ["perf/step_time"]
++
++
++@pytest.mark.parametrize("cancelled_while", ["queued", "running"])
++def test_a_cancelled_report_neither_loses_nor_repeats_its_batch(cancelled_while):
++    """Serve cancels the handler when the client disconnects.
++
++    Work still queued then never runs and leaves the batch buffered; work
++    already running reports it to the end.
++    """
++    adapter = _GatedAdapter()
++    service = _service_with_slow_backend(adapter)
++    service.metrics_buffer.add_metric(step=1, metric_name="perf/step_time", metric_value=1.0)
++    worker_free = threading.Event()
++
++    async def scenario():
++        loop = asyncio.get_running_loop()
++        # One worker: holding it keeps the report queued, and the next report
++        # cannot start before the cancelled one is done.
++        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
++        if cancelled_while == "queued":
++            loop.run_in_executor(None, worker_free.wait, 5)
++        report = asyncio.create_task(service.report_step(ReportStepRequest(step=1)))
++        await asyncio.sleep(0)
++        # Blocking the loop is fine here: the worker does not need it.
++        if cancelled_while == "running":
++            assert adapter.entered.wait(5), "the report never reached the backend"
++        report.cancel()
++        worker_free.set()
++        adapter.release.set()
++        with contextlib.suppress(asyncio.CancelledError):
++            await report
++        await service.report_step(ReportStepRequest(step=1))
++
++    asyncio.run(scenario())
++
++    assert adapter.received == [{"perf/step_time": 1.0}]
++    assert not service.metrics_buffer.has_metrics_for_step(1)
+-- 
+2.43.0
+

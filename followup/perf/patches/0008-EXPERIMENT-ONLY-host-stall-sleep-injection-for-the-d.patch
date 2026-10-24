@@ -1,0 +1,88 @@
+From 41089c5852c63c52e2270d6075bd452fe7015370 Mon Sep 17 00:00:00 2001
+From: Mukayi <1515982581@qq.com>
+Date: Thu, 22 Oct 2026 15:36:46 +0800
+Subject: [PATCH 08/11] EXPERIMENT ONLY: host-stall sleep injection for the
+ detection regression (do not merge)
+
+(cherry picked from commit b822dfc9821e8aa88163c8d997cdb09a28c2c976)
+(cherry picked from commit 3aa503b50e1aae32f1abfc956cbe6d4c42aef7a6)
+---
+ relax/backends/megatron/actor.py |  5 +++++
+ relax/backends/megatron/model.py |  3 +++
+ relax/utils/straggler/runtime.py | 30 ++++++++++++++++++++++++++++++
+ 3 files changed, 38 insertions(+)
+
+diff --git a/relax/backends/megatron/actor.py b/relax/backends/megatron/actor.py
+index 0bead71..f41b98a 100644
+--- a/relax/backends/megatron/actor.py
++++ b/relax/backends/megatron/actor.py
+@@ -2800,6 +2800,11 @@ class MegatronTrainRayActor(TrainRayActor):
+         if self.straggler is not None:
+             extra = self.straggler.step_metrics(rollout_id, int(sum(total_lengths)))
+         log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter, extra_metrics=extra)
++        # EXPERIMENT ONLY: injection clock + end-of-rollout sleep
++        from ...utils.straggler.runtime import straggler_inject_set_rollout, straggler_inject_sleep
++
++        straggler_inject_sleep()
++        straggler_inject_set_rollout(rollout_id + 1)
+ 
+     @timer
+     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
+diff --git a/relax/backends/megatron/model.py b/relax/backends/megatron/model.py
+index 637d85f..fb20e70 100644
+--- a/relax/backends/megatron/model.py
++++ b/relax/backends/megatron/model.py
+@@ -1327,6 +1327,9 @@ def train_one_step(
+     else:
+         forward_backward_func = get_forward_backward_func()
+     note_schedule(model, num_microbatches, forward_only=False)
++    from relax.utils.straggler.runtime import straggler_inject_sleep  # EXPERIMENT ONLY
++
++    straggler_inject_sleep("step_start")
+     losses_reduced = forward_backward_func(
+         forward_step_func=forward_step,
+         data_iterator=data_iterator,
+diff --git a/relax/utils/straggler/runtime.py b/relax/utils/straggler/runtime.py
+index 4df5aab..cf6ff8c 100644
+--- a/relax/utils/straggler/runtime.py
++++ b/relax/utils/straggler/runtime.py
+@@ -295,6 +295,36 @@ def trace_dir(args: Any) -> str:
+ 
+ _PROFILER: StragglerProfiler | None = None
+ 
++# EXPERIMENT ONLY (do not merge): host-stall injection for the detection regression on the follow-up code.
++# Global rank STRAGGLER_INJECT_SLEEP_RANK sleeps STRAGGLER_INJECT_SLEEP_MS at "rollout_end" or "step_start"
++# for rollouts [STRAGGLER_INJECT_SLEEP_START, STRAGGLER_INJECT_STOP).
++_INJECT_RANK = int(os.environ.get("STRAGGLER_INJECT_SLEEP_RANK", "-1"))
++_INJECT_S = float(os.environ.get("STRAGGLER_INJECT_SLEEP_MS", "0")) / 1000.0
++_INJECT_AT = os.environ.get("STRAGGLER_INJECT_SLEEP_AT", "rollout_end")
++_INJECT_START = int(os.environ.get("STRAGGLER_INJECT_SLEEP_START", "0"))
++_INJECT_STOP = int(os.environ.get("STRAGGLER_INJECT_STOP", str(1 << 30)))
++_CUR_ROLLOUT = 0
++
++
++def straggler_inject_set_rollout(rollout_id: int) -> None:
++    global _CUR_ROLLOUT
++    _CUR_ROLLOUT = rollout_id
++
++
++def straggler_inject_sleep(where: str = "rollout_end") -> None:
++    import time
++
++    import torch.distributed as dist
++
++    if (
++        _INJECT_S > 0
++        and where == _INJECT_AT
++        and _INJECT_START <= _CUR_ROLLOUT < _INJECT_STOP
++        and dist.is_initialized()
++        and dist.get_rank() == _INJECT_RANK
++    ):
++        time.sleep(_INJECT_S)
++
+ 
+ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None:
+     """Create the process-wide profiler if it is enabled and ``role`` runs
+-- 
+2.43.0
+

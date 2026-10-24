@@ -1,0 +1,78 @@
+From fb079972d7ede32013454013943c794d1f1eab88 Mon Sep 17 00:00:00 2001
+From: Mukayi <1515982581@qq.com>
+Date: Sat, 24 Oct 2026 13:05:59 +0800
+Subject: [PATCH 11/11] EXPERIMENT ONLY: full-rollout interval timing
+ (STRAGGLER_INTERVAL=1); switch the A/B toggle after the interval (do not
+ merge)
+
+---
+ relax/backends/megatron/actor.py |  6 ++++--
+ relax/utils/straggler/runtime.py | 21 +++++++++++++++++++++
+ 2 files changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/relax/backends/megatron/actor.py b/relax/backends/megatron/actor.py
+index ac27d38..4cec6cd 100644
+--- a/relax/backends/megatron/actor.py
++++ b/relax/backends/megatron/actor.py
+@@ -2172,6 +2172,9 @@ class MegatronTrainRayActor(TrainRayActor):
+         # RL-only generative eval (uses SGLang via rollout_manager.eval). SFT
+         # uses local eval/predict runner below.
+         dist.barrier(group=get_gloo_group())
++        from ...utils.straggler.runtime import straggler_interval_end  # EXPERIMENT ONLY
++
++        straggler_interval_end(rollout_id)
+         self._run_step_evaluation(evaluation_step_for_rollout(self.args, rollout_id))
+ 
+         # On the final training step the rollout component has already exited
+@@ -2796,7 +2799,7 @@ class MegatronTrainRayActor(TrainRayActor):
+     def _log_perf_data(self, rollout_id: int, total_lengths: Sequence[int]) -> None:
+         """``log_perf_data`` plus the straggler scalars of any analysed window;
+         every rank must call it (the profiler gathers once per window)."""
+-        from ...utils.straggler.runtime import straggler_ab_active, straggler_ab_set_step
++        from ...utils.straggler.runtime import straggler_ab_active
+ 
+         active = self.straggler is not None and straggler_ab_active()
+         extra = None
+@@ -2806,7 +2809,6 @@ class MegatronTrainRayActor(TrainRayActor):
+         from ...utils.straggler.runtime import straggler_gc_log  # EXPERIMENT ONLY
+ 
+         straggler_gc_log(rollout_id)
+-        straggler_ab_set_step(rollout_id + 1)
+         # EXPERIMENT ONLY: injection clock + end-of-rollout sleep
+         from ...utils.straggler.runtime import straggler_inject_set_rollout, straggler_inject_sleep
+ 
+diff --git a/relax/utils/straggler/runtime.py b/relax/utils/straggler/runtime.py
+index 661353e..6d35c27 100644
+--- a/relax/utils/straggler/runtime.py
++++ b/relax/utils/straggler/runtime.py
+@@ -380,6 +380,27 @@ def straggler_gc_log(rollout_id: int) -> None:
+     _GC_STEP[:] = [0, 0, 0, 0.0]
+ 
+ 
++# EXPERIMENT ONLY (not for the PR): STRAGGLER_INTERVAL=1 logs, on every rank, the wall time from the end of the
++# previous rollout to the end of this one (data wait, training, step_metrics, logging, flush and the barrier after
++# it). The A/B toggle switches here, after the interval is closed, so that a rollout's whole cost counts in its own
++# block.
++_INTERVAL = os.environ.get("STRAGGLER_INTERVAL", "0") == "1"
++_INTERVAL_END = [None]
++
++
++def straggler_interval_end(rollout_id: int) -> None:
++    from time import perf_counter
++
++    now = perf_counter()
++    if _INTERVAL and _INTERVAL_END[0] is not None:
++        import torch.distributed as dist
++
++        rank = dist.get_rank() if dist.is_initialized() else -1
++        logger.info("[abstep] rank=%d step=%d interval_s=%.6f", rank, rollout_id, now - _INTERVAL_END[0])
++    _INTERVAL_END[0] = now
++    straggler_ab_set_step(rollout_id + 1)
++
++
+ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None:
+     """Create the process-wide profiler if it is enabled and ``role`` runs
+     training steps; ``None`` otherwise.
+-- 
+2.43.0
+

@@ -1,0 +1,97 @@
+From b8feb1729da64f9999c7ab3f2ba121b716cd554b Mon Sep 17 00:00:00 2001
+From: Tianze Xia <42513613+Mukayi@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 00:23:19 +0800
+Subject: [PATCH 01/11] fix(dist): forward torch>=2.13 single-tensor collective
+ names in ReloadableProcessGroup (#462)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Relates to #363（从该 PR 中拆出）。
+
+## What
+
+torch 2.13 重命名了 ProcessGroup 的五个单 tensor 集合通信方法。本 PR 让
+`ReloadableProcessGroup`
+也转发这五个新名字：`reduce_scatter_single`、`reduce_scatter_single_coalesced`、`all_gather_single`、`all_gather_single_coalesced`、`all_to_all_single`。改动只涉及
+`relax/utils/reloadable_process_group.py`，新增 20 行。
+
+## Why
+
+torch 2.13 给下列 ProcessGroup 方法改了名，`distributed_c10d` 也随之改为调用新名字：
+
+| 旧名 | 新名 |
+| --- | --- |
+| `_reduce_scatter_base` | `reduce_scatter_single` |
+| `reduce_scatter_tensor_coalesced` | `reduce_scatter_single_coalesced`
+|
+| `_allgather_base` | `all_gather_single` |
+| `allgather_into_tensor_coalesced` | `all_gather_single_coalesced` |
+| `alltoall_base` | `all_to_all_single` |
+
+`ReloadableProcessGroup` 只覆盖了旧名字。调用新名字时会落到 C++ trampoline 的默认实现，返回的
+`PyWorkHolder` 一旦调用 `wait()` 就会 segfault。Megatron 的 `ParamAndGradBuffer`
+在 import 时就绑定了 `torch.distributed.reduce_scatter_tensor` 和
+`_coalescing_manager`，Relax 的 monkey patch 无法把这里传入的 group 换成内部的真实
+group，所以训练会在第一次梯度 reduce-scatter 时崩溃。
+
+## How
+
+按旧名字已有的写法，用 `_fwd` 把这五个新名字转发给内部真实的 group。torch 2.13 之前的版本不会调用这些新名字，行为不变。
+
+## Testing
+
+- torch 2.13.0，8×A100，Qwen3-0.6B SFT DP8：不带修复时，8 个 rank 都在第一步的梯度
+reduce-scatter 处 segfault（`PyWorkHolder::wait`）；带上修复后，正常训练了 60 步。
+- 没有在 torch 2.9.0（`docker/Dockerfile` 使用的版本）上实际运行；这个版本不会调用新增的这些方法名。
+- 没有新增单测。
+- `pre-commit run --files relax/utils/reloadable_process_group.py` 通过。
+
+- [ ] `pre-commit run --all-files` passes
+- [ ] Tests pass (`pytest tests/`)
+- [ ] New tests added (if applicable)
+- [ ] Documentation updated (if applicable)
+
+## Type of Change
+
+- [x] Bug fix (non-breaking change that fixes an issue)
+
+(cherry picked from commit b57d72c013d3d723b73515436e30e64d39e5da3a)
+---
+ relax/utils/reloadable_process_group.py | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/relax/utils/reloadable_process_group.py b/relax/utils/reloadable_process_group.py
+index 3dd9ce8..5c7becb 100644
+--- a/relax/utils/reloadable_process_group.py
++++ b/relax/utils/reloadable_process_group.py
+@@ -295,6 +295,26 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
+     def alltoall(self, *a, **kw):
+         return self._fwd("alltoall", *a, **kw)
+ 
++    # torch>=2.13 renamed the single-tensor collectives on ProcessGroup and
++    # ``distributed_c10d`` now calls the new names (``group.reduce_scatter_single(...)``
++    # instead of ``group._reduce_scatter_base(...)`` etc.). Without these overrides
++    # the call falls through to the C++ trampoline default, which returns a
++    # ``PyWorkHolder`` whose ``wait()`` segfaults. Harmless on older torch (never called).
++    def reduce_scatter_single(self, *a, **kw):
++        return self._fwd("reduce_scatter_single", *a, **kw)
++
++    def reduce_scatter_single_coalesced(self, *a, **kw):
++        return self._fwd("reduce_scatter_single_coalesced", *a, **kw)
++
++    def all_gather_single(self, *a, **kw):
++        return self._fwd("all_gather_single", *a, **kw)
++
++    def all_gather_single_coalesced(self, *a, **kw):
++        return self._fwd("all_gather_single_coalesced", *a, **kw)
++
++    def all_to_all_single(self, *a, **kw):
++        return self._fwd("all_to_all_single", *a, **kw)
++
+     def send(self, *a, **kw):
+         return self._fwd("send", *a, **kw)
+ 
+-- 
+2.43.0
+

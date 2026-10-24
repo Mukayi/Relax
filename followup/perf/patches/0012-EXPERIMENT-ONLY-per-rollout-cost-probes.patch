@@ -1,0 +1,121 @@
+From fbeec0a6c5403c9f598edfee9c076a9a1b1f5b02 Mon Sep 17 00:00:00 2001
+From: Mukayi <1515982581@qq.com>
+Date: Sat, 24 Oct 2026 20:15:49 +0800
+Subject: [PATCH] EXPERIMENT ONLY: per-rollout cost probes of the profiler's
+ calls and the step's logging, flush and barrier (COSTPROBE=1, do not merge)
+
+---
+ relax/backends/megatron/actor.py | 14 ++++++++
+ relax/utils/straggler/runtime.py | 55 ++++++++++++++++++++++++++++++++
+ 2 files changed, 69 insertions(+)
+
+diff --git a/relax/backends/megatron/actor.py b/relax/backends/megatron/actor.py
+index 4cec6cd..3a614a6 100644
+--- a/relax/backends/megatron/actor.py
++++ b/relax/backends/megatron/actor.py
+@@ -2168,10 +2168,18 @@ class MegatronTrainRayActor(TrainRayActor):
+                 self.sleep()
+             if has_rollout:
+                 self.update_weights()
++        from time import perf_counter  # EXPERIMENT ONLY
++
++        from ...utils.straggler.runtime import straggler_cost_add  # EXPERIMENT ONLY
++
++        started = perf_counter()
+         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
++        straggler_cost_add("flush", perf_counter() - started)
+         # RL-only generative eval (uses SGLang via rollout_manager.eval). SFT
+         # uses local eval/predict runner below.
++        started = perf_counter()
+         dist.barrier(group=get_gloo_group())
++        straggler_cost_add("barrier", perf_counter() - started)
+         from ...utils.straggler.runtime import straggler_interval_end  # EXPERIMENT ONLY
+ 
+         straggler_interval_end(rollout_id)
+@@ -2805,7 +2813,13 @@ class MegatronTrainRayActor(TrainRayActor):
+         extra = None
+         if active:
+             extra = self.straggler.step_metrics(rollout_id, int(sum(total_lengths)))
++        from time import perf_counter  # EXPERIMENT ONLY
++
++        from ...utils.straggler.runtime import straggler_cost_add  # EXPERIMENT ONLY
++
++        started = perf_counter()
+         log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter, extra_metrics=extra)
++        straggler_cost_add("log_perf_data", perf_counter() - started)
+         from ...utils.straggler.runtime import straggler_gc_log  # EXPERIMENT ONLY
+ 
+         straggler_gc_log(rollout_id)
+diff --git a/relax/utils/straggler/runtime.py b/relax/utils/straggler/runtime.py
+index 6d35c27..230472b 100644
+--- a/relax/utils/straggler/runtime.py
++++ b/relax/utils/straggler/runtime.py
+@@ -398,6 +398,7 @@ def straggler_interval_end(rollout_id: int) -> None:
+         rank = dist.get_rank() if dist.is_initialized() else -1
+         logger.info("[abstep] rank=%d step=%d interval_s=%.6f", rank, rollout_id, now - _INTERVAL_END[0])
+     _INTERVAL_END[0] = now
++    straggler_cost_log(rollout_id)
+     straggler_ab_set_step(rollout_id + 1)
+ 
+ 
+@@ -554,3 +555,57 @@ def note_microbatch_tokens(total_lengths: Any) -> None:
+     """
+     if _PROFILER is not None and _AB_ON and isinstance(total_lengths, (list, tuple)):
+         _PROFILER.collector.note_tokens(int(sum(total_lengths)))
++
++
++# EXPERIMENT ONLY (not for the PR): COSTPROBE=1 times, on every rank and rollout, the profiler's calls (segment
++# timer start / stop, drain, sampled-step anchor, window close, end_step, step_metrics) and the step's logging,
++# flush and barrier, and logs them with the rollout's interval.
++_COSTPROBE = os.environ.get("COSTPROBE", "0") == "1"
++_COST: dict = {}
++_CALLS: dict = {}
++
++
++def straggler_cost_add(key: str, seconds: float) -> None:
++    if _COSTPROBE:
++        _COST[key] = _COST.get(key, 0.0) + seconds
++        _CALLS[key] = _CALLS.get(key, 0) + 1
++
++
++def _cost_wrap(owner: Any, name: str, key: str) -> None:
++    from functools import wraps
++    from time import perf_counter
++
++    original = getattr(owner, name)
++
++    @wraps(original)
++    def timed(*args: Any, **kwargs: Any) -> Any:
++        started = perf_counter()
++        try:
++            return original(*args, **kwargs)
++        finally:
++            straggler_cost_add(key, perf_counter() - started)
++
++    setattr(owner, name, timed)
++
++
++def straggler_cost_log(rollout_id: int) -> None:
++    if not _COSTPROBE:
++        return
++    import torch.distributed as dist
++
++    rank = dist.get_rank() if dist.is_initialized() else -1
++    parts = " ".join(f"{key}={1000 * _COST[key]:.3f}/{_CALLS[key]}" for key in sorted(_COST))
++    logger.info("[cost] rank=%d step=%d %s", rank, rollout_id, parts)
++    _COST.clear()
++    _CALLS.clear()
++
++
++if _COSTPROBE:
++    from relax.utils.straggler import timers as _timers_module
++
++    _cost_wrap(_timers_module._SegmentTimer, "start", "timer")
++    _cost_wrap(_timers_module._SegmentTimer, "stop", "timer")
++    for _name, _key in (("drain", "drain"), ("_begin_trace", "begin_trace"), ("_close_window", "close_window"),
++                        ("end_step", "end_step")):
++        _cost_wrap(StragglerCollector, _name, _key)
++    _cost_wrap(StragglerProfiler, "step_metrics", "step_metrics")
+-- 
+2.43.0
+

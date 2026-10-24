@@ -1,0 +1,39 @@
+From 614ae4f703b01e614d166a600412c05e29216177 Mon Sep 17 00:00:00 2001
+From: Mukayi <1515982581@qq.com>
+Date: Thu, 22 Oct 2026 00:20:31 +0800
+Subject: [PATCH 06/11] test(metrics): make the proxy test independent of the
+ runner's proxy env
+
+The test only set HTTP_PROXY/HTTPS_PROXY. On a runner that already has
+lowercase http_proxy/https_proxy and a no_proxy covering 127.0.0.1,
+urllib uses those instead, the request bypasses the proxy, and the test
+passes against the pre-fix client too. Set both cases and clear
+NO_PROXY/no_proxy so it fails without trust_env = False.
+
+(cherry picked from commit 57b2dfd72ca79a26c8f040c5d26db3c92b095179)
+---
+ tests/utils/test_metrics_client_transport.py | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/tests/utils/test_metrics_client_transport.py b/tests/utils/test_metrics_client_transport.py
+index ae2d9ac..1cfcb09 100644
+--- a/tests/utils/test_metrics_client_transport.py
++++ b/tests/utils/test_metrics_client_transport.py
+@@ -115,8 +115,12 @@ def test_client_reuses_one_connection_across_calls():
+ def test_client_ignores_proxy_environment_for_cluster_local_endpoint(monkeypatch):
+     """A proxy in the environment must not capture the metrics endpoint."""
+     with _CountingServer() as server:
+-        monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:3128")
+-        monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
++        # urllib prefers the lowercase names, and a NO_PROXY that covers
++        # 127.0.0.1 would bypass the proxy anyway, so set and clear both cases.
++        for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
++            monkeypatch.setenv(name, "http://proxy.invalid:3128")
++        for name in ("NO_PROXY", "no_proxy"):
++            monkeypatch.delenv(name, raising=False)
+         client = MetricsClient(server.url)
+         # If trust_env were left True, this request would be sent to the proxy
+         # and fail, because nothing is listening there.
+-- 
+2.43.0
+
