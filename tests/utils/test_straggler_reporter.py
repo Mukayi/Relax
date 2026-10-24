@@ -104,9 +104,11 @@ def test_alert_is_logged_as_warning_with_table_at_the_window_step(captured):
 
 def test_numbers_left_out_of_the_scalars_are_logged_once_per_window(captured):
     _, infos = captured
-    reporter.log_straggler_window(_args(), _report())
+    report = _report()
+    report.metrics["straggler/tokens/median"] = 14802.1
+    reporter.log_straggler_window(_args(), report)
     others = [line for line in infos if "other metrics" in line]
-    assert len(others) == 1 and "fwd/median_ms 100" in others[0]
+    assert len(others) == 1 and "fwd/median_ms 100," in others[0] and "tokens/median 14802.1" in others[0]
     assert "flagged/count" not in others[0], "a reported scalar is not repeated in the log"
 
 

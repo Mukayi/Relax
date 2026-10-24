@@ -178,5 +178,5 @@ def log_straggler_window(args: Any, report: WindowReport) -> None:
         logger.info(
             "[straggler] step=%d other metrics: %s",
             step,
-            ", ".join(f"{key.removeprefix('straggler/')} {metrics[key]:.4g}" for key in others),
+            ", ".join(f"{key.removeprefix('straggler/')} {round(metrics[key], 3):g}" for key in others),
         )
