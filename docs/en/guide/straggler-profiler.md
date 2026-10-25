@@ -187,7 +187,7 @@ With both `--timeline-dump-dir` and `--use-metrics-service` set, every window ap
 ## Overhead
 
 - One pair of non-blocking CUDA events per timer call site; at the end of each step only completed events are read. One Gloo all-gather per window, 272 B per rank.
-- On 8×A100 with Qwen3-0.6B DP8 (step ≈ 1 s) and full functionality (level 2, a trace directory, the metrics service, overlap), the profiler's direct cost on rank 0 is about 1.5 ms per step (≈ 0.15 %), about 60 % of it in the timers; the other ranks wait for rank 0 at the next collective. End-to-end on/off comparisons on a shared host cannot resolve 0.5 %.
+- On 8×A100 with Qwen3-0.6B DP8 (step ≈ 1 s) and full functionality (level 2, a trace directory, the metrics service, overlap), the profiler's direct cost on rank 0 is about 1.5 ms per step (≈ 0.15 %), about 60 % of it in the timers; the other ranks wait for rank 0 at the next collective. An end-to-end in-run crossover gives +0.13 % (95 % CI −0.05 % to +0.30 %, four pairs), with the upper bound below 0.5 %.
 - Sampled-step trace: one extra device synchronize and anchor per window (about 1.1 ms), and the sampled step is gathered to the primary rank when the window closes (about 2 ms for the two window-close gathers); at most about 0.03 % per step with the default window.
 - `modules` level: the sampled step's forwards are 3–10 % longer (on a small, launch-bound model the hooks' CPU time shows), backwards are unchanged; reading the module spans adds about 3.5 ms per window.
 - The method and all measurements are in [RFC #362](https://github.com/redai-studio/Relax/issues/362).

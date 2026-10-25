@@ -187,7 +187,7 @@ primary 自己的 CPU 侧计时（例如 `actor_train`、每个 micro-batch 的 
 ## 开销
 
 - 每个计时点一对非阻塞的 CUDA event，每步结束时只读取已完成的事件；每个窗口一次 Gloo all-gather，每个 rank 发送 272 B。
-- 8×A100、Qwen3-0.6B DP8（每步约 1 s）、完整功能（级别 2、trace 目录、metrics service、overlap）下，分析器在 rank 0 上的直接开销约每步 1.5 ms（约 0.15%），其中计时点约占六成；其他 rank 在下一个集合通信上等 rank 0。端到端开 / 关对比在共享机器上分辨不了 0.5%。
+- 8×A100、Qwen3-0.6B DP8（每步约 1 s）、完整功能（级别 2、trace 目录、metrics service、overlap）下，分析器在 rank 0 上的直接开销约每步 1.5 ms（约 0.15%），其中计时点约占六成；其他 rank 在下一个集合通信上等 rank 0。端到端运行内交叉对照为 +0.13%（95% CI −0.05%～+0.30%，4 组），区间上界低于 0.5%。
 - 采样步 trace：每个窗口多一次设备同步和锚点（约 1.1 ms），并在窗口结束时把采样步 gather 到 primary（窗口结束的两次 gather 共约 2 ms）；默认窗口下每步最多约 0.03%。
 - `modules` 级别：采样步的前向长 3–10%（小模型受 kernel 发射限制，hook 的 CPU 开销会显现），反向不变；每个窗口读取模块计时多约 3.5 ms。
 - 测量方法和数据见 [RFC #362](https://github.com/redai-studio/Relax/issues/362)。
