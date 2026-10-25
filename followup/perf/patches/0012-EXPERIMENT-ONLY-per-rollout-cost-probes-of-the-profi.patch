@@ -1,8 +1,9 @@
-From 0ff134702aa184bd3dd631a72e4e021351e042a2 Mon Sep 17 00:00:00 2001
+From 7fb8a29365ca144248d92797bdb68e5e0c567d97 Mon Sep 17 00:00:00 2001
 From: Mukayi <1515982581@qq.com>
 Date: Sat, 24 Oct 2026 20:15:49 +0800
-Subject: [PATCH] EXPERIMENT ONLY: per-rollout cost probes of the profiler's
- calls and the step's logging, flush and barrier (COSTPROBE=1, do not merge)
+Subject: [PATCH 12/12] EXPERIMENT ONLY: per-rollout cost probes of the
+ profiler's calls and the step's logging, flush and barrier (COSTPROBE=1, do
+ not merge)
 
 ---
  relax/backends/megatron/actor.py | 14 ++++++++

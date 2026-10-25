@@ -1,7 +1,7 @@
-From fb079972d7ede32013454013943c794d1f1eab88 Mon Sep 17 00:00:00 2001
+From 448d11968183804745dfe28b7a70c0765a7f595a Mon Sep 17 00:00:00 2001
 From: Mukayi <1515982581@qq.com>
 Date: Sat, 24 Oct 2026 13:05:59 +0800
-Subject: [PATCH 11/11] EXPERIMENT ONLY: full-rollout interval timing
+Subject: [PATCH 11/12] EXPERIMENT ONLY: full-rollout interval timing
  (STRAGGLER_INTERVAL=1); switch the A/B toggle after the interval (do not
  merge)
 

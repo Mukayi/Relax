@@ -1,7 +1,7 @@
-From eba0fc83ddd4cd642226fdd38844bb01f1324a71 Mon Sep 17 00:00:00 2001
+From 3b395507c60408b84b71f4badd66b4b89e0ab0b2 Mon Sep 17 00:00:00 2001
 From: Mukayi <1515982581@qq.com>
 Date: Thu, 22 Oct 2026 00:57:47 +0800
-Subject: [PATCH 07/11] fix(metrics): take the step's batch on the worker
+Subject: [PATCH 07/12] fix(metrics): take the step's batch on the worker
  thread
 
 report_step took the batch before awaiting asyncio.to_thread. If Serve

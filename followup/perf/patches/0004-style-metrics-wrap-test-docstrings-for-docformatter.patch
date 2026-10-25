@@ -1,7 +1,7 @@
-From d6fd7c416ca72c81fca2c1fb57d53ad5dbf7d2f3 Mon Sep 17 00:00:00 2001
+From 3a98d50caa2d21d2c6e7ee3fd2a5eabbb5d1201e Mon Sep 17 00:00:00 2001
 From: Mukayi <1515982581@qq.com>
 Date: Wed, 21 Oct 2026 20:19:19 +0800
-Subject: [PATCH 04/11] style(metrics): wrap test docstrings for docformatter
+Subject: [PATCH 04/12] style(metrics): wrap test docstrings for docformatter
 
 (cherry picked from commit 75ea68431766fbd1583174dd0091dcb413e08caa)
 ---

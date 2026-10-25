@@ -1,7 +1,7 @@
-From 93d9fb228324dc36f7e2a0683acdd231ec01221e Mon Sep 17 00:00:00 2001
+From b354e195b9675a07bce2f8a6848a1d0ea769a8d0 Mon Sep 17 00:00:00 2001
 From: Mukayi <1515982581@qq.com>
 Date: Thu, 15 Oct 2026 19:34:24 +0800
-Subject: [PATCH 02/11] fix(metrics): reuse one HTTP connection and keep
+Subject: [PATCH 02/12] fix(metrics): reuse one HTTP connection and keep
  /report_step off the event loop
 
 The metrics service is enabled by default (`--use-metrics-service` defaults to

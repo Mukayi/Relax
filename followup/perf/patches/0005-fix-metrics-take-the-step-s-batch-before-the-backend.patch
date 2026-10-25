@@ -1,7 +1,7 @@
-From deedfab0476342af61a44ff7980203c9f0c5c84e Mon Sep 17 00:00:00 2001
+From 302837bef3642be9d6bbd7d0697f4672948c316a Mon Sep 17 00:00:00 2001
 From: Mukayi <1515982581@qq.com>
 Date: Thu, 22 Oct 2026 00:15:00 +0800
-Subject: [PATCH 05/11] fix(metrics): take the step's batch before the backend
+Subject: [PATCH 05/12] fix(metrics): take the step's batch before the backend
  fan-out
 
 report_step read the step's buffered metrics, awaited the backend

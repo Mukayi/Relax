@@ -1,7 +1,7 @@
-From 787765dfc85133561a9bb1b77c4a121153d1ade7 Mon Sep 17 00:00:00 2001
+From 85f6386eb63dedd567fffc76bfca79790b3862fe Mon Sep 17 00:00:00 2001
 From: Mukayi <1515982581@qq.com>
 Date: Fri, 16 Oct 2026 12:36:47 +0800
-Subject: [PATCH 03/11] test(metrics): drive the real report_step, not the
+Subject: [PATCH 03/12] test(metrics): drive the real report_step, not the
  test's own to_thread
 
 `test_slow_backend_does_not_block_concurrent_ingestion` called

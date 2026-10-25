@@ -1,7 +1,7 @@
-From 41089c5852c63c52e2270d6075bd452fe7015370 Mon Sep 17 00:00:00 2001
+From f70d45d61d78c50bc476a22d93e4b047ca9e651f Mon Sep 17 00:00:00 2001
 From: Mukayi <1515982581@qq.com>
 Date: Thu, 22 Oct 2026 15:36:46 +0800
-Subject: [PATCH 08/11] EXPERIMENT ONLY: host-stall sleep injection for the
+Subject: [PATCH 08/12] EXPERIMENT ONLY: host-stall sleep injection for the
  detection regression (do not merge)
 
 (cherry picked from commit b822dfc9821e8aa88163c8d997cdb09a28c2c976)

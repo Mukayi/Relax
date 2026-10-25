@@ -1,7 +1,7 @@
-From 614ae4f703b01e614d166a600412c05e29216177 Mon Sep 17 00:00:00 2001
+From bc5b8177081f94296f6a8aa05368abba92686447 Mon Sep 17 00:00:00 2001
 From: Mukayi <1515982581@qq.com>
 Date: Thu, 22 Oct 2026 00:20:31 +0800
-Subject: [PATCH 06/11] test(metrics): make the proxy test independent of the
+Subject: [PATCH 06/12] test(metrics): make the proxy test independent of the
  runner's proxy env
 
 The test only set HTTP_PROXY/HTTPS_PROXY. On a runner that already has

@@ -1,11 +1,11 @@
-From c5e84daa1b52eb926ad8d1c3f5fb5dbbba1b878f Mon Sep 17 00:00:00 2001
+From 6450322e4bb2ed0cfad20746c3cf8aa45135121c Mon Sep 17 00:00:00 2001
 From: Mukayi <1515982581@qq.com>
 Date: Wed, 7 Oct 2026 13:25:43 +0800
-Subject: [PATCH 09/11] EXPERIMENT ONLY: in-run on/off A/B toggle for straggler
- overhead, ported to a829f13 (do not merge)
+Subject: [PATCH 09/12] EXPERIMENT ONLY: in-run on/off A/B toggle for straggler
+ overhead (do not merge)
 
-d8d8c39 on the final code: off rollouts also skip note_schedule and note_microbatch_tokens; the
-final code has no delivered().
+Off rollouts also skip note_schedule and note_microbatch_tokens; the final code has no
+delivered().
 ---
  relax/backends/megatron/actor.py |  6 +++++-
  relax/backends/megatron/model.py |  3 +++
@@ -54,7 +54,7 @@ index cf6ff8c..10ae384 100644
          time.sleep(_INJECT_S)
  
  
-+# EXPERIMENT ONLY (not for the PR): in-run on/off A/B, ported to a829f13.
++# EXPERIMENT ONLY (not for the PR): in-run on/off A/B for the overhead experiment.
 +# STRAGGLER_AB_PERIOD=N toggles the profiler every N rollouts; STRAGGLER_AB_PHASE=0|1 picks
 +# whether block 0 is on. Off rollouts get config.timers=None and skip step_metrics, note_schedule
 +# and note_microbatch_tokens, i.e. the code path of a run without the profiler.

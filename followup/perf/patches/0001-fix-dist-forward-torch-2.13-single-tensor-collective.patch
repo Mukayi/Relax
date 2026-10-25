@@ -1,7 +1,7 @@
-From b8feb1729da64f9999c7ab3f2ba121b716cd554b Mon Sep 17 00:00:00 2001
+From c5a3a5a6a26d86636b2beba327a50ba3a398c099 Mon Sep 17 00:00:00 2001
 From: Tianze Xia <42513613+Mukayi@users.noreply.github.com>
 Date: Thu, 22 Oct 2026 00:23:19 +0800
-Subject: [PATCH 01/11] fix(dist): forward torch>=2.13 single-tensor collective
+Subject: [PATCH 01/12] fix(dist): forward torch>=2.13 single-tensor collective
  names in ReloadableProcessGroup (#462)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
