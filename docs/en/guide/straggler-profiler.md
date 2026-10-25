@@ -1,6 +1,6 @@
 # Straggler Analysis
 
-The Megatron backend ships a low-overhead straggler profiler that can stay enabled in production runs. It times every training rank's forward, backward, optimizer, gradient-sync and similar segments with CUDA events, compares the ranks every K rollouts, and reports the rank holding the group back and why. This is not `torch.profiler`: it traces no kernels, never calls `cuda.synchronize()`, and does not change compute/communication overlap; errors inside the profiler never affect training.
+The Megatron backend ships a low-overhead straggler profiler that can stay enabled in production runs. It times every training rank's forward, backward, optimizer, gradient-sync and similar segments with CUDA events, compares the ranks every K rollouts, and reports the rank holding the group back and why. This is not `torch.profiler`: it traces no kernels; ordinary training steps never call `cuda.synchronize()`, and their measured compute/communication overlap stays within the A/A run-to-run spread; with tracing enabled, the sampled step synchronizes once per window from the second window onward to align ranks in time. Errors inside the profiler never affect training.
 
 ## Features
 
@@ -47,10 +47,10 @@ Each actor process logs `Straggler profiler enabled: report_interval=… primary
 | 2 `detail` | Plus the sampled-step trace; needs a trace directory and runs as `coarse` without one |
 | 3 `modules` | Plus module timing: hooks only during the sampled step, trace only, never in the window statistics or the verdicts; needs a trace directory and must be set explicitly |
 
-`RELAX_STRAGGLER_LEVEL` sets the start level. With `--use-metrics-service`, open `http://<head node>:8000/metrics/straggler` in a browser while training runs and press a button, or send the request directly:
+`RELAX_STRAGGLER_LEVEL` sets the start level. With `--use-metrics-service`, set `HEAD_NODE` to the reachable address of the head node. While training runs, open `http://${HEAD_NODE}:8000/metrics/straggler` in a browser and press a button, or send the request directly:
 
 ```bash
-curl -X POST http://<head>:8000/metrics/straggler/control -H 'Content-Type: application/json' -d '{"level": 0}'
+curl -X POST "http://${HEAD_NODE}:8000/metrics/straggler/control" -H 'Content-Type: application/json' -d '{"level": 0}'
 ```
 
 Every rank switches from the next window on, at most one window plus one poll interval later; the page shows the level in effect. Without the metrics service the level stays at its start value, and a profiler that has switched itself off after errors ignores level requests. The page and the endpoints are served by the Ray Serve server on port 8000 of the head node and have no authentication, so do not expose them outside the cluster.

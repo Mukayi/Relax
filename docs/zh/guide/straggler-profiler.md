@@ -1,6 +1,6 @@
 # Straggler（慢 rank）分析
 
-Relax 的 Megatron 后端内置一个低开销的慢 rank 分析器，可以在生产训练中一直开着。它用 CUDA event 给每个训练 rank 的前向、反向、optimizer、梯度同步等阶段计时，每隔 K 个 rollout 在所有 rank 之间比较一次，报告拖慢整组的 rank 及原因。它不是 `torch.profiler`：不采集 kernel，不调用 `cuda.synchronize()`，不影响通信与计算的重叠；分析器自身出错不会影响训练。
+Relax 的 Megatron 后端内置一个低开销的慢 rank 分析器，可以在生产训练中一直开着。它用 CUDA event 给每个训练 rank 的前向、反向、optimizer、梯度同步等阶段计时，每隔 K 个 rollout 在所有 rank 之间比较一次，报告拖慢整组的 rank 及原因。它不是 `torch.profiler`：不采集 kernel；普通训练步不调用 `cuda.synchronize()`，实测通信与计算的重叠在 A/A 运行间波动内；启用 trace 时，从第二个窗口起每个采样步开头同步一次，用于跨 rank 时间对齐。分析器自身出错不会影响训练。
 
 ## 功能
 
@@ -47,10 +47,10 @@ env_vars:
 | 2 `detail` | 再加采样步 trace；需要 trace 目录，没有时按 `coarse` 运行 |
 | 3 `modules` | 再加模块计时：只在采样步挂 hook，只写进 trace，不进窗口统计和判定；需要 trace 目录，只能显式设置 |
 
-启动级别由 `RELAX_STRAGGLER_LEVEL` 决定。开启 `--use-metrics-service` 时，训练中可以在浏览器打开 `http://<head 节点>:8000/metrics/straggler` 点按钮切换，也可以直接发请求：
+启动级别由 `RELAX_STRAGGLER_LEVEL` 决定。开启 `--use-metrics-service` 时，把 `HEAD_NODE` 设为 head 节点的可访问地址；训练中可以在浏览器打开 `http://${HEAD_NODE}:8000/metrics/straggler` 点按钮切换，也可以直接发请求：
 
 ```bash
-curl -X POST http://<head>:8000/metrics/straggler/control -H 'Content-Type: application/json' -d '{"level": 0}'
+curl -X POST "http://${HEAD_NODE}:8000/metrics/straggler/control" -H 'Content-Type: application/json' -d '{"level": 0}'
 ```
 
 所有 rank 从下一个窗口起一起切换，最多晚一个窗口加一次轮询间隔生效；页面上显示当前生效的级别。没开 metrics service 时级别固定为启动值，分析器因异常关闭后也不再响应切换。页面和接口由 head 节点 8000 端口的 Ray Serve 服务提供，没有鉴权，不要暴露到集群外。
