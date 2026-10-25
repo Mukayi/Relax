@@ -1,6 +1,6 @@
 # A/A control for the two-rollout estimator
 
-The profiler is not installed in any run. After the first 20 warm-up rollouts, the final estimator relabels the full-rollout intervals in two-rollout blocks. The true effect is therefore zero.
+The profiler is not installed in any run; the code is PR commit `a829f13`, which outside docs and tests differs from `891d0cf` only in the profiler's `reporter.py`. After the first 20 warm-up rollouts, the final estimator relabels the full-rollout intervals in two-rollout blocks. The true effect is therefore zero.
 
 - natural pair 1: −0.008%
 - natural pair 2: −0.064%
