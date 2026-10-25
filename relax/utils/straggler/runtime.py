@@ -13,9 +13,15 @@ import os
 import pickle
 import socket
 from dataclasses import replace
+from datetime import timedelta
 from functools import partial
 from typing import Any, Callable, Sequence
 
+import torch
+import torch.distributed as dist
+
+from relax.utils import device
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.straggler.collector import StragglerCollector
 from relax.utils.straggler.control import LEVELS, LevelPoller
@@ -36,9 +42,7 @@ PROFILED_ROLES: frozenset[str] = frozenset({"actor"})
 
 def timing_event_factory() -> Callable[[], Any]:
     """Build timing events of the active accelerator."""
-    from relax.utils.device import device_module
-
-    return partial(device_module.Event, enable_timing=True)
+    return partial(device.device_module.Event, enable_timing=True)
 
 
 def stream_capture_check() -> Callable[[], bool]:
@@ -47,8 +51,6 @@ def stream_capture_check() -> Callable[[], bool]:
 
     A backend without one cannot be capturing through this API.
     """
-    from relax.utils import device
-
     if not device.is_available():
         return _never
     return getattr(device.device_module, "is_current_stream_capturing", None) or _never
@@ -60,8 +62,6 @@ def _never() -> bool:
 
 def device_synchronize() -> Callable[[], None]:
     """The active accelerator's synchronize, which anchors a sampled step."""
-    from relax.utils import device
-
     return device.device_module.synchronize if device.is_available() else (lambda: None)
 
 
@@ -80,10 +80,6 @@ def init_straggler_gather_group(timeout_s: float) -> None:
     the actor group before any gather.
     """
     global _STALL_GATHER_GROUP
-    from datetime import timedelta
-
-    import torch.distributed as dist
-
     if _STALL_GATHER_GROUP is None:
         _STALL_GATHER_GROUP = dist.new_group(backend="gloo", timeout=timedelta(seconds=timeout_s))
 
@@ -102,9 +98,6 @@ def gloo_all_gather(values: list[float]) -> list[list[float]]:
     build its tensor sends NaN in every slot and raises after the gather, and
     the collector skips a window with such a row on every rank.
     """
-    import torch
-    import torch.distributed as dist
-
     group = get_straggler_gather_group()
     error = None
     try:
@@ -122,9 +115,6 @@ def gloo_primary_rank(is_primary: bool) -> int | None:
     """The primary rank's global rank, the same on every rank: one
     ``all_reduce`` over the straggler Gloo group; ``None`` without a
     primary."""
-    import torch
-    import torch.distributed as dist
-
     value = torch.tensor([dist.get_rank() if is_primary else -1], dtype=torch.int64)
     dist.all_reduce(value, op=dist.ReduceOp.MAX, group=get_straggler_gather_group())
     rank = int(value.item())
@@ -144,9 +134,6 @@ def gloo_all_gather_objects(obj: Any) -> list[Any]:
     cannot encode its object sends an all-zero row, and every rank raises after
     the gather.
     """
-    import torch
-    import torch.distributed as dist
-
     group = get_straggler_gather_group()
     local = torch.zeros(_META_ROW_BYTES, dtype=torch.uint8)
     gathered = [torch.empty_like(local) for _ in range(dist.get_world_size(group))]
@@ -175,8 +162,6 @@ def gloo_gather_objects_to(obj: Any, dst: int) -> list[Any] | None:
     The object is pickled before the collective so that a rank whose pickling
     fails still joins it, with ``None``; it raises after the gather.
     """
-    import torch.distributed as dist
-
     group = get_straggler_gather_group()
     error = None
     try:
@@ -191,10 +176,8 @@ def gloo_gather_objects_to(obj: Any, dst: int) -> list[Any] | None:
 
 
 def local_rank_meta() -> RankMeta:
-    import torch.distributed as dist
     from megatron.core import mpu
 
-    from relax.utils import device
     from relax.utils.distributed_utils import get_gloo_group
 
     return RankMeta(
@@ -287,8 +270,6 @@ def trace_dir(args: Any) -> str:
     ``RELAX_STRAGGLER_TRACE_DIR``, else ``straggler/`` under the timeline dump
     directory.
     """
-    from relax.utils.env import Envs
-
     timeline_dir = getattr(args, "timeline_dump_dir", None)
     return Envs.RELAX_STRAGGLER_TRACE_DIR or (os.path.join(timeline_dir, "straggler") if timeline_dir else "")
 
@@ -304,8 +285,6 @@ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None
     before the optimizer is built (its config takes ``straggler_timers``).
     """
     global _PROFILER
-    from relax.utils.env import Envs
-
     if not Envs.RELAX_STRAGGLER_PROFILER or role not in PROFILED_ROLES:
         return None
     if _PROFILER is not None:
@@ -391,8 +370,6 @@ def initial_level(trace_on: bool) -> int:
     """The level a run starts at: ``RELAX_STRAGGLER_LEVEL``, else detail when
     traces have somewhere to go and coarse otherwise; never ``modules`` unless
     asked for."""
-    from relax.utils.env import Envs
-
     level = Envs.RELAX_STRAGGLER_LEVEL
     return level if level >= 0 else (2 if trace_on else 1)
 

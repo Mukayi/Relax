@@ -25,7 +25,6 @@ logger = get_logger(__name__)
 
 # Order is part of the metric contract (``straggler/health/state``).
 HEALTH_ACTIVE, HEALTH_DEGRADED, HEALTH_DISABLE = 0, 1, 2
-HEALTH_STATES: tuple[str, ...] = ("active", "degraded", "disabled")
 
 
 @dataclass(frozen=True)
