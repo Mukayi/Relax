@@ -127,7 +127,7 @@ button.current { font-weight: bold; }
 <table>
 <tr><td>Requested level</td><td id="requested">-</td></tr>
 <tr><td>Level in effect</td><td id="level">-</td></tr>
-<tr><td>Last window ended at rollout</td><td id="rollout">-</td></tr>
+<tr><td>Latest finished rollout</td><td id="rollout">-</td></tr>
 <tr><td>Profiler health</td><td id="health">-</td></tr>
 <tr><td>Last report from the primary rank</td><td id="age">-</td></tr>
 </table>
