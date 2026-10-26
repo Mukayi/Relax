@@ -47,6 +47,8 @@ Each actor process logs `Straggler profiler enabled: report_interval=… primary
 | 2 `detail` | Plus the sampled-step trace; needs a trace directory and runs as `coarse` without one |
 | 3 `modules` | Plus module timing: hooks only during the sampled step, trace only, never in the window statistics or the verdicts; needs a trace directory and must be set explicitly |
 
+With a trace directory the start level is `detail`, which can stay on (see Overhead); `modules` makes the sampled step slower, so turn it on only while investigating.
+
 `RELAX_STRAGGLER_LEVEL` sets the start level. With `--use-metrics-service`, set `HEAD_NODE` to the reachable address of the head node. While training runs, open `http://${HEAD_NODE}:8000/metrics/straggler` in a browser and press a button, or send the request directly:
 
 ```bash
@@ -54,6 +56,8 @@ curl -X POST "http://${HEAD_NODE}:8000/metrics/straggler/control" -H 'Content-Ty
 ```
 
 Every rank switches from the next window on, at most one window plus one poll interval later; the page shows the level in effect. Without the metrics service the level stays at its start value, and a profiler that has switched itself off after errors ignores level requests. The page and the endpoints are served by the Ray Serve server on port 8000 of the head node and have no authentication, so do not expose them outside the cluster.
+
+On the page, "Requested level" is the last level asked for and "Level in effect" the level the primary rank reports; they can differ until the next window boundary. The primary rank reports every `RELAX_STRAGGLER_CONTROL_POLL_S` seconds from a background thread: if reports keep arriving but "Latest finished rollout" stops advancing, training is stuck; if "Last report from the primary rank" keeps growing, the primary rank has exited or cannot reach the metrics service.
 
 ## What you get
 

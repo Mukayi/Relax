@@ -47,6 +47,8 @@ env_vars:
 | 2 `detail` | 再加采样步 trace；需要 trace 目录，没有时按 `coarse` 运行 |
 | 3 `modules` | 再加模块计时：只在采样步挂 hook，只写进 trace，不进窗口统计和判定；需要 trace 目录，只能显式设置 |
 
+有 trace 目录时启动级别就是 `detail`，可以一直开着（开销见「开销」）；`modules` 会让采样步变慢，只在排查问题时临时打开。
+
 启动级别由 `RELAX_STRAGGLER_LEVEL` 决定。开启 `--use-metrics-service` 时，把 `HEAD_NODE` 设为 head 节点的可访问地址；训练中可以在浏览器打开 `http://${HEAD_NODE}:8000/metrics/straggler` 点按钮切换，也可以直接发请求：
 
 ```bash
@@ -54,6 +56,8 @@ curl -X POST "http://${HEAD_NODE}:8000/metrics/straggler/control" -H 'Content-Ty
 ```
 
 所有 rank 从下一个窗口起一起切换，最多晚一个窗口加一次轮询间隔生效；页面上显示当前生效的级别。没开 metrics service 时级别固定为启动值，分析器因异常关闭后也不再响应切换。页面和接口由 head 节点 8000 端口的 Ray Serve 服务提供，没有鉴权，不要暴露到集群外。
+
+页面上「Requested level」是最近一次请求的级别，「Level in effect」是 primary 上报的生效级别，在下一个窗口边界之前两者可能不同。primary 在后台线程每 `RELAX_STRAGGLER_CONTROL_POLL_S` 秒上报一次：上报照常而「Latest finished rollout」不再增长，说明训练卡住了；「Last report from the primary rank」一直变大，说明 primary 进程已经退出或连不上 metrics service。
 
 ## 看输出
 
