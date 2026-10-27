@@ -1,0 +1,122 @@
+[
+ {
+  "cond": "proxy",
+  "rep": 0,
+  "arm": "before",
+  "start": 1793092307.8,
+  "requests": 200,
+  "errors": {},
+  "conn_service": 0,
+  "conn_other": 200
+ },
+ {
+  "cond": "proxy",
+  "rep": 0,
+  "arm": "after",
+  "start": 1793092372.6,
+  "requests": 200,
+  "errors": {},
+  "conn_service": 1,
+  "conn_other": 0
+ },
+ {
+  "cond": "proxy",
+  "rep": 1,
+  "arm": "after",
+  "start": 1793092383.8,
+  "requests": 200,
+  "errors": {},
+  "conn_service": 1,
+  "conn_other": 0
+ },
+ {
+  "cond": "proxy",
+  "rep": 1,
+  "arm": "before",
+  "start": 1793092395.3,
+  "requests": 200,
+  "errors": {},
+  "conn_service": 0,
+  "conn_other": 200
+ },
+ {
+  "cond": "proxy",
+  "rep": 2,
+  "arm": "before",
+  "start": 1793092457.0,
+  "requests": 200,
+  "errors": {},
+  "conn_service": 0,
+  "conn_other": 200
+ },
+ {
+  "cond": "proxy",
+  "rep": 2,
+  "arm": "after",
+  "start": 1793092524.6,
+  "requests": 200,
+  "errors": {},
+  "conn_service": 1,
+  "conn_other": 0
+ },
+ {
+  "cond": "no proxy",
+  "rep": 0,
+  "arm": "before",
+  "start": 1793092535.8,
+  "requests": 200,
+  "errors": {},
+  "conn_service": 200,
+  "conn_other": 0
+ },
+ {
+  "cond": "no proxy",
+  "rep": 0,
+  "arm": "after",
+  "start": 1793092547.2,
+  "requests": 200,
+  "errors": {},
+  "conn_service": 1,
+  "conn_other": 0
+ },
+ {
+  "cond": "no proxy",
+  "rep": 1,
+  "arm": "after",
+  "start": 1793092558.4,
+  "requests": 200,
+  "errors": {},
+  "conn_service": 1,
+  "conn_other": 0
+ },
+ {
+  "cond": "no proxy",
+  "rep": 1,
+  "arm": "before",
+  "start": 1793092569.8,
+  "requests": 200,
+  "errors": {},
+  "conn_service": 200,
+  "conn_other": 0
+ },
+ {
+  "cond": "no proxy",
+  "rep": 2,
+  "arm": "before",
+  "start": 1793092581.2,
+  "requests": 200,
+  "errors": {},
+  "conn_service": 200,
+  "conn_other": 0
+ },
+ {
+  "cond": "no proxy",
+  "rep": 2,
+  "arm": "after",
+  "start": 1793092592.7,
+  "requests": 200,
+  "errors": {},
+  "conn_service": 1,
+  "conn_other": 0
+ }
+]
