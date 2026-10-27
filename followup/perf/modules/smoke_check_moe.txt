@@ -1,0 +1,27 @@
+straggler_trace_rollout000005.json
+  pp0 dp0 tp0: attn 48, moe 48, router 48, dispatch 48, experts 48, combine 48; outside F/B 0; MoE parts outside moe 0
+  pp0 dp1 tp0: attn 48, moe 48, router 48, dispatch 48, experts 48, combine 48; outside F/B 0; MoE parts outside moe 0
+  pp0 dp2 tp0: attn 48, moe 48, router 48, dispatch 48, experts 48, combine 48; outside F/B 0; MoE parts outside moe 0
+  pp0 dp3 tp0: attn 48, moe 48, router 48, dispatch 48, experts 48, combine 48; outside F/B 0; MoE parts outside moe 0
+  pp0 dp4 tp0: attn 48, moe 48, router 48, dispatch 48, experts 48, combine 48; outside F/B 0; MoE parts outside moe 0
+  pp0 dp5 tp0: attn 48, moe 48, router 48, dispatch 48, experts 48, combine 48; outside F/B 0; MoE parts outside moe 0
+  pp0 dp6 tp0: attn 48, moe 48, router 48, dispatch 48, experts 48, combine 48; outside F/B 0; MoE parts outside moe 0
+  pp0 dp7 tp0: attn 48, moe 48, router 48, dispatch 48, experts 48, combine 48; outside F/B 0; MoE parts outside moe 0
+straggler_trace_rollout000010.json
+  pp0 dp0 tp0: attn 48, moe 48, router 48, dispatch 48, experts 48, combine 48; outside F/B 0; MoE parts outside moe 0
+  pp0 dp1 tp0: attn 48, moe 48, router 48, dispatch 48, experts 48, combine 48; outside F/B 0; MoE parts outside moe 0
+  pp0 dp2 tp0: attn 48, moe 48, router 48, dispatch 48, experts 48, combine 48; outside F/B 0; MoE parts outside moe 0
+  pp0 dp3 tp0: attn 48, moe 48, router 48, dispatch 48, experts 48, combine 48; outside F/B 0; MoE parts outside moe 0
+  pp0 dp4 tp0: attn 48, moe 48, router 48, dispatch 48, experts 48, combine 48; outside F/B 0; MoE parts outside moe 0
+  pp0 dp5 tp0: attn 48, moe 48, router 48, dispatch 48, experts 48, combine 48; outside F/B 0; MoE parts outside moe 0
+  pp0 dp6 tp0: attn 48, moe 48, router 48, dispatch 48, experts 48, combine 48; outside F/B 0; MoE parts outside moe 0
+  pp0 dp7 tp0: attn 48, moe 48, router 48, dispatch 48, experts 48, combine 48; outside F/B 0; MoE parts outside moe 0
+straggler_trace_rollout000015.json
+  pp0 dp0 tp0: attn 32, moe 32, router 32, dispatch 32, experts 32, combine 32; outside F/B 0; MoE parts outside moe 0
+  pp0 dp1 tp0: attn 32, moe 32, router 32, dispatch 32, experts 32, combine 32; outside F/B 0; MoE parts outside moe 0
+  pp0 dp2 tp0: attn 32, moe 32, router 32, dispatch 32, experts 32, combine 32; outside F/B 0; MoE parts outside moe 0
+  pp0 dp3 tp0: attn 32, moe 32, router 32, dispatch 32, experts 32, combine 32; outside F/B 0; MoE parts outside moe 0
+  pp0 dp4 tp0: attn 32, moe 32, router 32, dispatch 32, experts 32, combine 32; outside F/B 0; MoE parts outside moe 0
+  pp0 dp5 tp0: attn 32, moe 32, router 32, dispatch 32, experts 32, combine 32; outside F/B 0; MoE parts outside moe 0
+  pp0 dp6 tp0: attn 32, moe 32, router 32, dispatch 32, experts 32, combine 32; outside F/B 0; MoE parts outside moe 0
+  pp0 dp7 tp0: attn 32, moe 32, router 32, dispatch 32, experts 32, combine 32; outside F/B 0; MoE parts outside moe 0

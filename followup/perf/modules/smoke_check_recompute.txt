@@ -1,0 +1,27 @@
+straggler_trace_rollout000005.json
+  pp0 dp0 tp0: attn 189, mlp 189; outside F/B 0; MoE parts outside moe 0
+  pp0 dp1 tp0: attn 189, mlp 189; outside F/B 0; MoE parts outside moe 0
+  pp1 dp0 tp0: attn 189, mlp 189; outside F/B 0; MoE parts outside moe 0
+  pp1 dp1 tp0: attn 189, mlp 189; outside F/B 0; MoE parts outside moe 0
+  pp2 dp0 tp0: attn 189, mlp 189; outside F/B 0; MoE parts outside moe 0
+  pp2 dp1 tp0: attn 189, mlp 189; outside F/B 0; MoE parts outside moe 0
+  pp3 dp0 tp0: attn 189, mlp 189; outside F/B 0; MoE parts outside moe 0
+  pp3 dp1 tp0: attn 189, mlp 189; outside F/B 0; MoE parts outside moe 0
+straggler_trace_rollout000010.json
+  pp0 dp0 tp0: attn 189, mlp 189; outside F/B 0; MoE parts outside moe 0
+  pp0 dp1 tp0: attn 189, mlp 189; outside F/B 0; MoE parts outside moe 0
+  pp1 dp0 tp0: attn 189, mlp 189; outside F/B 0; MoE parts outside moe 0
+  pp1 dp1 tp0: attn 189, mlp 189; outside F/B 0; MoE parts outside moe 0
+  pp2 dp0 tp0: attn 189, mlp 189; outside F/B 0; MoE parts outside moe 0
+  pp2 dp1 tp0: attn 189, mlp 189; outside F/B 0; MoE parts outside moe 0
+  pp3 dp0 tp0: attn 189, mlp 189; outside F/B 0; MoE parts outside moe 0
+  pp3 dp1 tp0: attn 189, mlp 189; outside F/B 0; MoE parts outside moe 0
+straggler_trace_rollout000015.json
+  pp0 dp0 tp0: attn 168, mlp 168; outside F/B 0; MoE parts outside moe 0
+  pp0 dp1 tp0: attn 168, mlp 168; outside F/B 0; MoE parts outside moe 0
+  pp1 dp0 tp0: attn 168, mlp 168; outside F/B 0; MoE parts outside moe 0
+  pp1 dp1 tp0: attn 168, mlp 168; outside F/B 0; MoE parts outside moe 0
+  pp2 dp0 tp0: attn 168, mlp 168; outside F/B 0; MoE parts outside moe 0
+  pp2 dp1 tp0: attn 168, mlp 168; outside F/B 0; MoE parts outside moe 0
+  pp3 dp0 tp0: attn 168, mlp 168; outside F/B 0; MoE parts outside moe 0
+  pp3 dp1 tp0: attn 168, mlp 168; outside F/B 0; MoE parts outside moe 0

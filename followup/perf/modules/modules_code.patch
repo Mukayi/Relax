@@ -1,0 +1,799 @@
+diff --git a/relax/utils/straggler/collector.py b/relax/utils/straggler/collector.py
+index 4ed1cf5..79b49ed 100644
+--- a/relax/utils/straggler/collector.py
++++ b/relax/utils/straggler/collector.py
+@@ -17,7 +17,7 @@ synchronize and an anchor event, its brackets keep their offsets from that
+ anchor, and the window close gathers every rank's sample to the primary rank:
+ once tracing is on, in every window, with ``None`` from a rank without one.
+ At the ``modules`` level that step also carries module brackets (see
+-``modules``), whose hooks exist only while it runs.
++``modules``), which are attached only while it runs.
+ """
+ 
+ from __future__ import annotations
+diff --git a/relax/utils/straggler/control.py b/relax/utils/straggler/control.py
+index 619aee2..3834e43 100644
+--- a/relax/utils/straggler/control.py
++++ b/relax/utils/straggler/control.py
+@@ -5,7 +5,7 @@ for it on a daemon thread, and the window gather hands it to every rank.
+ 
+ Levels: 0 paused (no brackets recorded, windows not analyzed), 1 coarse (the
+ per-window statistics), 2 detail (plus the sampled-step trace), 3 modules
+-(plus the attention / MLP forward and backward of every layer in that trace;
++(plus the forward and backward of the blocks of every layer in that trace;
+ never the default).
+ """
+ 
+@@ -135,12 +135,11 @@ button.current { font-weight: bold; }
+ <button data-level="0">Pause</button>
+ <button data-level="1">Coarse</button>
+ <button data-level="2">Detail (sampled-step trace)</button>
+-<button data-level="3">Modules (detail + attention / MLP per layer)</button>
++<button data-level="3">Modules (detail + per-layer blocks)</button>
+ </p>
+ <p>A change takes effect at the next window boundary, at most RELAX_STRAGGLER_REPORT_INTERVAL rollouts
+ later. Detail and modules need a trace directory (RELAX_STRAGGLER_TRACE_DIR or --timeline-dump-dir);
+-without one they stay coarse. Modules hooks every layer during the sampled step, so that step runs
+-slower.</p>
++without one they stay coarse. Modules times the blocks of every layer during the sampled step only.</p>
+ <script>
+ const LEVELS = __LEVELS__;
+ const api = location.pathname.replace(/\\/straggler\\/?$/, "") + "/straggler/control";
+diff --git a/relax/utils/straggler/modules.py b/relax/utils/straggler/modules.py
+index cedd2f3..fec6356 100644
+--- a/relax/utils/straggler/modules.py
++++ b/relax/utils/straggler/modules.py
+@@ -1,71 +1,171 @@
+ # Copyright (c) 2026 Relax Authors. All Rights Reserved.
+ """Module brackets for the ``modules`` level: forward and backward of the
+-attention and of the MLP / MoE block of every transformer layer, recorded on
++blocks that ``MODULE_SPECS`` names inside every transformer layer (by default
++the attention, the MLP / MoE block and the parts of a MoE layer), recorded on
+ the sampled step only.
+ 
+-The hooks are attached when a sampled step at that level starts and removed
+-when it ends, so no other step pays for them. Forward uses module pre / post
+-hooks. Backward uses gradient hooks on the block's output (its gradient
+-arriving opens the bracket) and on its input (closes it), which also holds
+-under activation recompute, where the block's forward runs again inside the
+-backward. Which micro-batch a bracket belongs to, and whether a forward was a
+-recompute, is read off the trace by containment (see ``trace``).
++The timing is attached when a sampled step at that level starts and removed
++when it ends, so no other step pays for it. Each block's forward, or the
++method its spec names (such as the token exchange of a MoE layer), is shadowed
++by a wrapper that brackets every call. Backward uses gradient hooks on the
++block's output (its gradient arriving opens the bracket) and on its input
++(closes it), which also holds under activation recompute, where the block's
++forward runs again inside the backward. Which micro-batch a bracket belongs
++to, and whether a forward was a recompute, is read off the trace by
++containment (see ``trace``).
++
++Timing the blocks of another model means adding specs; the
++``straggler-module-trace`` skill walks through it.
+ """
+ 
+ from __future__ import annotations
+ 
++from collections import Counter
++from dataclasses import dataclass
+ from typing import Any, Iterable
+ 
+-from relax.utils.straggler.stats import MODULE_INDEX
++from relax.utils.straggler.stats import NUM_FIELDS
+ from relax.utils.straggler.timers import EventSink
+ 
+ 
+-_SKIPPED_BLOCKS = frozenset({"IdentityOp", "IdentityFuncOp"})
++@dataclass(frozen=True)
++class ModuleSpec:
++    """One kind of block: the object at attribute ``path`` of a transformer
++    layer (any module with ``layer_number``), named ``name`` in the trace.
++
++    ``method`` times that method of the object instead of its forward, for a
++    part that is not a module; ``when`` requires the object's class name to
++    contain it. The first spec that matches a (path, method) pair wins.
++    """
++
++    path: str
++    name: str
++    method: str | None = None
++    when: str | None = None
++
++
++MODULE_SPECS: tuple[ModuleSpec, ...] = (
++    ModuleSpec("self_attention", "attn"),
++    ModuleSpec("mlp", "moe", when="MoE"),
++    ModuleSpec("mlp", "mlp"),
++    # Inside a MoE layer: routing, the token exchange around the experts (the EP all-to-all) and the experts.
++    ModuleSpec("mlp.router", "router"),
++    ModuleSpec("mlp.token_dispatcher", "dispatch", method="token_dispatch"),
++    ModuleSpec("mlp.experts", "experts"),
++    ModuleSpec("mlp.token_dispatcher", "combine", method="token_combine"),
++    ModuleSpec("mlp.shared_experts", "shared experts"),
++)
++# Block names; a block's forward and backward brackets are record segments NUM_FIELDS + 2 * index (+ 1).
++MODULE_NAMES: tuple[str, ...] = tuple(dict.fromkeys(spec.name for spec in MODULE_SPECS))
++
++# Megatron's placeholders for blocks a layer does not have.
++PLACEHOLDERS = frozenset({"IdentityOp", "IdentityFuncOp"})
++
++
++def module_segment(name: str, backward: bool) -> int:
++    """The record segment of a block's forward or backward bracket."""
++    return NUM_FIELDS + 2 * MODULE_NAMES.index(name) + backward
++
++
++def module_block(segment: int) -> tuple[str, bool]:
++    """Block name of a module record segment and whether it is a backward."""
++    offset = segment - NUM_FIELDS
++    return MODULE_NAMES[offset // 2], bool(offset % 2)
++
++
++def _resolve(obj: Any, path: str) -> Any:
++    for part in path.split("."):
++        obj = getattr(obj, part, None)
++        if obj is None:
++            return None
++    return obj
+ 
+ 
+ class ModuleTimers:
+-    """The attention and MLP / MoE blocks of the transformer layers found in
++    """The ``MODULE_SPECS`` blocks of the transformer layers found in
+     ``model_chunks``, bracketed into ``sink`` (the collector) while attached.
+ 
+-    A layer is any module with ``self_attention``, ``mlp`` and ``layer_number``
+-    (Megatron's ``TransformerLayer``, including the one inside an MTP layer,
+-    whose numbers start at 1 again and are recorded negated); identity
+-    placeholders are skipped.
++    The layers inside an MTP layer number from 1 again and are recorded
++    negated; identity placeholders are skipped.
+     """
+ 
+     def __init__(self, model_chunks: Iterable[Any], sink: EventSink) -> None:
+         self._sink = sink
+-        self._blocks: list[tuple[Any, str, int]] = []
++        # (object, method, block name, layer)
++        self._blocks: list[tuple[Any, str, str, int]] = []
+         for chunk in model_chunks:
+             for module in chunk.modules():
+                 layer = getattr(module, "layer_number", None)
+                 if layer is None:
+                     continue
+                 layer = -int(layer) if getattr(module, "is_mtp_layer", False) else int(layer)
+-                for name in ("self_attention", "mlp"):
+-                    block = getattr(module, name, None)
+-                    if block is None or type(block).__name__ in _SKIPPED_BLOCKS:
++                taken = set()
++                for spec in MODULE_SPECS:
++                    key = (spec.path, spec.method)
++                    block = None if key in taken else _resolve(module, spec.path)
++                    if block is None or type(block).__name__ in PLACEHOLDERS:
+                         continue
+-                    kind = "attn" if name == "self_attention" else ("moe" if "MoE" in type(block).__name__ else "mlp")
+-                    self._blocks.append((block, kind, layer))
+-        self._handles: list[Any] = []
++                    if spec.method is not None and not callable(getattr(block, spec.method, None)):
++                        continue
++                    if spec.when is None or spec.when in type(block).__name__:
++                        taken.add(key)
++                        self._blocks.append((block, spec.method or "forward", spec.name, layer))
++        self._wrappers: list[_Wrapper] = []
+ 
+-    @property
+-    def blocks(self) -> int:
+-        return len(self._blocks)
++    def counts(self) -> Counter:
++        """Blocks found, by name."""
++        return Counter(name for _, _, name, _ in self._blocks)
+ 
+     def attach(self) -> None:
+-        if self._handles:
++        if self._wrappers:
+             return
+-        for block, kind, layer in self._blocks:
+-            hooks = _BlockHooks(self._sink, MODULE_INDEX[f"{kind}_fwd"], MODULE_INDEX[f"{kind}_bwd"], layer)
+-            self._handles.append(block.register_forward_pre_hook(hooks.pre, with_kwargs=True))
+-            self._handles.append(block.register_forward_hook(hooks.post, with_kwargs=True))
++        for block, method, name, layer in self._blocks:
++            self._wrappers.append(_Wrapper(block, method, self._sink, name, layer))
+ 
+     def detach(self) -> None:
+-        handles, self._handles = self._handles, []
+-        for handle in handles:
+-            handle.remove()
++        wrappers, self._wrappers = self._wrappers, []
++        # Last in, first out: a block shared by two layers is wrapped once per layer.
++        for wrapper in reversed(wrappers):
++            wrapper.remove()
++
++
++class _Wrapper:
++    """Brackets the calls of ``owner.<method>`` into ``sink`` by shadowing the
++    method with an instance attribute until ``remove``.
++
++    Forward hooks would take every call of a module off PyTorch's fast path,
++    and a launch-bound model shows that CPU time in its forwards. The block's
++    own exceptions pass through; the profiler's go to ``sink.on_error``.
++    """
++
++    __slots__ = ("_owner", "_method", "_saved")
++
++    def __init__(self, owner: Any, method: str, sink: EventSink, name: str, layer: int) -> None:
++        self._owner = owner
++        self._method = method
++        self._saved = owner.__dict__.get(method)
++        original = getattr(owner, method)
++        fwd, bwd = module_segment(name, False), module_segment(name, True)
++
++        def timed(*args: Any, **kwargs: Any) -> Any:
++            start = _open(sink)
++            try:
++                output = original(*args, **kwargs)
++            except BaseException:
++                if start is not None:
++                    sink.discard_event(start)
++                raise
++            if start is not None and _close(sink, fwd, layer, start):
++                _bracket_backward(sink, bwd, layer, args[0] if args else kwargs.get("hidden_states"), output)
++            return output
++
++        setattr(owner, method, timed)
++
++    def remove(self) -> None:
++        if self._saved is None:
++            delattr(self._owner, self._method)
++        else:
++            setattr(self._owner, self._method, self._saved)
+ 
+ 
+ def _grad_tensor(value: Any) -> Any:
+@@ -76,6 +176,32 @@ def _grad_tensor(value: Any) -> Any:
+     return value if getattr(value, "requires_grad", False) else None
+ 
+ 
++def _bracket_backward(sink: EventSink, segment: int, layer: int, source: Any, output: Any) -> None:
++    """Bracket the backward of one call, from the gradient of its output to
++    that of its input ``source``, when both take part in it."""
++    output, source = _grad_tensor(output), _grad_tensor(source)
++    if output is None or source is None:
++        return
++    try:
++        bracket = _BackwardBracket(sink, segment, layer)
++        _on_gradient(output, bracket.open)
++        _on_gradient(source, bracket.close)
++    except Exception as exc:
++        sink.on_error("modules", exc)
++
++
++def _on_gradient(tensor: Any, hook: Any) -> None:
++    """Call ``hook`` when the gradient of ``tensor`` arrives.
++
++    A non-leaf tensor's hooks run just before its ``grad_fn`` does, so the hook
++    goes on that node, where it is cheaper to register.
++    """
++    if tensor.grad_fn is None:
++        tensor.register_hook(hook)
++    else:
++        tensor.grad_fn.register_prehook(hook)
++
++
+ def _open(sink: EventSink) -> Any:
+     """The start event of a bracket; ``None`` when none could be recorded."""
+     try:
+@@ -100,45 +226,6 @@ def _close(sink: EventSink, segment: int, layer: int, start: Any) -> bool:
+     return False
+ 
+ 
+-class _BlockHooks:
+-    """Forward bracket of one block, and the gradient hooks that bracket its
+-    backward.
+-
+-    Never raises into the model: failures go to ``sink.on_error``.
+-    """
+-
+-    __slots__ = ("_sink", "_fwd", "_bwd", "_layer", "_start", "_input")
+-
+-    def __init__(self, sink: EventSink, fwd: int, bwd: int, layer: int) -> None:
+-        self._sink = sink
+-        self._fwd = fwd
+-        self._bwd = bwd
+-        self._layer = layer
+-        self._start: Any = None
+-        self._input: Any = None
+-
+-    def pre(self, module: Any, args: tuple, kwargs: dict) -> None:
+-        if self._start is not None:
+-            self._sink.discard_event(self._start)
+-        self._start = _open(self._sink)
+-        self._input = _grad_tensor(args[0] if args else kwargs.get("hidden_states"))
+-
+-    def post(self, module: Any, args: tuple, kwargs: dict, output: Any) -> None:
+-        start, self._start = self._start, None
+-        source, self._input = self._input, None
+-        if start is None or not _close(self._sink, self._fwd, self._layer, start):
+-            return
+-        result = _grad_tensor(output)
+-        if result is None or source is None:
+-            return
+-        try:
+-            backward = _BackwardBracket(self._sink, self._bwd, self._layer)
+-            result.register_hook(backward.open)
+-            source.register_hook(backward.close)
+-        except Exception as exc:
+-            self._sink.on_error("modules", exc)
+-
+-
+ class _BackwardBracket:
+     """One block's backward for one forward call: opened by the gradient of its
+     output, closed by the gradient of its input.
+diff --git a/relax/utils/straggler/runtime.py b/relax/utils/straggler/runtime.py
+index 4df5aab..2488977 100644
+--- a/relax/utils/straggler/runtime.py
++++ b/relax/utils/straggler/runtime.py
+@@ -35,10 +35,19 @@ PROFILED_ROLES: frozenset[str] = frozenset({"actor"})
+ 
+ 
+ def timing_event_factory() -> Callable[[], Any]:
+-    """Build timing events of the active accelerator."""
+-    from relax.utils.device import device_module
++    """Build timing events of the active accelerator.
+ 
+-    return partial(device_module.Event, enable_timing=True)
++    On CUDA they are ``torch.Event``, whose ``record`` finds the current stream
++    in C++; ``torch.cuda.Event.record`` looks it up in Python, several
++    microseconds more per record.
++    """
++    import torch
++
++    from relax.utils import device
++
++    if device.get_device_name() == "cuda" and hasattr(torch, "Event"):
++        return partial(torch.Event, device="cuda", enable_timing=True)
++    return partial(device.device_module.Event, enable_timing=True)
+ 
+ 
+ def stream_capture_check() -> Callable[[], bool]:
+@@ -372,7 +381,7 @@ def register_straggler_model(model_chunks: Sequence[Any]) -> None:
+     """Hand the model chunks to the profiler for the ``modules`` level; a no-op
+     without a profiler.
+ 
+-    Their layers are hooked only while a sampled step at that level runs.
++    Their blocks are timed only while a sampled step at that level runs.
+     """
+     if _PROFILER is None:
+         return
+@@ -384,7 +393,12 @@ def register_straggler_model(model_chunks: Sequence[Any]) -> None:
+         return
+     collector.module_timers = timers
+     if collector.is_primary:
+-        logger.info("[straggler] modules level: %d attention / MLP blocks on this rank", timers.blocks)
++        counts = timers.counts()
++        logger.info(
++            "[straggler] modules level: %d blocks on this rank (%s)",
++            counts.total(),
++            ", ".join(f"{name} {count}" for name, count in counts.items()),
++        )
+ 
+ 
+ def initial_level(trace_on: bool) -> int:
+diff --git a/relax/utils/straggler/stats.py b/relax/utils/straggler/stats.py
+index 10f1a6a..c7434ed 100644
+--- a/relax/utils/straggler/stats.py
++++ b/relax/utils/straggler/stats.py
+@@ -16,8 +16,8 @@ from relax.utils.straggler.health import HEALTH_DISABLE
+ # Compute-stream time (ms, summed over the window) per coarse segment. The
+ # first block is fed by Megatron's own ``config.timers`` call sites (see
+ # MEGATRON_TIMER_SEGMENTS); the ``lp_*`` block is the same call sites during
+-# ``forward_only`` (log-prob passes). Adding a segment (e.g. for MoE dispatch
+-# hooks) is one entry here plus one mapping below.
++# ``forward_only`` (log-prob passes). Adding a segment is one entry here plus
++# one mapping below.
+ GPU_SEGMENTS: tuple[str, ...] = (
+     "fwd",
+     "bwd",
+@@ -68,13 +68,6 @@ FIELDS: tuple[str, ...] = (
+ FIELD_INDEX: Mapping[str, int] = {name: index for index, name in enumerate(FIELDS)}
+ NUM_FIELDS: int = len(FIELDS)
+ 
+-# Module brackets of a sampled step at the ``modules`` level: the attention and
+-# the MLP (``moe`` when it is a MoE layer) of every transformer layer, forward
+-# and backward. They only go into the trace, never into a window, so their
+-# indices start after the last field.
+-MODULE_SEGMENTS: tuple[str, ...] = ("attn_fwd", "attn_bwd", "mlp_fwd", "mlp_bwd", "moe_fwd", "moe_bwd")
+-MODULE_INDEX: Mapping[str, int] = {name: NUM_FIELDS + index for index, name in enumerate(MODULE_SEGMENTS)}
+-
+ 
+ def disabled_row() -> list[float]:
+     """The vector a switched-off rank keeps sending: all zeros except the
+diff --git a/relax/utils/straggler/trace.py b/relax/utils/straggler/trace.py
+index 03e3853..995eb5e 100644
+--- a/relax/utils/straggler/trace.py
++++ b/relax/utils/straggler/trace.py
+@@ -13,9 +13,9 @@ pipeline sit next to each other. Within a row the slices nest by time:
+   ``grad sync`` is the DP reduction, the other syncs keep their Megatron timer
+   names;
+ * level 3 (modules, only at the ``modules`` level): inside ``F{i}`` / ``B{i}``,
+-  the forward / backward of the attention and the MLP (``moe``) of every
+-  layer, e.g. ``attn fwd L3`` (``attn fwd MTP L1`` for an MTP layer); a
+-  forward inside a ``B{i}`` is an activation recompute.
++  the forward / backward of the blocks ``modules.MODULE_SPECS`` names in
++  every layer, e.g. ``attn fwd L3``, ``dispatch bwd L3`` (``attn fwd MTP L1``
++  for an MTP layer); a forward inside a ``B{i}`` is an activation recompute.
+ """
+ 
+ from __future__ import annotations
+@@ -28,11 +28,11 @@ from typing import Any, Sequence
+ 
+ from relax.utils.logging_utils import get_logger
+ from relax.utils.straggler.detector import RankMeta
++from relax.utils.straggler.modules import module_block
+ from relax.utils.straggler.stats import (
+     FIELD_INDEX,
+     GPU_SEGMENTS,
+     GRAD_SYNC_TIMERS,
+-    MODULE_INDEX,
+     NUM_FIELDS,
+     PP_PHASE_FIELDS,
+ )
+@@ -61,8 +61,6 @@ _RECV = FIELD_INDEX["pp_recv"]
+ _LP_RECV = FIELD_INDEX["lp_pp_recv"]
+ _SEGMENT_NAMES = {FIELD_INDEX[name]: name for name in GPU_SEGMENTS}
+ _PHASE_NAMES = {FIELD_INDEX[name]: name.removeprefix("pp_wait_") for name in PP_PHASE_FIELDS}
+-_MODULE_NAMES = {index: name.replace("_", " ") for name, index in MODULE_INDEX.items()}
+-_MODULE_FORWARDS = frozenset(index for name, index in MODULE_INDEX.items() if name.endswith("_fwd"))
+ _WAITS_FOR = {"fill": "previous stage", "up": "previous stage", "down": "next stage", "drain": "next stage"}
+ _MICRO_BATCH_NAMES = {_FWD: "F", _BWD: "B", _LP_FWD: "lp F"}
+ _LEVEL2_NAMES = {
+@@ -212,11 +210,12 @@ def _module_events(
+             outers[j] if j < len(outers) and outers[j].start <= module.start <= module.end <= outers[j].end else None
+         )
+         layer, mtp = abs(module.phase), module.phase < 0
+-        name = f"{_MODULE_NAMES[module.segment]} {'MTP ' if mtp else ''}L{layer}"
++        block, backward = module_block(module.segment)
++        name = f"{block} {'bwd' if backward else 'fwd'} {'MTP ' if mtp else ''}L{layer}"
+         args: dict[str, Any] = {"layer": layer, "mtp": True} if mtp else {"layer": layer}
+         if outer is not None:
+             args.update(_micro_batch_args(outer))
+-            if outer.segment == _BWD and module.segment in _MODULE_FORWARDS:
++            if outer.segment == _BWD and not backward:
+                 name += " (recompute)"
+             elif outer.segment == _LP_FWD:
+                 name = f"lp {name}"
+diff --git a/tests/utils/test_straggler_collector.py b/tests/utils/test_straggler_collector.py
+index 6347a1a..9dbcdda 100644
+--- a/tests/utils/test_straggler_collector.py
++++ b/tests/utils/test_straggler_collector.py
+@@ -10,11 +10,15 @@ import pytest
+ 
+ from relax.utils.straggler import collector as collector_module
+ from relax.utils.straggler.health import HEALTH_DISABLE
+-from relax.utils.straggler.stats import FIELD_INDEX, GPU_SEGMENTS, GRAD_SYNC_TIMERS, MODULE_INDEX, PP_PHASE_FIELDS
++from relax.utils.straggler.modules import module_segment
++from relax.utils.straggler.stats import FIELD_INDEX, GPU_SEGMENTS, GRAD_SYNC_TIMERS, PP_PHASE_FIELDS
+ from relax.utils.straggler.trace import RECORD_WIDTH
+ from tests.utils.straggler_helpers import FakeEvent, bracket, make_collector, meta
+ 
+ 
++_ATTN_FWD = module_segment("attn", False)
++
++
+ class _FakeCapture:
+     """Toggle standing in for ``torch.cuda.is_current_stream_capturing``."""
+ 
+@@ -530,7 +534,7 @@ def test_the_requested_level_travels_in_the_primary_row_and_applies_from_the_nex
+     assert collector.pending_events == 0
+ 
+ 
+-class _ModuleHooks:
++class _ModuleTimers:
+     def __init__(self):
+         self.calls = []
+ 
+@@ -545,32 +549,32 @@ def _module_bracket(collector, layer):
+     start = collector.record_event()
+     end = collector.record_event()
+     if start is not None:
+-        collector.push(MODULE_INDEX["attn_fwd"], layer, start, end, 0.0)
++        collector.push(_ATTN_FWD, layer, start, end, 0.0)
+ 
+ 
+-def test_the_modules_level_hooks_only_the_sampled_step_and_keeps_module_brackets_out_of_the_window():
++def test_the_modules_level_times_only_the_sampled_step_and_keeps_module_brackets_out_of_the_window():
+     gathered, gather = _recording_gather()
+     collector, calls = _tracing_collector(level=3, gather=gather, max_trace_brackets=1, max_module_brackets=1)
+-    hooks = collector.module_timers = _ModuleHooks()
++    timers = collector.module_timers = _ModuleTimers()
+     after_step = []
+     for rollout_id in range(4):
+         bracket(collector)
+         _module_bracket(collector, 1)
+         _module_bracket(collector, 2)
+         collector.end_step(rollout_id=rollout_id)
+-        after_step.append(list(hooks.calls))
++        after_step.append(list(timers.calls))
+     assert after_step == [[], [], ["attach", "detach"], ["attach", "detach"]]
+     sample, _ = calls["gathered"][-1]
+     # The fwd bracket and the first module bracket, each under its own cap; the second module bracket is lost.
+     rows = _rows(sample)
+-    assert [int(r[0]) for r in rows] == [FIELD_INDEX["fwd"], MODULE_INDEX["attn_fwd"]] and rows[1][1] == 1.0
++    assert [int(r[0]) for r in rows] == [FIELD_INDEX["fwd"], _ATTN_FWD] and rows[1][1] == 1.0
+     assert sample.lost == 1
+     assert [row[FIELD_INDEX["fwd"]] for row in gathered] == [2.0, 2.0]
+     assert collector.health.errors_total == 0
+-    # Switching off in the middle of a sampled step removes the hooks too.
++    # Switching off in the middle of a sampled step detaches the module timers too.
+     bracket(collector)
+     collector._disable("test")
+-    assert hooks.calls[-2:] == ["attach", "detach"]
++    assert timers.calls[-2:] == ["attach", "detach"]
+ 
+ 
+ def test_a_module_bracket_finding_the_queue_full_is_dropped_instead_of_a_window_bracket():
+@@ -619,7 +623,7 @@ def test_a_window_bracket_pushes_out_a_module_bracket_queued_after_older_window_
+         FIELD_INDEX["pp_recv"],
+         FIELD_INDEX["fwd"],
+         FIELD_INDEX["bwd"],
+-        MODULE_INDEX["attn_fwd"],
++        _ATTN_FWD,
+     ]
+     assert records[-1][1] == 2 and sample.lost == 1
+ 
+@@ -632,7 +636,7 @@ def test_module_brackets_in_flight_at_the_close_do_not_count_as_unread():
+     start = collector.record_event()
+     end = collector.record_event()
+     end.done = False
+-    collector.push(MODULE_INDEX["attn_fwd"], 1, start, end, 0.0)
++    collector.push(_ATTN_FWD, 1, start, end, 0.0)
+     collector.end_step(rollout_id=1)
+     assert rows[-1][FIELD_INDEX["unread"]] == 0.0
+     # The sample is dropped, its module bracket with it.
+diff --git a/tests/utils/test_straggler_modules.py b/tests/utils/test_straggler_modules.py
+index 496dfe0..443874b 100644
+--- a/tests/utils/test_straggler_modules.py
++++ b/tests/utils/test_straggler_modules.py
+@@ -1,6 +1,6 @@
+ # Copyright (c) 2026 Relax Authors. All Rights Reserved.
+ """CPU tests for the module brackets of the ``modules`` level: which blocks are
+-hooked, and the forward / backward brackets they record, with and without
++timed, and the forward / backward brackets they record, with and without
+ activation recompute."""
+ 
+ import pytest
+@@ -10,15 +10,11 @@ torch = pytest.importorskip("torch")
+ from torch import nn  # noqa: E402
+ from torch.utils.checkpoint import checkpoint  # noqa: E402
+ 
+-from relax.utils.straggler.modules import ModuleTimers  # noqa: E402
+-from relax.utils.straggler.stats import MODULE_INDEX  # noqa: E402
+-
+-
+-_NAMES = {index: name for name, index in MODULE_INDEX.items()}
++from relax.utils.straggler.modules import ModuleTimers, module_block  # noqa: E402
+ 
+ 
+ class _Sink:
+-    """The collector side of the hooks: events are increasing integers."""
++    """The collector side of the brackets: events are increasing integers."""
+ 
+     def __init__(self):
+         self.clock = 0
+@@ -34,7 +30,8 @@ class _Sink:
+         return self.clock
+ 
+     def push(self, segment, layer, start, end, cpu_ms):
+-        self.pushed.append((_NAMES[segment], layer, start, end))
++        name, backward = module_block(segment)
++        self.pushed.append((f"{name}_{'bwd' if backward else 'fwd'}", layer, start, end))
+ 
+     def discard_event(self, event):
+         self.discarded.append(event)
+@@ -62,6 +59,54 @@ class MoELayer(_Block):
+     pass
+ 
+ 
++class _Router(nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.gate = nn.Linear(4, 2)
++
++    def forward(self, hidden_states):
++        return self.gate(hidden_states).softmax(-1)
++
++
++class _Dispatcher:
++    """A plain object with the token exchange as methods, like Megatron's token
++    dispatchers."""
++
++    def token_dispatch(self, hidden_states, probs):
++        return hidden_states * 1.0, probs
++
++    def token_combine(self, hidden_states):
++        return hidden_states * 1.0
++
++
++class _Experts(nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.proj = nn.Linear(4, 4)
++
++    def forward(self, hidden_states, probs):
++        return self.proj(hidden_states) * probs[..., :1], None
++
++
++class _RoutedMoELayer(nn.Module):
++    """Megatron's MoE layer in miniature: route, dispatch, experts, combine,
++    shared experts."""
++
++    def __init__(self):
++        super().__init__()
++        self.router = _Router()
++        self.token_dispatcher = _Dispatcher()
++        self.experts = _Experts()
++        self.shared_experts = nn.Linear(4, 4)
++
++    def forward(self, hidden_states, padding_mask=None):
++        probs = self.router(hidden_states)
++        tokens, probs = self.token_dispatcher.token_dispatch(hidden_states.clone(), probs)
++        output, _ = self.experts(tokens, probs)
++        output = self.token_dispatcher.token_combine(output).view_as(hidden_states)
++        return output + self.shared_experts(hidden_states), None
++
++
+ class IdentityOp(nn.Module):
+     def forward(self, x):
+         return x
+@@ -93,7 +138,7 @@ def _run(model, x):
+ 
+ def test_attention_and_mlp_of_every_layer_are_found_and_identity_blocks_skipped():
+     model = nn.Sequential(_Layer(1), _Layer(2, mlp=MoELayer()), _Layer(3, mlp=IdentityOp()))
+-    assert ModuleTimers([model], _Sink()).blocks == 5
++    assert ModuleTimers([model], _Sink()).counts() == {"attn": 3, "mlp": 1, "moe": 1}
+ 
+ 
+ def test_forward_and_backward_brackets_follow_the_execution_order_and_leave_gradients_unchanged():
+@@ -129,6 +174,40 @@ def test_forward_and_backward_brackets_follow_the_execution_order_and_leave_grad
+     assert len(sink.pushed) == 8
+ 
+ 
++def test_the_parts_of_a_moe_layer_nest_inside_it_forward_and_backward_and_leave_gradients_unchanged():
++    torch.manual_seed(0)
++    model = nn.Sequential(_Layer(1, mlp=_RoutedMoELayer()))
++    x = torch.randn(2, 4, requires_grad=True)
++    _run(model, x)
++    expected = [p.grad.clone() for p in model.parameters()]
++    model.zero_grad()
++
++    parts = ("router", "dispatch", "experts", "combine", "shared experts")
++    sink = _Sink()
++    timers = ModuleTimers([model], sink)
++    assert timers.counts() == {"attn": 1, "moe": 1, **dict.fromkeys(parts, 1)}
++    timers.attach()
++    _run(model, x)
++    spans = {name: (start, end) for name, _, start, end in sink.pushed}
++    for direction in ("fwd", "bwd"):
++        outer_start, outer_end = spans[f"moe_{direction}"]
++        for part in parts:
++            start, end = spans[f"{part}_{direction}"]
++            assert outer_start < start < end < outer_end, (part, direction, spans)
++    assert all(torch.equal(p.grad, e) for p, e in zip(model.parameters(), expected))
++    assert (sink.discarded, sink.errors) == ([], [])
++
++    timers.detach()
++    assert "token_dispatch" not in model[0].mlp.token_dispatcher.__dict__
++
++
++def test_a_method_spec_finds_nothing_on_an_object_without_the_method():
++    moe = _RoutedMoELayer()
++    moe.token_dispatcher = object()
++    counts = ModuleTimers([_Layer(1, mlp=moe)], _Sink()).counts()
++    assert counts == {"attn": 1, "moe": 1, "router": 1, "experts": 1, "shared experts": 1}
++
++
+ def test_an_mtp_layer_is_recorded_apart_from_the_decoder_layer_with_the_same_number():
+     model = nn.Sequential(_Layer(1), _MtpLayer(1))
+     sink = _Sink()
+@@ -170,6 +249,40 @@ def test_nothing_is_recorded_while_the_collector_does_not_record():
+     assert (sink.pushed, sink.discarded, sink.errors) == ([], [], [])
+ 
+ 
++def test_blocks_get_no_module_hooks_and_detach_restores_the_forward_they_had():
++    model = _Layer(1)
++    # An instance-level forward, as another wrapper would leave it.
++    own_forward = model.mlp.forward
++    model.mlp.forward = own_forward
++    timers = ModuleTimers([model], _Sink())
++    timers.attach()
++    assert not (model.mlp._forward_hooks or model.mlp._forward_pre_hooks)
++    timers.detach()
++    assert "forward" not in model.self_attention.__dict__ and model.mlp.__dict__["forward"] is own_forward
++
++
++def test_a_block_shared_by_two_layers_is_unwrapped_on_detach():
++    shared = _Block()
++    timers = ModuleTimers([_Layer(1, mlp=shared), _Layer(2, mlp=shared)], _Sink())
++    timers.attach()
++    timers.detach()
++    assert "forward" not in shared.__dict__
++
++
++def test_a_block_that_raises_returns_its_start_event_and_the_error_reaches_the_model():
++    class _Failing(_Block):
++        def forward(self, hidden_states, padding_mask=None):
++            raise ValueError("block broke")
++
++    sink = _Sink()
++    model = _Layer(1, mlp=_Failing())
++    ModuleTimers([model], sink).attach()
++    with pytest.raises(ValueError, match="block broke"):
++        model(torch.randn(2, 4, requires_grad=True))
++    # The last event recorded is the failing block's start.
++    assert (sink.names, sink.discarded, sink.errors) == ([("attn_fwd", 1)], [sink.clock], [])
++
++
+ def test_attach_is_idempotent():
+     sink = _Sink()
+     model = _Layer(1)
+diff --git a/tests/utils/test_straggler_runtime.py b/tests/utils/test_straggler_runtime.py
+index d07834f..c2807de 100644
+--- a/tests/utils/test_straggler_runtime.py
++++ b/tests/utils/test_straggler_runtime.py
+@@ -82,6 +82,7 @@ def _use_backend(monkeypatch, backend, available=True):
+ 
+     monkeypatch.setattr(device, "device_module", backend)
+     monkeypatch.setattr(device, "is_available", lambda: available)
++    monkeypatch.setattr(device, "get_device_name", lambda: "npu")
+ 
+ 
+ def test_timing_events_come_from_the_active_accelerator(monkeypatch):
+@@ -91,6 +92,17 @@ def test_timing_events_come_from_the_active_accelerator(monkeypatch):
+     assert backend.events == [{"enable_timing": True}]
+ 
+ 
++def test_timing_events_on_cuda_are_device_generic_events(monkeypatch):
++    torch = pytest.importorskip("torch")
++    from relax.utils import device
++
++    built = []
++    monkeypatch.setattr(device, "get_device_name", lambda: "cuda")
++    monkeypatch.setattr(torch, "Event", lambda **kwargs: built.append(kwargs))
++    runtime.timing_event_factory()()
++    assert built == [{"device": "cuda", "enable_timing": True}]
++
++
+ @pytest.mark.parametrize(
+     ("capturing", "available", "expected"), [(True, True, True), (False, True, False), (True, False, False)]
+ )
+@@ -146,7 +158,7 @@ def test_the_model_reaches_the_collector_only_with_a_profiler(monkeypatch):
+     profiler = _profiler()
+     monkeypatch.setattr(runtime, "_PROFILER", profiler)
+     runtime.register_straggler_model([])
+-    assert profiler.collector.module_timers.blocks == 0
++    assert not profiler.collector.module_timers.counts()
+     runtime.register_straggler_model([object()])
+     assert profiler.collector.health.errors_total == 1, "a model without modules() is a profiler error"
+ 
+diff --git a/tests/utils/test_straggler_trace.py b/tests/utils/test_straggler_trace.py
+index 79357bd..d34debf 100644
+--- a/tests/utils/test_straggler_trace.py
++++ b/tests/utils/test_straggler_trace.py
+@@ -6,7 +6,8 @@ from array import array
+ 
+ import pytest
+ 
+-from relax.utils.straggler.stats import FIELD_INDEX, GRAD_SYNC_TIMERS, MODULE_INDEX
++from relax.utils.straggler.modules import module_segment
++from relax.utils.straggler.stats import FIELD_INDEX, GRAD_SYNC_TIMERS
+ from relax.utils.straggler.trace import (
+     FILE_PREFIX,
+     TIMELINE_PID_BASE,
+@@ -167,7 +168,8 @@ def test_missing_samples_are_skipped_and_cpu_events_get_their_own_row():
+ 
+ 
+ def _module(name, layer, start, end):
+-    return (MODULE_INDEX[name], layer, -1, -1, start, end)
++    block, direction = name.rsplit("_", 1)
++    return (module_segment(block, direction == "bwd"), layer, -1, -1, start, end)
+ 
+ 
+ def test_module_brackets_nest_in_their_micro_batch_and_mark_recompute_and_log_prob_forwards():
