@@ -205,8 +205,10 @@ def _bracket_backward(sink: EventSink, segment: int, layer: int, sources: list[A
         bracket = _BackwardBracket(sink, segment, layer)
         for output in outputs:
             _on_gradient(output, bracket.open)
+        # A tensor's hooks run before its grad_fn's prehooks, so where a block's input comes straight from the
+        # block before it, its backward ends before that block's begins.
         for source in sources:
-            _on_gradient(source, bracket.close)
+            source.register_hook(bracket.close)
     except Exception as exc:
         sink.on_error("modules", exc)
 

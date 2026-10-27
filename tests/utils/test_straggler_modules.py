@@ -266,6 +266,20 @@ def test_the_dispatch_backward_holds_both_exchanges_and_the_experts_backward_nei
     assert (sink.discarded, sink.errors) == ([], [])
 
 
+@pytest.mark.parametrize("layer_class", [_RoutedMoELayer, _SortingMoELayer], ids=["one_expert_per_rank", "sorted"])
+def test_where_a_part_takes_the_output_of_the_part_before_its_backward_ends_before_that_one_begins(layer_class):
+    sink = _Sink()
+    moe = layer_class()
+    moe.token_dispatcher = _ExchangingDispatcher(sink, [])
+    model = nn.Sequential(_Layer(1, mlp=moe))
+    ModuleTimers([model], sink).attach()
+    _run(model, torch.randn(2, 4, requires_grad=True))
+    parts = {"combine_bwd", "experts_bwd", "dispatch_bwd", "router_bwd"}
+    spans = sorted((start, end) for name, _, start, end in sink.pushed if name in parts)
+    assert len(spans) == len(parts)
+    assert all(end < next_start for (_, end), (next_start, _) in zip(spans, spans[1:])), spans
+
+
 def test_a_method_spec_finds_nothing_on_an_object_without_the_method():
     moe = _RoutedMoELayer()
     moe.token_dispatcher = object()
