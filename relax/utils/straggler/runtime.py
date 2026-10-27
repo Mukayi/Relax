@@ -358,7 +358,7 @@ def register_straggler_model(model_chunks: Sequence[Any]) -> None:
     """Hand the model chunks to the profiler for the ``modules`` level; a no-op
     without a profiler.
 
-    Their layers are hooked only while a sampled step at that level runs.
+    Their blocks are timed only while a sampled step at that level runs.
     """
     if _PROFILER is None:
         return

@@ -17,7 +17,7 @@ synchronize and an anchor event, its brackets keep their offsets from that
 anchor, and the window close gathers every rank's sample to the primary rank:
 once tracing is on, in every window, with ``None`` from a rank without one.
 At the ``modules`` level that step also carries module brackets (see
-``modules``), whose hooks exist only while it runs.
+``modules``), which are attached only while it runs.
 """
 
 from __future__ import annotations

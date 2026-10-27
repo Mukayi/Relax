@@ -7,7 +7,7 @@ Relax 的 Megatron 后端内置一个低开销的慢 rank 分析器，可以在�
 - **慢 rank 判定**：每个窗口（K 个 rollout）汇总各 rank 的阶段耗时，只在同一 PP stage 内比较，给出原因（见「reason 怎么读」）；数据不足时报告「不确定」。连续 `PERSIST_WINDOWS` 个窗口异常才告警，连续 `RECOVER_WINDOWS` 个正常窗口后解除。
 - **PP 等待与 micro-batch**：非交错 1F1B 下把 PP 等待拆成填充、稳态、排空几段；记录单个 micro-batch 前向 / 反向耗时和 token 数的极值。
 - **采样步 trace**：每个窗口把一个 rollout 里所有 rank 的计时放到同一条时间轴上，写成 Perfetto 文件：PP 气泡、每个 micro-batch 的前向 / 反向（VPP 下带模型块）、收发、梯度同步和 optimizer。
-- **模块计时**：在采样步里给每层 attention 和 MLP / MoE 块的前向、反向计时。
+- **模块计时**：在采样步里给每层 attention 和 MLP / MoE 块的前向、反向计时，MoE 层内再分 router、dispatch、experts、combine。
 - **运行中切换级别**：暂停、窗口统计、加 trace、加模块计时四档，训练中通过网页或接口切换。
 - **出错自动关闭**：分析器自身的异常只计数，不抛进训练循环；某个 rank 累计 3 次异常，或连续 3 个窗口有丢失的计时或异常时，所有 rank 在同一个窗口一起关闭分析器，训练照常进行。状态见 `straggler/health/*`。
 
@@ -45,9 +45,9 @@ env_vars:
 | 0 `paused` | 不计时、不判定，告警的连续计数冻结；标量只有 `straggler/control/level` |
 | 1 `coarse` | 窗口统计和判定 |
 | 2 `detail` | 再加采样步 trace；需要 trace 目录，没有时按 `coarse` 运行 |
-| 3 `modules` | 再加模块计时：只在采样步挂 hook，只写进 trace，不进窗口统计和判定；需要 trace 目录，只能显式设置 |
+| 3 `modules` | 再加模块计时：只在采样步进行，只写进 trace，不进窗口统计和判定；需要 trace 目录，只能显式设置 |
 
-有 trace 目录时启动级别就是 `detail`，可以一直开着（开销见「开销」）；`modules` 会让采样步变慢，只在排查问题时临时打开。
+有 trace 目录时启动级别就是 `detail`，可以一直开着（开销见「开销」）；`modules` 开销更高，只在排查问题时临时打开。
 
 启动级别由 `RELAX_STRAGGLER_LEVEL` 决定。开启 `--use-metrics-service` 时，把 `HEAD_NODE` 设为 head 节点的可访问地址；训练中可以在浏览器打开 `http://${HEAD_NODE}:8000/metrics/straggler` 点按钮切换，也可以直接发请求：
 
@@ -159,7 +159,7 @@ closed; their time lands in the next window
 | --- | --- |
 | 第 1 层（PP） | `busy`：连续的计算和通信；`bubble fill` / `up` / `down` / `drain`：PP 等待，按 1F1B 阶段命名，`waits_for` 写明在等上一个还是下一个 stage；`untimed`：超过 0.5 ms 且没有计时覆盖的时间（CPU 侧停顿） |
 | 第 2 层（fwd / bwd） | `busy` 里的 `F{i}` / `B{i}`（`i` 是 micro-batch 序号，VPP 下另带模型块，记为 `F{i} chunk {c}`；前向带 token 数）、`send`、`grad sync`（DP 梯度同步，即 Megatron 的 `all-grads-sync`；其他梯度同步用 Megatron 的计时器名）、`param gather`、`optimizer`；log-prob 阶段为 `lp F{i}` 等 |
-| 第 3 层（模块） | 只在 `modules` 级别出现：`F{i}` / `B{i}` 里每个 transformer 层的 attention 和 MLP（MoE 层记为 `moe`）的前向、反向，例如 `attn fwd L3`、`moe bwd L3`，参数带 `layer`、`micro_batch`（VPP 下另带 `model_chunk`）；MTP 层记为 `attn fwd MTP L1` 等（参数带 `mtp`）；出现在 `B{i}` 里的前向是激活重计算，记为 `… (recompute)` |
+| 第 3 层（模块） | 只在 `modules` 级别出现：`F{i}` / `B{i}` 里每个 transformer 层的 attention 和 MLP（MoE 层记为 `moe`）的前向、反向，例如 `attn fwd L3`、`moe bwd L3`，参数带 `layer`、`micro_batch`（VPP 下另带 `model_chunk`）；MoE 层内另有 `router`、`dispatch`（EP all-to-all 在这里）、`experts`、`combine` 和 `shared experts`；MTP 层记为 `attn fwd MTP L1` 等（参数带 `mtp`）；出现在 `B{i}` 里的前向是激活重计算，记为 `… (recompute)`。要计其他模型的块，在 `relax/utils/straggler/modules.py` 的 `MODULE_SPECS` 里加 spec |
 
 primary 自己的 CPU 侧计时（例如 `actor_train`、每个 micro-batch 的 `get_data_batch_*`）单独一行 `primary CPU`。
 
@@ -193,12 +193,12 @@ primary 自己的 CPU 侧计时（例如 `actor_train`、每个 micro-batch 的 
 - 每个计时点一对非阻塞的 CUDA event，每步结束时只读取已完成的事件；每个窗口一次 Gloo all-gather，每个 rank 发送 272 B。
 - 8×A100、Qwen3-0.6B DP8（每步约 1 s）、完整功能（级别 2、trace 目录、metrics service、overlap）下，分析器在 rank 0 上的直接开销约每步 1.5 ms（约 0.15%），其中计时点约占六成；其他 rank 在下一个集合通信上等 rank 0。端到端运行内交叉对照为 +0.13%（95% CI −0.05%～+0.30%，4 组），区间上界低于 0.5%。
 - 采样步 trace：每个窗口多一次设备同步和锚点（约 1.1 ms），并在窗口结束时把采样步 gather 到 primary（窗口结束的两次 gather 共约 2 ms）；默认窗口下每步最多约 0.03%。
-- `modules` 级别：采样步的前向长 3–10%（小模型受 kernel 发射限制，hook 的 CPU 开销会显现），反向不变；每个窗口读取模块计时多约 3.5 ms。
+- `modules` 级别：同样的端到端交叉对照为 +0.34%（95% CI +0.20%～+0.48%，4 组）。每个块的前向多约 21 µs、反向多约 15 µs CPU 时间（单卡微基准），每个窗口读取模块计时多约 3.5 ms；Qwen3-0.6B TP1×PP4×DP2 上采样步的前向、反向与 detail 级别分不开（±3% 以内）。
 - 测量方法和数据见 [RFC #362](https://github.com/redai-studio/Relax/issues/362)。
 
 ## 限制
 
-- 计时复用 Megatron 已有的计时点。窗口统计里 attention、MoE、head / logits、MTP 的内部都包含在 `fwd` / `bwd` 中，`modules` 级别也只在 trace 里给出每层 attention 和 MLP / MoE 的整块耗时；EP all-to-all 计入计算时间；不给真实的通信计算重叠比例，`dp_grad_sync` 变小不能理解为重叠变好。
+- 计时复用 Megatron 已有的计时点。窗口统计里 attention、MoE、head / logits、MTP 的内部都包含在 `fwd` / `bwd` 中，`modules` 级别只在 trace 里给出每层 attention、MLP / MoE 和 MoE 层内各部分的耗时；EP all-to-all 计入计算时间；不给真实的通信计算重叠比例，`dp_grad_sync` 变小不能理解为重叠变好。
 - 同一 TP 组的 rank 在前向 / 反向里互相等待，其中一个变慢时整组都会被报出；所有 rank 同时变慢时（整机降频、共享存储抖动）发现不了。
 - PP 阶段拆分、trace 里的阶段命名和气泡推算只适用于非交错 1F1B，VPP 的收发只计入 `pp_recv`。VPP 下的 micro-batch 序号和模型块按 Megatron 的交错调度表（`get_schedule_table`，用模型自己的 config 生成）由调用顺序换算；`combined_1f1b` 的训练调用把前向和反向合并执行，不编号。
 - 跨卡对齐依赖各 rank 的墙钟，跨机器时受 NTP 精度影响，误差见日志 `other metrics` 一行里的 `trace/align_spread_ms`。窗口只有 1 个 rollout 时，采样步可能来不及读完，这个窗口就没有 trace。CUDA graph 捕获期间不计时。

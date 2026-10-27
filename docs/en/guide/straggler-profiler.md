@@ -7,7 +7,7 @@ The Megatron backend ships a low-overhead straggler profiler that can stay enabl
 - **Straggler verdicts**: every window (K rollouts) gathers each rank's segment times, compares ranks only within the same PP stage, and gives a reason (see *Reading the reason*); a rank without enough data is reported as uncertain. An alert needs `PERSIST_WINDOWS` consecutive abnormal windows and clears after `RECOVER_WINDOWS` consecutive clean windows.
 - **PP waits and micro-batches**: under non-interleaved 1F1B the PP wait is split into fill, steady-state and drain phases; the extremes of single micro-batch forward / backward times and token counts are recorded.
 - **Sampled-step trace**: every window puts one rollout's timings of all ranks on a common time axis and writes a Perfetto file: PP bubbles, each micro-batch's forward / backward (with the model chunk under VPP), sends, gradient syncs and the optimizer.
-- **Module timing**: in the sampled step, the forward and backward of every layer's attention and MLP / MoE block.
+- **Module timing**: in the sampled step, the forward and backward of every layer's attention and MLP / MoE block, with a MoE layer split into router, dispatch, experts and combine.
 - **Level switching while training**: paused, window statistics, plus trace, plus module timing, switched from a web page or an endpoint.
 - **Self-shutdown on errors**: the profiler's own errors are counted and never reach the training loop. When a rank has caught 3 errors, or has lost spans or caught errors in 3 consecutive windows, every rank switches the profiler off in the same window and training carries on. See `straggler/health/*`.
 
@@ -45,9 +45,9 @@ Each actor process logs `Straggler profiler enabled: report_interval=… primary
 | 0 `paused` | Nothing is timed or analyzed, alert counts are frozen; the only scalar is `straggler/control/level` |
 | 1 `coarse` | Window statistics and verdicts |
 | 2 `detail` | Plus the sampled-step trace; needs a trace directory and runs as `coarse` without one |
-| 3 `modules` | Plus module timing: hooks only during the sampled step, trace only, never in the window statistics or the verdicts; needs a trace directory and must be set explicitly |
+| 3 `modules` | Plus module timing: only during the sampled step, trace only, never in the window statistics or the verdicts; needs a trace directory and must be set explicitly |
 
-With a trace directory the start level is `detail`, which can stay on (see Overhead); `modules` makes the sampled step slower, so turn it on only while investigating.
+With a trace directory the start level is `detail`, which can stay on (see Overhead); `modules` costs more, so turn it on only while investigating.
 
 `RELAX_STRAGGLER_LEVEL` sets the start level. With `--use-metrics-service`, set `HEAD_NODE` to the reachable address of the head node. While training runs, open `http://${HEAD_NODE}:8000/metrics/straggler` in a browser and press a button, or send the request directly:
 
@@ -159,7 +159,7 @@ Each rank is a row, ordered by (dp, pp, tp) so the stages of a pipeline sit next
 | --- | --- |
 | 1 (PP) | `busy`: back-to-back compute and communication; `bubble fill` / `up` / `down` / `drain`: PP waits named by 1F1B phase, with `waits_for` saying whether the previous or the next stage is awaited; `untimed`: more than 0.5 ms covered by no timed span (host-side stalls) |
 | 2 (fwd / bwd) | Inside `busy`: `F{i}` / `B{i}` (`i` is the micro-batch number; with VPP the model chunk follows: `F{i} chunk {c}`; forwards carry their token count), `send`, `grad sync` (the DP gradient sync, Megatron's `all-grads-sync`; the other gradient syncs keep their Megatron timer names), `param gather`, `optimizer`; log-prob passes show `lp F{i}` and so on |
-| 3 (modules) | Only at the `modules` level. Inside `F{i}` / `B{i}`: the forward and backward of the attention and of the MLP (`moe` for a MoE layer) of every transformer layer, e.g. `attn fwd L3`, `moe bwd L3`, with `layer` and `micro_batch` in the arguments (and `model_chunk` with VPP); MTP layers are named `attn fwd MTP L1` and so on (with `mtp` in the arguments); a forward inside `B{i}` is an activation recompute and is named `… (recompute)` |
+| 3 (modules) | Only at the `modules` level. Inside `F{i}` / `B{i}`: the forward and backward of the attention and of the MLP (`moe` for a MoE layer) of every transformer layer, e.g. `attn fwd L3`, `moe bwd L3`, with `layer` and `micro_batch` in the arguments (and `model_chunk` with VPP); inside a MoE layer, `router`, `dispatch` (where the EP all-to-all happens), `experts`, `combine` and `shared experts`; MTP layers are named `attn fwd MTP L1` and so on (with `mtp` in the arguments); a forward inside `B{i}` is an activation recompute and is named `… (recompute)`. To time the blocks of another model, add specs to `MODULE_SPECS` in `relax/utils/straggler/modules.py` |
 
 The primary rank's own CPU-side timers (such as `actor_train` and the per-micro-batch `get_data_batch_*`) get a separate `primary CPU` row.
 
@@ -193,12 +193,12 @@ With both `--timeline-dump-dir` and `--use-metrics-service` set, every window ap
 - One pair of non-blocking CUDA events per timer call site; at the end of each step only completed events are read. One Gloo all-gather per window, 272 B per rank.
 - On 8×A100 with Qwen3-0.6B DP8 (step ≈ 1 s) and full functionality (level 2, a trace directory, the metrics service, overlap), the profiler's direct cost on rank 0 is about 1.5 ms per step (≈ 0.15 %), about 60 % of it in the timers; the other ranks wait for rank 0 at the next collective. An end-to-end in-run crossover gives +0.13 % (95 % CI −0.05 % to +0.30 %, four pairs), with the upper bound below 0.5 %.
 - Sampled-step trace: one extra device synchronize and anchor per window (about 1.1 ms), and the sampled step is gathered to the primary rank when the window closes (about 2 ms for the two window-close gathers); at most about 0.03 % per step with the default window.
-- `modules` level: the sampled step's forwards are 3–10 % longer (on a small, launch-bound model the hooks' CPU time shows), backwards are unchanged; reading the module spans adds about 3.5 ms per window.
+- `modules` level: the same end-to-end crossover at the `modules` level gives +0.34 % (95 % CI +0.20 % to +0.48 %, four pairs). Each block costs about 21 µs of CPU time in the forward and 15 µs in the backward (single-GPU microbenchmark), and reading the module spans adds about 3.5 ms per window; on Qwen3-0.6B TP1×PP4×DP2 the sampled step's forwards and backwards cannot be told apart from the detail level (within ±3 %).
 - The method and all measurements are in [RFC #362](https://github.com/redai-studio/Relax/issues/362).
 
 ## Limits
 
-- The timings reuse Megatron's existing timer call sites. In the window statistics, the internals of attention, MoE, head / logits and MTP are part of `fwd` / `bwd`, and the `modules` level only adds whole attention and MLP / MoE blocks to the trace; EP all-to-all counts as compute; there is no real compute/communication overlap ratio, and a smaller `dp_grad_sync` does not mean better overlap.
+- The timings reuse Megatron's existing timer call sites. In the window statistics, the internals of attention, MoE, head / logits and MTP are part of `fwd` / `bwd`, and the `modules` level only adds the attention, the MLP / MoE block and the parts of a MoE layer to the trace; EP all-to-all counts as compute; there is no real compute/communication overlap ratio, and a smaller `dp_grad_sync` does not mean better overlap.
 - Ranks of the same TP group wait for each other inside forward and backward, so when one of them slows down the whole group is reported; when every rank slows down at once (whole-machine clock throttling, a shared-storage stall) nothing is detected.
 - The PP phase split, the phase names in the trace and the bubble estimate assume non-interleaved 1F1B; the transfers of the interleaved (VPP) schedule count in `pp_recv` only. With VPP, the micro-batch number and model chunk come from Megatron's interleaved schedule table (`get_schedule_table`, built from the model's own config) by call order; training calls under `combined_1f1b` merge forward and backward steps and are not numbered.
 - Ranks are aligned by their wall clocks, so across machines NTP accuracy applies; `trace/align_spread_ms` in the `other metrics` log line shows the error. With one-rollout windows the sampled step may not be fully read when the window closes, and that window has no trace. Nothing is timed under CUDA graph capture.

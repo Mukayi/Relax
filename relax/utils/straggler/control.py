@@ -139,8 +139,7 @@ button.current { font-weight: bold; }
 </p>
 <p>A change takes effect at the next window boundary, at most RELAX_STRAGGLER_REPORT_INTERVAL rollouts
 later. Detail and modules need a trace directory (RELAX_STRAGGLER_TRACE_DIR or --timeline-dump-dir);
-without one they stay coarse. Modules hooks every layer during the sampled step, so that step runs
-slower.</p>
+without one they stay coarse. Modules times the blocks of every layer during the sampled step only.</p>
 <script>
 const LEVELS = __LEVELS__;
 const api = location.pathname.replace(/\\/straggler\\/?$/, "") + "/straggler/control";
