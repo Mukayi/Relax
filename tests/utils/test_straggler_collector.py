@@ -534,7 +534,7 @@ def test_the_requested_level_travels_in_the_primary_row_and_applies_from_the_nex
     assert collector.pending_events == 0
 
 
-class _ModuleHooks:
+class _ModuleTimers:
     def __init__(self):
         self.calls = []
 
@@ -552,17 +552,17 @@ def _module_bracket(collector, layer):
         collector.push(_ATTN_FWD, layer, start, end, 0.0)
 
 
-def test_the_modules_level_hooks_only_the_sampled_step_and_keeps_module_brackets_out_of_the_window():
+def test_the_modules_level_times_only_the_sampled_step_and_keeps_module_brackets_out_of_the_window():
     gathered, gather = _recording_gather()
     collector, calls = _tracing_collector(level=3, gather=gather, max_trace_brackets=1, max_module_brackets=1)
-    hooks = collector.module_timers = _ModuleHooks()
+    timers = collector.module_timers = _ModuleTimers()
     after_step = []
     for rollout_id in range(4):
         bracket(collector)
         _module_bracket(collector, 1)
         _module_bracket(collector, 2)
         collector.end_step(rollout_id=rollout_id)
-        after_step.append(list(hooks.calls))
+        after_step.append(list(timers.calls))
     assert after_step == [[], [], ["attach", "detach"], ["attach", "detach"]]
     sample, _ = calls["gathered"][-1]
     # The fwd bracket and the first module bracket, each under its own cap; the second module bracket is lost.
@@ -571,10 +571,10 @@ def test_the_modules_level_hooks_only_the_sampled_step_and_keeps_module_brackets
     assert sample.lost == 1
     assert [row[FIELD_INDEX["fwd"]] for row in gathered] == [2.0, 2.0]
     assert collector.health.errors_total == 0
-    # Switching off in the middle of a sampled step removes the hooks too.
+    # Switching off in the middle of a sampled step detaches the module timers too.
     bracket(collector)
     collector._disable("test")
-    assert hooks.calls[-2:] == ["attach", "detach"]
+    assert timers.calls[-2:] == ["attach", "detach"]
 
 
 def test_a_module_bracket_finding_the_queue_full_is_dropped_instead_of_a_window_bracket():

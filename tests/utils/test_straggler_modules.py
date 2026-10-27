@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """CPU tests for the module brackets of the ``modules`` level: which blocks are
-hooked, and the forward / backward brackets they record, with and without
+timed, and the forward / backward brackets they record, with and without
 activation recompute."""
 
 import pytest
@@ -14,7 +14,7 @@ from relax.utils.straggler.modules import ModuleTimers, module_block  # noqa: E4
 
 
 class _Sink:
-    """The collector side of the hooks: events are increasing integers."""
+    """The collector side of the brackets: events are increasing integers."""
 
     def __init__(self):
         self.clock = 0
@@ -247,6 +247,40 @@ def test_nothing_is_recorded_while_the_collector_does_not_record():
     ModuleTimers([model], sink).attach()
     _run(model, torch.randn(2, 4, requires_grad=True))
     assert (sink.pushed, sink.discarded, sink.errors) == ([], [], [])
+
+
+def test_blocks_get_no_module_hooks_and_detach_restores_the_forward_they_had():
+    model = _Layer(1)
+    # An instance-level forward, as another wrapper would leave it.
+    own_forward = model.mlp.forward
+    model.mlp.forward = own_forward
+    timers = ModuleTimers([model], _Sink())
+    timers.attach()
+    assert not (model.mlp._forward_hooks or model.mlp._forward_pre_hooks)
+    timers.detach()
+    assert "forward" not in model.self_attention.__dict__ and model.mlp.__dict__["forward"] is own_forward
+
+
+def test_a_block_shared_by_two_layers_is_unwrapped_on_detach():
+    shared = _Block()
+    timers = ModuleTimers([_Layer(1, mlp=shared), _Layer(2, mlp=shared)], _Sink())
+    timers.attach()
+    timers.detach()
+    assert "forward" not in shared.__dict__
+
+
+def test_a_block_that_raises_returns_its_start_event_and_the_error_reaches_the_model():
+    class _Failing(_Block):
+        def forward(self, hidden_states, padding_mask=None):
+            raise ValueError("block broke")
+
+    sink = _Sink()
+    model = _Layer(1, mlp=_Failing())
+    ModuleTimers([model], sink).attach()
+    with pytest.raises(ValueError, match="block broke"):
+        model(torch.randn(2, 4, requires_grad=True))
+    # The last event recorded is the failing block's start.
+    assert (sink.names, sink.discarded, sink.errors) == ([("attn_fwd", 1)], [sink.clock], [])
 
 
 def test_attach_is_idempotent():

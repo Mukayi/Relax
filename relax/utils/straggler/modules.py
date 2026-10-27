@@ -4,15 +4,15 @@ blocks that ``MODULE_SPECS`` names inside every transformer layer (by default
 the attention, the MLP / MoE block and the parts of a MoE layer), recorded on
 the sampled step only.
 
-The hooks are attached when a sampled step at that level starts and removed
-when it ends, so no other step pays for them. A block that is a module is
-timed with module pre / post hooks; a block that is a method (such as the token
-exchange of a MoE layer) is timed by a wrapper that exists only while attached.
-Backward uses gradient hooks on the block's output (its gradient arriving opens
-the bracket) and on its input (closes it), which also holds under activation
-recompute, where the block's forward runs again inside the backward. Which
-micro-batch a bracket belongs to, and whether a forward was a recompute, is
-read off the trace by containment (see ``trace``).
+The timing is attached when a sampled step at that level starts and removed
+when it ends, so no other step pays for it. Each block's forward, or the
+method its spec names (such as the token exchange of a MoE layer), is shadowed
+by a wrapper that brackets every call. Backward uses gradient hooks on the
+block's output (its gradient arriving opens the bracket) and on its input
+(closes it), which also holds under activation recompute, where the block's
+forward runs again inside the backward. Which micro-batch a bracket belongs
+to, and whether a forward was a recompute, is read off the trace by
+containment (see ``trace``).
 
 Timing the blocks of another model means adding specs to ``MODULE_SPECS``.
 """
@@ -90,8 +90,8 @@ class ModuleTimers:
 
     def __init__(self, model_chunks: Iterable[Any], sink: EventSink) -> None:
         self._sink = sink
-        # (object, method or None, block name, layer)
-        self._blocks: list[tuple[Any, str | None, str, int]] = []
+        # (object, method, block name, layer)
+        self._blocks: list[tuple[Any, str, str, int]] = []
         for chunk in model_chunks:
             for module in chunk.modules():
                 layer = getattr(module, "layer_number", None)
@@ -108,46 +108,54 @@ class ModuleTimers:
                         continue
                     if spec.when is None or spec.when in type(block).__name__:
                         taken.add(key)
-                        self._blocks.append((block, spec.method, spec.name, layer))
-        self._handles: list[Any] = []
+                        self._blocks.append((block, spec.method or "forward", spec.name, layer))
+        self._wrappers: list[_Wrapper] = []
 
     def counts(self) -> Counter:
         """Blocks found, by name."""
         return Counter(name for _, _, name, _ in self._blocks)
 
     def attach(self) -> None:
-        if self._handles:
+        if self._wrappers:
             return
         for block, method, name, layer in self._blocks:
-            hooks = _BlockHooks(self._sink, module_segment(name, False), module_segment(name, True), layer)
-            if method is None:
-                self._handles.append(block.register_forward_pre_hook(hooks.pre, with_kwargs=True))
-                self._handles.append(block.register_forward_hook(hooks.post, with_kwargs=True))
-            else:
-                self._handles.append(_MethodWrapper(block, method, hooks))
+            self._wrappers.append(_Wrapper(block, method, self._sink, name, layer))
 
     def detach(self) -> None:
-        handles, self._handles = self._handles, []
-        for handle in handles:
-            handle.remove()
+        wrappers, self._wrappers = self._wrappers, []
+        # Last in, first out: a block shared by two layers is wrapped once per layer.
+        for wrapper in reversed(wrappers):
+            wrapper.remove()
 
 
-class _MethodWrapper:
-    """Brackets the calls of ``owner.<method>`` with ``hooks`` by shadowing the
-    method with an instance attribute until ``remove``."""
+class _Wrapper:
+    """Brackets the calls of ``owner.<method>`` into ``sink`` by shadowing the
+    method with an instance attribute until ``remove``.
+
+    Forward hooks would take every call of a module off PyTorch's fast path,
+    and a launch-bound model shows that CPU time in its forwards. The block's
+    own exceptions pass through; the profiler's go to ``sink.on_error``.
+    """
 
     __slots__ = ("_owner", "_method", "_saved")
 
-    def __init__(self, owner: Any, method: str, hooks: _BlockHooks) -> None:
+    def __init__(self, owner: Any, method: str, sink: EventSink, name: str, layer: int) -> None:
         self._owner = owner
         self._method = method
         self._saved = owner.__dict__.get(method)
         original = getattr(owner, method)
+        fwd, bwd = module_segment(name, False), module_segment(name, True)
 
         def timed(*args: Any, **kwargs: Any) -> Any:
-            hooks.pre(owner, args, kwargs)
-            output = original(*args, **kwargs)
-            hooks.post(owner, args, kwargs, output)
+            start = _open(sink)
+            try:
+                output = original(*args, **kwargs)
+            except BaseException:
+                if start is not None:
+                    sink.discard_event(start)
+                raise
+            if start is not None and _close(sink, fwd, layer, start):
+                _bracket_backward(sink, bwd, layer, args[0] if args else kwargs.get("hidden_states"), output)
             return output
 
         setattr(owner, method, timed)
@@ -165,6 +173,32 @@ def _grad_tensor(value: Any) -> Any:
     if isinstance(value, (tuple, list)):
         value = value[0] if value else None
     return value if getattr(value, "requires_grad", False) else None
+
+
+def _bracket_backward(sink: EventSink, segment: int, layer: int, source: Any, output: Any) -> None:
+    """Bracket the backward of one call, from the gradient of its output to
+    that of its input ``source``, when both take part in it."""
+    output, source = _grad_tensor(output), _grad_tensor(source)
+    if output is None or source is None:
+        return
+    try:
+        bracket = _BackwardBracket(sink, segment, layer)
+        _on_gradient(output, bracket.open)
+        _on_gradient(source, bracket.close)
+    except Exception as exc:
+        sink.on_error("modules", exc)
+
+
+def _on_gradient(tensor: Any, hook: Any) -> None:
+    """Call ``hook`` when the gradient of ``tensor`` arrives.
+
+    A non-leaf tensor's hooks run just before its ``grad_fn`` does, so the hook
+    goes on that node, where it is cheaper to register.
+    """
+    if tensor.grad_fn is None:
+        tensor.register_hook(hook)
+    else:
+        tensor.grad_fn.register_prehook(hook)
 
 
 def _open(sink: EventSink) -> Any:
@@ -189,45 +223,6 @@ def _close(sink: EventSink, segment: int, layer: int, start: Any) -> bool:
         sink.discard_event(start)
         sink.on_error("modules", exc)
     return False
-
-
-class _BlockHooks:
-    """Forward bracket of one block, and the gradient hooks that bracket its
-    backward.
-
-    Never raises into the model: failures go to ``sink.on_error``.
-    """
-
-    __slots__ = ("_sink", "_fwd", "_bwd", "_layer", "_start", "_input")
-
-    def __init__(self, sink: EventSink, fwd: int, bwd: int, layer: int) -> None:
-        self._sink = sink
-        self._fwd = fwd
-        self._bwd = bwd
-        self._layer = layer
-        self._start: Any = None
-        self._input: Any = None
-
-    def pre(self, module: Any, args: tuple, kwargs: dict) -> None:
-        if self._start is not None:
-            self._sink.discard_event(self._start)
-        self._start = _open(self._sink)
-        self._input = _grad_tensor(args[0] if args else kwargs.get("hidden_states"))
-
-    def post(self, module: Any, args: tuple, kwargs: dict, output: Any) -> None:
-        start, self._start = self._start, None
-        source, self._input = self._input, None
-        if start is None or not _close(self._sink, self._fwd, self._layer, start):
-            return
-        result = _grad_tensor(output)
-        if result is None or source is None:
-            return
-        try:
-            backward = _BackwardBracket(self._sink, self._bwd, self._layer)
-            result.register_hook(backward.open)
-            source.register_hook(backward.close)
-        except Exception as exc:
-            self._sink.on_error("modules", exc)
 
 
 class _BackwardBracket:
