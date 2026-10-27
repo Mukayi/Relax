@@ -79,6 +79,34 @@ class _Dispatcher:
         return hidden_states * 1.0
 
 
+class _Exchange(torch.autograd.Function):
+    """Stand-in for an all-to-all: passes the tensor through its own autograd
+    node and logs the sink's clock when its backward runs."""
+
+    @staticmethod
+    def forward(ctx, tensor, sink, log, name):
+        ctx.sink, ctx.log, ctx.name = sink, log, name
+        return tensor.clone()
+
+    @staticmethod
+    def backward(ctx, grad):
+        ctx.log.append((ctx.name, ctx.sink.record_event()))
+        return grad, None, None, None
+
+
+class _ExchangingDispatcher(_Dispatcher):
+    """Exchanges the tokens, then the probabilities, each through its own node,
+    like Megatron's all-to-all dispatcher; backward runs the probabilities'
+    exchange first."""
+
+    def __init__(self, sink, log):
+        self._sink, self._log = sink, log
+
+    def token_dispatch(self, hidden_states, probs):
+        tokens = _Exchange.apply(hidden_states, self._sink, self._log, "tokens")
+        return tokens, _Exchange.apply(probs, self._sink, self._log, "probs")
+
+
 class _Experts(nn.Module):
     def __init__(self):
         super().__init__()
@@ -104,6 +132,18 @@ class _RoutedMoELayer(nn.Module):
         tokens, probs = self.token_dispatcher.token_dispatch(hidden_states.clone(), probs)
         output, _ = self.experts(tokens, probs)
         output = self.token_dispatcher.token_combine(output).view_as(hidden_states)
+        return output + self.shared_experts(hidden_states), None
+
+
+class _SortingMoELayer(_RoutedMoELayer):
+    """With several experts per rank, Megatron sorts the exchanged tokens and
+    probabilities by expert before the experts, and back after them."""
+
+    def forward(self, hidden_states, padding_mask=None):
+        probs = self.router(hidden_states)
+        tokens, probs = self.token_dispatcher.token_dispatch(hidden_states.clone(), probs)
+        output, _ = self.experts(tokens.flip(0), probs.flip(0))
+        output = self.token_dispatcher.token_combine(output.flip(0)).view_as(hidden_states)
         return output + self.shared_experts(hidden_states), None
 
 
@@ -199,6 +239,31 @@ def test_the_parts_of_a_moe_layer_nest_inside_it_forward_and_backward_and_leave_
 
     timers.detach()
     assert "token_dispatch" not in model[0].mlp.token_dispatcher.__dict__
+
+
+# With one expert per rank the experts take the exchanged tensors themselves.
+@pytest.mark.parametrize("layer_class", [_RoutedMoELayer, _SortingMoELayer], ids=["one_expert_per_rank", "sorted"])
+def test_the_dispatch_backward_holds_both_exchanges_and_the_experts_backward_neither(layer_class):
+    torch.manual_seed(0)
+    sink, exchanges = _Sink(), []
+    moe = layer_class()
+    moe.token_dispatcher = _ExchangingDispatcher(sink, exchanges)
+    model = nn.Sequential(_Layer(1, mlp=moe))
+    x = torch.randn(2, 4, requires_grad=True)
+    _run(model, x)
+    expected = [p.grad.clone() for p in model.parameters()]
+    model.zero_grad()
+    exchanges.clear()
+
+    ModuleTimers([model], sink).attach()
+    _run(model, x)
+    spans = {name: (start, end) for name, _, start, end in sink.pushed}
+    start, end = spans["dispatch_bwd"]
+    assert [name for name, _ in exchanges] == ["probs", "tokens"]
+    assert all(start < at < end for _, at in exchanges), (spans, exchanges)
+    assert spans["experts_bwd"][1] < exchanges[0][1], (spans, exchanges)
+    assert all(torch.equal(p.grad, e) for p, e in zip(model.parameters(), expected))
+    assert (sink.discarded, sink.errors) == ([], [])
 
 
 def test_a_method_spec_finds_nothing_on_an_object_without_the_method():
