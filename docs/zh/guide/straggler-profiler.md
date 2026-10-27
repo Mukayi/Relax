@@ -199,8 +199,9 @@ primary 自己的 CPU 侧计时（例如 `actor_train`、每个 micro-batch 的 
 ## 限制
 
 - 计时复用 Megatron 已有的计时点。窗口统计里 attention、MoE、head / logits、MTP 的内部都包含在 `fwd` / `bwd` 中，`modules` 级别只在 trace 里给出每层 attention、MLP / MoE 和 MoE 层内各部分的耗时；EP all-to-all 计入计算时间；不给真实的通信计算重叠比例，`dp_grad_sync` 变小不能理解为重叠变好。
-- 同一 TP 组的 rank 在前向 / 反向里互相等待，其中一个变慢时整组都会被报出；所有 rank 同时变慢时（整机降频、共享存储抖动）发现不了。
+- 同一 TP 组的 rank 在前向 / 反向里互相等待，其中一个变慢时整组都会被报出；所有 rank 同时变慢时（整机降频、共享存储抖动、整组通信变慢）发现不了。
 - PP 阶段拆分、trace 里的阶段命名和气泡推算只适用于非交错 1F1B，VPP 的收发只计入 `pp_recv`。VPP 下的 micro-batch 序号和模型块按 Megatron 的交错调度表（`get_schedule_table`，用模型自己的 config 生成）由调用顺序换算；`combined_1f1b` 的训练调用把前向和反向合并执行，不编号。
 - 跨卡对齐依赖各 rank 的墙钟，跨机器时受 NTP 精度影响，误差见日志 `other metrics` 一行里的 `trace/align_spread_ms`。窗口只有 1 个 rollout 时，采样步可能来不及读完，这个窗口就没有 trace。CUDA graph 捕获期间不计时。
 - 告警有延迟：默认参数下从开始变慢到告警约 21–30 个 rollout。调小 `REPORT_INTERVAL` 或 `PERSIST_WINDOWS` 能更早告警，但更容易被一次性抖动触发。
+- 计时依赖 Megatron 的计时接口（`config.timers`）：不认识的计时点名字会打一条警告，这一段不计时；Megatron 若调用 `Timers.log` / `write`，或给 `start` / `stop` 传入新参数，开启时会直接报错。关闭 profiler（`RELAX_STRAGGLER_PROFILER=0`）即恢复 `config.timers = None`。
 - 某个 rank 进程整个消失时，其余 rank 的每次 gather 都要等到 `RELAX_STRAGGLER_GATHER_TIMEOUT_S` 超时，失败多次后各自关闭分析器。
