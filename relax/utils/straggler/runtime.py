@@ -41,7 +41,14 @@ PROFILED_ROLES: frozenset[str] = frozenset({"actor"})
 
 
 def timing_event_factory() -> Callable[[], Any]:
-    """Build timing events of the active accelerator."""
+    """Build timing events of the active accelerator.
+
+    On CUDA they are ``torch.Event``, whose ``record`` finds the current stream
+    in C++; ``torch.cuda.Event.record`` looks it up in Python, several
+    microseconds more per record.
+    """
+    if device.get_device_name() == "cuda" and hasattr(torch, "Event"):
+        return partial(torch.Event, device="cuda", enable_timing=True)
     return partial(device.device_module.Event, enable_timing=True)
 
 

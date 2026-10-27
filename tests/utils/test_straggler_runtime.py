@@ -83,6 +83,7 @@ def _use_backend(monkeypatch, backend, available=True):
 
     monkeypatch.setattr(device, "device_module", backend)
     monkeypatch.setattr(device, "is_available", lambda: available)
+    monkeypatch.setattr(device, "get_device_name", lambda: "npu")
 
 
 def test_timing_events_come_from_the_active_accelerator(monkeypatch):
@@ -90,6 +91,17 @@ def test_timing_events_come_from_the_active_accelerator(monkeypatch):
     _use_backend(monkeypatch, backend)
     runtime.timing_event_factory()()
     assert backend.events == [{"enable_timing": True}]
+
+
+def test_timing_events_on_cuda_are_device_generic_events(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from relax.utils import device
+
+    built = []
+    monkeypatch.setattr(device, "get_device_name", lambda: "cuda")
+    monkeypatch.setattr(torch, "Event", lambda **kwargs: built.append(kwargs))
+    runtime.timing_event_factory()()
+    assert built == [{"device": "cuda", "enable_timing": True}]
 
 
 @pytest.mark.parametrize(
