@@ -119,6 +119,7 @@ def test_resident_sft_preserves_hooks_across_single_step_calls(monkeypatch, enab
         has_conditional_branch_sync=lambda _: False,
         finalize_model_grads=lambda *_: None,
         timer=lambda *_args, **_kwargs: nullcontext(),
+        straggler_timers=lambda _name: None,
         train_one_step=train_step,
         log_step_peak_memory=lambda *_args: nullcontext(),
         torch=SimpleNamespace(
