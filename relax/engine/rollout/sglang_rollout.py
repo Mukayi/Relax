@@ -46,8 +46,21 @@ from relax.utils.http_utils import (
 )
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import SingletonMeta, load_function
+from relax.utils.opd.opd_multimodal import (
+    get_image_token_id,
+    image_inputs,
+    validate_image_input_ids,
+    validate_prompt_token_ids,
+)
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
+from relax.utils.score_centering import (
+    append_score_centering_candidates,
+    configure_score_centering_request,
+    parse_score_centering_response,
+    resolve_score_centering_vocab_size,
+    score_centering_enabled,
+)
 from relax.utils.timer import Timer
 from relax.utils.training.eval_config import EvalDatasetConfig
 from relax.utils.training.train_dump_utils import save_debug_rollout_data
@@ -88,6 +101,8 @@ class GenerateState(metaclass=SingletonMeta):
         prepare_model_maybe_update_args(args, completeness="metadata")
         self.tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
         self.processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
+        if score_centering_enabled(args):
+            resolve_score_centering_vocab_size(args)
 
         # OPD manager (singleton — one OpdManager per GenerateState)
         self.opd_manager = opd.OpdManager(args) if opd.is_opd_enabled(args) else None
@@ -221,6 +236,9 @@ async def _run_image_processor(
     elapsed_seconds)."""
     t_start = monotonic()
     loop = asyncio.get_running_loop()
+    # The shared media may already hold the OPD transport cache. It is not an
+    # HF processor input and must not cross the processor worker boundary.
+    multimodal_inputs = {key: value for key, value in multimodal_inputs.items() if key != "_opd_image_b64_cache"}
 
     if state.processor_pool is not None:
         mm_inputs_ipc = prepare_mm_inputs_for_ipc(multimodal_inputs)
@@ -380,6 +398,17 @@ async def generate(
     _has_media = sample.multimodal_inputs is not None and any(
         sample.multimodal_inputs.get(k) for k in ("images", "videos", "audio")
     )
+    native_image_opd = bool(state.opd_manager and not evaluation and _has_media)
+    if native_image_opd:
+        image_inputs(sample.multimodal_inputs)
+    if (
+        state.opd_manager
+        and not evaluation
+        and args.use_slime_router
+        and "RadixTreeMiddleware" in args.slime_router_middleware_paths
+        and (_has_media or image_inputs(sample.teacher_multimodal_inputs))
+    ):
+        raise ValueError("Native image OPD requires token-preserving routing; RadixTreeMiddleware uses text lookup.")
     from relax.utils.data.kimi_k3 import encode_kimi_k3_rollout_prompt, is_kimi_k3_tokenizer
 
     if is_kimi_k3_tokenizer(state.tokenizer):
@@ -418,6 +447,7 @@ async def generate(
 
     if state.opd_manager and not evaluation:
         state.opd_manager.before_rollout(payload)
+    sc_sampling_mode = configure_score_centering_request(args, payload) if not evaluation else None
     # LoRA adapter mode: route generation through the trained adapter registered on the engine
     # (see UpdateWeightFromTensor._push_lora_adapter). Without lora_path the engine serves the
     # base model only and rollouts would not reflect the trained policy.
@@ -451,6 +481,16 @@ async def generate(
         if not sample.rollout_tokens:
             sample.rollout_tokens = tokenizer_prompt_ids
 
+    if native_image_opd:
+        validate_image_input_ids(
+            payload["input_ids"],
+            sample.tokens,
+            sample.response_length,
+            len(image_inputs(sample.multimodal_inputs)),
+            get_image_token_id(state.processor, state.tokenizer),
+        )
+        payload["return_prompt_token_ids"] = True
+
     # Provide a routing key so cache-affinity routers pin related requests to the same
     # engine and reuse its prefix/KV cache.
     headers = None
@@ -465,11 +505,33 @@ async def generate(
     output = await _post_generation(args, state, url, payload, headers, evaluation)
     _t_generate = monotonic() - _t_generate_start
 
+    sc_result = None
+    if sc_sampling_mode is not None:
+        sc_result = parse_score_centering_response(
+            output["meta_info"],
+            args.rollout_top_logprobs_num,
+            sampling_mode=sc_sampling_mode,
+            expected_tokens=output.get("output_ids"),
+            vocab_size=resolve_score_centering_vocab_size(args),
+        )
+    if native_image_opd:
+        validate_prompt_token_ids(output, sample.tokens)
+
     _t_post_generate_start = monotonic()
     if args.use_slime_router and "RadixTreeMiddleware" in args.slime_router_middleware_paths:
         from relax.engine.router.middleware.radix_tree_middleware import postprocess_sample_with_radix_tree
 
         sample = await postprocess_sample_with_radix_tree(args, sample, output)
+        if sc_result is not None:
+            sc_tokens, sc_sampled, sc_ids, sc_logprobs = sc_result
+            response_tokens = sample.tokens[-sample.response_length :] if sample.response_length else []
+            if response_tokens != sc_tokens:
+                raise ValueError(
+                    "Score Centering cannot align generation-time candidates with the radix-tree retrieved trajectory"
+                )
+            sample.rollout_log_probs = sc_sampled
+            sample.rollout_topk_token_ids = sc_ids
+            sample.rollout_topk_log_probs = sc_logprobs
     else:
         if "output_token_logprobs" in output["meta_info"]:
             new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
@@ -482,6 +544,19 @@ async def generate(
             new_response_tokens, new_response_log_probs = state.opd_manager.parse_rollout_logprobs(
                 output["meta_info"], new_response_tokens, new_response_log_probs
             )
+
+        if sc_result is not None:
+            new_response_tokens, new_response_log_probs, _, _ = sc_result
+            # Keep an independent copy to detect in-place token sanitization.
+            sc_tokens_before_sanitization = list(new_response_tokens)
+
+        if native_image_opd:
+            media_token_ids = {
+                getattr(state.tokenizer, name, None) for name in ("image_token_id", "audio_token_id", "video_token_id")
+            }
+            media_token_ids.add(get_image_token_id(state.processor, state.tokenizer))
+            if any(token in media_token_ids for token in new_response_tokens):
+                raise ValueError("Native image OPD cannot replace sampled media tokens; configure a stop token.")
 
         while hasattr(state.tokenizer, "image_token_id") and state.tokenizer.image_token_id in new_response_tokens:
             index = new_response_tokens.index(state.tokenizer.image_token_id)
@@ -522,6 +597,10 @@ async def generate(
                 new_response_tokens = sanitized
 
         # Update sample with tokens directly - avoiding re-tokenization
+        if sc_result is not None and new_response_tokens != sc_tokens_before_sanitization:
+            raise ValueError(
+                "Score Centering requires unchanged generated token IDs to preserve behavior probabilities"
+            )
         sample.tokens = sample.tokens + new_response_tokens
         sample.rollout_tokens = sample.rollout_tokens + new_response_tokens
         sample.response_length += len(new_response_tokens)
@@ -535,13 +614,15 @@ async def generate(
         if sample.rollout_log_probs is None:
             sample.rollout_log_probs = []
         sample.rollout_log_probs += new_response_log_probs
+        if sc_result is not None:
+            append_score_centering_candidates(sample, sc_result[2], sc_result[3])
 
         if state.opd_manager and not evaluation:
             state.opd_manager.after_rollout(sample, output)
 
     if "routed_experts" in output["meta_info"]:
         sample.rollout_routed_experts = np.frombuffer(
-            pybase64.b64decode(output["meta_info"]["routed_experts"].encode("ascii")),
+            pybase64.b64decode(output["meta_info"]["routed_experts"], validate=True),
             dtype=np.int32,
         ).reshape(
             len(sample.tokens) - 1,
@@ -1448,7 +1529,14 @@ def generate_rollout(
     # prefetched generation is almost always aborted by the next step's pause_generation and its
     # truncated samples would pollute the next rollout. Other modes keep the optimization.
     _lora_adapter_mode = getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_adapter_mode", False)
-    if not args.fully_async and not _lora_adapter_mode:
+    # Match Rollout._maybe_save_data: prefetch advances the saved data cursor, but its
+    # ObjectRef is not checkpointed. Leave the next batch unread at save boundaries.
+    _save_data = (
+        args.save is not None
+        and args.save_interval is not None
+        and (args.rotate_ckpt or (rollout_id + 1) % args.save_interval == 0 or rollout_id + 1 == args.num_rollout)
+    )
+    if not args.fully_async and not _lora_adapter_mode and not _save_data:
         state = GenerateState(args)
         state.prefetched_samples_ref = data_buffer.get_samples.remote(args.over_sampling_batch_size)
         logger.info(f"Rollout step {rollout_id}: pre-submitted data fetch for next step")

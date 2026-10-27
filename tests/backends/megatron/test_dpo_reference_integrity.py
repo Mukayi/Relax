@@ -89,6 +89,7 @@ def reference_actor_methods():
     tree = ast.parse(source.read_text())
     actor = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "MegatronTrainRayActor")
     method_names = {
+        "_flush_resident_sft_parameters",
         "_switch_model",
         "_is_standard_dpo",
         "_assert_dpo_reference_identity",
@@ -118,6 +119,7 @@ def reference_actor_methods():
     ("source", "ref_ckpt_step", "outcome", "schema_version"),
     [
         ("hf", None, "success", None),
+        ("hf_iteration", None, "success", None),
         ("hf", 7, "success", 1),
         ("hf", None, "success", 2),
         ("hf", 7, "loader_failure", None),
@@ -148,8 +150,11 @@ def test_reference_rebuild_preserves_actor_and_optimizer(
     reference_root.mkdir()
     reference_path = reference_root
     expected_step = ref_ckpt_step
-    if source == "hf":
-        (reference_root / "config.json").write_text("{}", encoding="utf-8")
+    if source in {"hf", "hf_iteration"}:
+        if source == "hf_iteration":
+            reference_path = reference_root / "iter_0000082"
+            reference_path.mkdir()
+        (reference_path / "config.json").write_text("{}", encoding="utf-8")
     else:
         latest = "0" if ref_ckpt_step == 0 else "3"
         (reference_root / "latest_checkpointed_iteration.txt").write_text(latest, encoding="utf-8")
@@ -200,7 +205,7 @@ def test_reference_rebuild_preserves_actor_and_optimizer(
             instance.args.no_load_optim,
             instance.args.no_load_rng,
             instance.args.finetune,
-        ) == (str(reference_root), True, True, True)
+        ) == (str(reference_path if source == "hf_iteration" else reference_root), True, True, True)
         assert instance.args.ckpt_step == expected_step
         assert instance.args.non_persistent_ckpt_type is None
         parameter.data.fill_(99)

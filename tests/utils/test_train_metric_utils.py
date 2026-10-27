@@ -90,6 +90,15 @@ def test_log_perf_data_raw_reports_mfu_for_known_peak(monkeypatch):
     assert logged_metrics["perf/mfu/actor_train"] == 0.75
 
 
+def test_log_perf_data_raw_reports_baseline_per_card_throughput(monkeypatch):
+    logged_metrics = _collect_perf_metrics(monkeypatch, 100.0)
+
+    assert logged_metrics["perf/actor_train_tok_per_s"] == 150.0
+    assert logged_metrics["perf/actor_train_tok_per_s_per_card"] == 75.0
+    assert logged_metrics["perf/step_token_per_s_per_card"] == 50.0
+    assert logged_metrics["perf/step_resp_token_per_s_per_card"] == 25.0
+
+
 @pytest.mark.parametrize(("tp", "last_pp", "dp"), list(itertools.product([0, 1], [True, False], [0, 1])))
 def test_is_metrics_primary_rank_is_tp0_last_pp_stage_dp0(monkeypatch, tp, last_pp, dp):
     core = ModuleType("megatron.core")

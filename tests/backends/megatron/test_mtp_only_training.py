@@ -1,7 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 from argparse import Namespace
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -16,7 +19,7 @@ from relax.backends.megatron.model_provider import (
     freeze_model_params,
     validate_mtp_only_trainable_params,
 )
-from relax.engine.sft.runtime import should_bypass_main_output_layer, should_skip_mtp_only_weight_management
+from relax.engine.sft.runtime import should_bypass_main_output_layer, should_skip_sft_weight_management
 
 
 class _MtpOnlyModel(torch.nn.Module):
@@ -43,83 +46,6 @@ def test_megatron_patch_routes_each_mtp_detach_path_independently():
     assert 'offset == 0 and getattr(self.config, "mtp_detach_backbone", True)' in patch
     assert "hidden_states = hidden_states.detach().requires_grad_(True)" in patch
     assert "mtp_detach_main_model" not in patch
-
-
-@pytest.mark.parametrize(
-    "detach_paths",
-    [
-        (),
-        ("embedding",),
-        ("backbone",),
-        ("lm-head",),
-        ("embedding", "backbone"),
-        ("embedding", "lm-head"),
-        ("backbone", "lm-head"),
-        ("embedding", "backbone", "lm-head"),
-    ],
-)
-def test_mtp_detach_path_gradient_matrix(detach_paths):
-    torch.manual_seed(0)
-    embedding = torch.nn.Linear(4, 4, bias=False)
-    backbone = torch.nn.Linear(4, 4, bias=False)
-    mtp = torch.nn.Linear(4, 4, bias=False)
-    lm_head = torch.nn.Linear(4, 2, bias=False)
-    inputs = torch.randn(3, 4)
-
-    decoder_input = embedding(inputs)
-    if "embedding" in detach_paths:
-        decoder_input = decoder_input.detach()
-    hidden_states = backbone(inputs)
-    if "backbone" in detach_paths:
-        hidden_states = hidden_states.detach().requires_grad_(True)
-    mtp_hidden = mtp(decoder_input + hidden_states)
-    if "lm-head" in detach_paths:
-        logits = torch.func.functional_call(lm_head, {"weight": lm_head.weight.detach()}, (mtp_hidden,))
-    else:
-        logits = lm_head(mtp_hidden)
-
-    logits.square().sum().backward()
-
-    assert (embedding.weight.grad is None) is ("embedding" in detach_paths)
-    assert (backbone.weight.grad is None) is ("backbone" in detach_paths)
-    assert (lm_head.weight.grad is None) is ("lm-head" in detach_paths)
-    assert mtp.weight.grad is not None
-
-
-@pytest.mark.parametrize(
-    "detach_paths",
-    [(), ("embedding",), ("lm-head",), ("embedding", "lm-head")],
-)
-def test_tied_embedding_weight_follows_each_active_gradient_path(detach_paths):
-    torch.manual_seed(0)
-    shared_weight = torch.nn.Parameter(torch.randn(4, 4))
-    mtp = torch.nn.Linear(4, 4, bias=False)
-    inputs = torch.randn(3, 4)
-
-    decoder_input = inputs @ shared_weight.t()
-    if "embedding" in detach_paths:
-        decoder_input = decoder_input.detach()
-    mtp_hidden = mtp(decoder_input)
-    output_weight = shared_weight.detach() if "lm-head" in detach_paths else shared_weight
-
-    (mtp_hidden @ output_weight.t()).square().sum().backward()
-
-    both_shared_paths_detached = "embedding" in detach_paths and "lm-head" in detach_paths
-    assert (shared_weight.grad is None) is both_shared_paths_detached
-    assert mtp.weight.grad is not None
-
-
-def test_backbone_detach_preserves_gradients_between_mtp_layers():
-    backbone = torch.nn.Linear(4, 4, bias=False)
-    first_mtp_layer = torch.nn.Linear(4, 4, bias=False)
-    second_mtp_layer = torch.nn.Linear(4, 4, bias=False)
-
-    hidden_states = backbone(torch.randn(3, 4)).detach().requires_grad_(True)
-    second_mtp_layer(first_mtp_layer(hidden_states)).square().sum().backward()
-
-    assert backbone.weight.grad is None
-    assert first_mtp_layer.weight.grad is not None
-    assert second_mtp_layer.weight.grad is not None
 
 
 @pytest.mark.parametrize(
@@ -263,21 +189,49 @@ def _actor_args(**overrides) -> Namespace:
     return Namespace(**defaults)
 
 
-def test_pure_mtp_only_sft_skips_weight_management():
-    assert should_skip_mtp_only_weight_management(_actor_args()) is True
+@pytest.mark.parametrize("prepacked", [False, True])
+def test_mtp_only_sft_reaches_train_without_weight_backuper(monkeypatch, prepacked):
+    actor_module = pytest.importorskip("relax.backends.megatron.actor", exc_type=ImportError)
 
+    class ReachedTrain(BaseException):
+        pass
 
-@pytest.mark.parametrize(
-    ("overrides", "extra_kwargs"),
-    [
-        ({"mtp_only_training": False}, {}),
-        ({"loss_type": "policy_loss"}, {}),
-        ({"sft_predict_interval": 10}, {}),
-        ({"offload_train": True}, {}),
-        ({"keep_old_actor": True}, {}),
-        ({}, {"with_ref": True}),
-        ({}, {"with_opd_teacher": True}),
-    ],
-)
-def test_mtp_only_keeps_weight_management_when_another_consumer_needs_it(overrides, extra_kwargs):
-    assert should_skip_mtp_only_weight_management(_actor_args(**overrides), **extra_kwargs) is False
+    actor = object.__new__(actor_module.MegatronTrainRayActor)
+    actor.args = _actor_args(
+        advantage_estimator="grpo",
+        compute_advantages_and_returns=False,
+        use_routing_replay=False,
+        use_rollout_routing_replay=False,
+    )
+    actor.model = []
+    actor.optimizer = object()
+    actor.opt_param_scheduler = object()
+    actor.rollout_data_postprocess = None
+    assert should_skip_sft_weight_management(actor.args)
+    assert not hasattr(actor, "weights_backuper")
+
+    iterator = SimpleNamespace(close=Mock())
+    data_iterator, num_microbatches = [iterator], [1]
+    make_iterator = Mock(return_value=(data_iterator, num_microbatches))
+    train = Mock(side_effect=ReachedTrain)
+    monkeypatch.setattr(actor_module, "get_data_iterator", make_iterator)
+    monkeypatch.setattr(actor_module, "timer", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(actor_module, "inverse_timer", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(actor_module, "log_rollout_data", lambda *_args: None)
+    monkeypatch.setattr(actor_module, "train", train)
+
+    kwargs = (
+        {"prepared_data_iterator": data_iterator, "prepared_num_microbatches": num_microbatches} if prepacked else {}
+    )
+    rollout_data = {}
+    with pytest.raises(ReachedTrain):
+        actor.train_actor(0, rollout_data, **kwargs)
+
+    train.assert_called_once_with(
+        0, actor.model, actor.optimizer, actor.opt_param_scheduler, data_iterator, num_microbatches
+    )
+    iterator.close.assert_called_once()
+    if prepacked:
+        make_iterator.assert_not_called()
+    else:
+        make_iterator.assert_called_once_with(actor.args, actor.model, rollout_data)

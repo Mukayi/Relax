@@ -8,11 +8,13 @@ import time
 from argparse import Namespace
 from collections import deque
 from contextlib import asynccontextmanager
+from functools import partial
 from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
+import numpy as np
 import pytest
 
 from relax.agentic.pipeline import (
@@ -25,7 +27,12 @@ from relax.agentic.pipeline import (
 from relax.agentic.pipeline import runtime as runtime_mod
 from relax.agentic.pipeline.prepare import PrepareDomain
 from relax.agentic.pipeline.reward import RewardDomain
-from relax.agentic.pipeline.runtime import RuntimeDomain, SGLangBackendAdapter, _build_session_specs
+from relax.agentic.pipeline.runtime import (
+    BackendGenerateResult,
+    RuntimeDomain,
+    SGLangBackendAdapter,
+    _build_session_specs,
+)
 from relax.agentic.pipeline.transfer import TransferBatch, TransferDomain
 from relax.agentic.session.admission import (
     AdmissionAction,
@@ -351,6 +358,52 @@ def test_session_forest_build_sample_and_session_spec() -> None:
     assert session_spec.input_payload["messages"] == [{"role": "user", "content": "hello"}]
 
 
+def test_score_centering_forest_preserves_multiturn_and_branch_candidates() -> None:
+    forest, initial_obs = _forest_with_initial_obs(
+        session_id="sc-branches",
+        messages=[{"role": "user", "content": "prompt"}],
+        train_token_delta=[10, 11],
+        rollout_token_delta=[10, 11],
+    )
+    first = forest.append_resp(
+        parent_state_hash=initial_obs.state_hash,
+        rollout_id=0,
+        abort_count=0,
+        messages_delta=[{"role": "assistant", "content": "a"}],
+        token_delta=[97],
+        logprob_delta=[-1.0],
+        topk_token_ids_delta=np.array([[97, 98]], dtype=np.int32),
+        topk_logprob_delta=np.array([[-1.0, -2.0]], dtype=np.float32),
+    )
+    observation = forest.append_obs(
+        parent_state_hash=first.state_hash,
+        rollout_id=0,
+        abort_count=0,
+        messages_delta=[{"role": "tool", "tool_call_id": "call", "content": "ok"}],
+        train_token_delta=[20, 21],
+        rollout_token_delta=[20, 21],
+    )
+    for token in (98, 99):
+        leaf = forest.append_resp(
+            parent_state_hash=observation.state_hash,
+            rollout_id=1,
+            abort_count=1,
+            messages_delta=[{"role": "assistant", "content": chr(token)}],
+            token_delta=[token],
+            logprob_delta=[-0.5],
+            topk_token_ids_delta=np.array([[token, 100]], dtype=np.int32),
+            topk_logprob_delta=np.array([[-0.5, -2.5]], dtype=np.float32),
+        )
+        sample = forest.build_sample(leaf_state_hash=leaf.state_hash, tokenizer=_FakeTokenizer())
+        assert sample.tokens == [10, 11, 97, 20, 21, token]
+        assert sample.loss_mask == [1, 0, 0, 1]
+        assert sample.rollout_log_probs == [-1.0, 0.0, 0.0, -0.5]
+        np.testing.assert_array_equal(sample.rollout_topk_token_ids, [[97, 98], [-1, -1], [-1, -1], [token, 100]])
+        np.testing.assert_array_equal(
+            sample.rollout_topk_log_probs, [[-1.0, -2.0], [-np.inf, -np.inf], [-np.inf, -np.inf], [-0.5, -2.5]]
+        )
+
+
 async def test_prepare_gate_defers_unstarted_groups_and_adhoc_refills_current_gap() -> None:
     handle = SimpleNamespace(
         start_group=SimpleNamespace(remote=AsyncMock()),
@@ -646,36 +699,48 @@ def _backend_adapter(*, lifecycle_enabled: bool) -> SGLangBackendAdapter:
     return adapter
 
 
-async def test_generate_sends_session_id_only_when_lifecycle_enabled(monkeypatch) -> None:
-    payloads: list[dict[str, Any]] = []
+@pytest.mark.parametrize("lifecycle_enabled", [False, True])
+async def test_generate_preserves_history_routing_and_session_lifecycle(monkeypatch, lifecycle_enabled) -> None:
+    calls = []
 
     async def fake_post(url, payload, headers=None, fail_fast_no_workers=False):
-        del url, headers, fail_fast_no_workers
-        payloads.append(dict(payload))
+        calls.append((url, payload, headers, fail_fast_no_workers))
         return {
             "output_ids": [4],
-            "meta_info": {"output_token_logprobs": [], "finish_reason": {"type": "stop"}},
+            "meta_info": {"id": "r", "weight_version": "7", "finish_reason": {"type": "stop"}},
         }
 
     monkeypatch.setattr(runtime_mod, "post", fake_post)
-    adapter = _backend_adapter(lifecycle_enabled=True)
-    await adapter.generate(
+    adapter = _backend_adapter(lifecycle_enabled=lifecycle_enabled)
+    adapter._args.sglang_router_ip = None
+    shard = object.__new__(AgenticSessionShard.__ray_metadata__.modified_class)
+    shard.args = adapter._args
+    await shard.set_router_address("10.0.0.1", 8000)
+    await shard.set_router_address("10.0.0.1", 8000)
+    with pytest.raises(RuntimeError, match="Cannot replace"):
+        await shard.set_router_address("other-router", 8000)
+    adapter._args.sglang_router_policy = "consistent_hashing"
+    adapter._worker_urls = AsyncMock(side_effect=AssertionError("generation must use the router"))
+    result = await adapter.generate(
         input_ids=[1, 2, 3],
         sampling_params={"max_new_tokens": 4},
-        session_id="session-9",
-        request_id="request-1:0",
+        session_id="s",
+        request_id="r",
+        fail_fast_no_workers=True,
     )
-    assert payloads[-1]["session_id"] == "session-9"
-    assert payloads[-1]["rid"] == "request-1:0"
 
-    adapter._session_lifecycle = False
-    await adapter.generate(
-        input_ids=[1, 2, 3],
-        sampling_params={"max_new_tokens": 4},
-        session_id="session-9",
-        request_id="request-2:0",
-    )
-    assert "session_id" not in payloads[-1]
+    assert len(calls) == 1
+    url, payload, headers, fail_fast = calls[0]
+    assert url == "http://10.0.0.1:8000/generate"
+    assert payload["input_ids"] == [1, 2, 3] and payload["rid"] == "r"
+    assert "session_params" not in payload
+    if lifecycle_enabled:
+        assert payload["session_id"] == "s"
+    else:
+        assert "session_id" not in payload
+    assert headers == {"X-SMG-Routing-Key": "s"} and fail_fast is True
+    assert result.meta_info["weight_version"] == "7"
+    adapter._worker_urls.assert_not_awaited()
 
 
 async def test_generate_maps_sglang_499_to_empty_abort(monkeypatch) -> None:
@@ -700,6 +765,47 @@ async def test_generate_maps_sglang_499_to_empty_abort(monkeypatch) -> None:
     assert result.new_tokens == []
     assert result.new_log_probs == []
     assert result.meta_info == {}
+
+
+@pytest.mark.parametrize("collect_score_centering", [True, False])
+async def test_generate_score_centering_candidates_are_training_only(monkeypatch, collect_score_centering) -> None:
+    calls = []
+
+    async def fake_post(url, payload, **kwargs):
+        calls.append(payload)
+        return {
+            "output_ids": [97],
+            "meta_info": {
+                "output_token_logprobs": [[-1.0, 97, "a"]],
+                "output_top_logprobs": [[[-1.0, 97, "a"], [-2.0, 98, "b"]]],
+                "finish_reason": {"type": "stop"},
+            },
+        }
+
+    monkeypatch.setattr(runtime_mod, "post", fake_post)
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    adapter._args.advantage_estimator = "score_centering"
+    adapter._args.rollout_top_logprobs_num = 2
+    adapter._args.rollout_temperature = 0.7
+    adapter._args.vocab_size = 96
+    adapter._args.score_centering_vocab_size = 256
+    result = await adapter.generate(
+        input_ids=[10, 11],
+        sampling_params={"temperature": 0.7, "max_new_tokens": 3},
+        session_id="sc-session",
+        request_id="sc-request",
+        collect_score_centering=collect_score_centering,
+    )
+    assert result.new_tokens == [97]
+    assert result.new_log_probs == [-1.0]
+    if collect_score_centering:
+        assert calls[0]["return_logprob"] is True
+        assert calls[0]["top_logprobs_num"] == 2
+        np.testing.assert_array_equal(result.new_topk_token_ids, [[97, 98]])
+        np.testing.assert_array_equal(result.new_topk_log_probs, [[-1.0, -2.0]])
+    else:
+        assert "top_logprobs_num" not in calls[0]
+        assert result.new_topk_token_ids is result.new_topk_log_probs is None
 
 
 async def test_close_session_fans_out_and_is_fail_open(monkeypatch) -> None:
@@ -844,6 +950,97 @@ def _admission_coordinator(*, max_wait_s: float = 30.0, capacity: int = 100):
     coordinator._cancelled_tickets = {}
     coordinator._counters = {}
     return coordinator_cls, coordinator
+
+
+async def test_admission_waits_for_router_before_starting_polling() -> None:
+    _, coordinator = _admission_coordinator()
+    coordinator._program_admission = True
+    coordinator._router_ip = None
+    coordinator._router_port = 3000
+    coordinator._poll_task = None
+    coordinator._client = SimpleNamespace(aclose=AsyncMock())
+    coordinator._reconcile_once = AsyncMock()
+    coordinator._poll_loop = AsyncMock(side_effect=asyncio.Event().wait)
+    try:
+        await coordinator.start()
+        coordinator._reconcile_once.assert_not_awaited()
+        assert coordinator._poll_task is None
+        await coordinator.set_router_address("ready-router", 3000)
+        poll_task = coordinator._poll_task
+        await coordinator.set_router_address("ready-router", 3000)
+        assert poll_task is not None and coordinator._poll_task is poll_task
+        coordinator._reconcile_once.assert_awaited_once()
+        assert (coordinator._router_ip, coordinator._router_port) == ("ready-router", 3000)
+        with pytest.raises(RuntimeError, match="Cannot replace"):
+            await coordinator.set_router_address("other-router", 3000)
+    finally:
+        await coordinator.shutdown()
+
+
+@pytest.mark.parametrize("fails", [False, True])
+async def test_runtime_router_publication_waits_for_every_owner(fails) -> None:
+    gates = [asyncio.Event() for _ in range(3)]
+
+    async def bind(index, _ip, _port):
+        await gates[index].wait()
+        if fails and index == 2:
+            raise RuntimeError("owner unavailable")
+
+    handles = [
+        SimpleNamespace(set_router_address=SimpleNamespace(remote=AsyncMock(side_effect=partial(bind, i))))
+        for i in range(3)
+    ]
+    runtime = RuntimeDomain(
+        Namespace(rollout_engine_init_timeout=1.0),
+        "train",
+        [SimpleNamespace(handle=handle) for handle in handles[:2]],
+        concurrency=1,
+        admission_coordinator=handles[2],
+    )
+    task = asyncio.create_task(runtime.bind_router("ready-router", 3000))
+    try:
+        await _wait_until(lambda: all(handle.set_router_address.remote.await_count for handle in handles))
+        gates[0].set()
+        gates[1].set()
+        await asyncio.sleep(0)
+        assert not task.done()
+        gates[2].set()
+        if fails:
+            with pytest.raises(RuntimeError, match="owner unavailable"):
+                await task
+        else:
+            await task
+        for handle in handles:
+            handle.set_router_address.remote.assert_awaited_once_with("ready-router", 3000)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("first_model_pd", [False, True])
+def test_agentic_ingress_keeps_requested_port_while_deferring_router(monkeypatch, first_model_pd) -> None:
+    from relax.agentic.session import service
+
+    rollout = ModuleType("relax.distributed.ray.rollout")
+    rollout._resolve_sglang_config = lambda _args: SimpleNamespace(
+        models=[SimpleNamespace(has_pd_disaggregation=first_model_pd), SimpleNamespace(has_pd_disaggregation=True)]
+    )
+    endpoint = (None, None) if first_model_pd else ("ingress-router", 3131)
+    rollout._start_router = MagicMock(return_value=endpoint)
+    monkeypatch.setitem(sys.modules, rollout.__name__, rollout)
+    monkeypatch.setattr(service, "AdmissionCoordinator", MagicMock())
+    monkeypatch.setattr(service, "AgenticChatAPIService", MagicMock())
+    monkeypatch.setattr(service, "create_agentic_session_shards", MagicMock(return_value=()))
+    monkeypatch.setattr(service.ray, "get", lambda _ref: None)
+    monkeypatch.setattr(service.serve, "run", MagicMock())
+    monkeypatch.setattr(service, "_DEPLOYED_ADMISSION_COORDINATOR", None)
+    args = Namespace(sglang_router_ip=None, sglang_router_port=3131)
+
+    service.deploy_agentic_chat_api_services(config=args, runtime_env={})
+
+    rollout._start_router.assert_called_once_with(args, has_pd_disaggregation=first_model_pd, force_new=False)
+    assert args.sglang_router_ip == endpoint[0]
+    assert args.sglang_router_port == 3131
 
 
 async def test_admission_coordinator_bypasses_protected_and_degraded_requests() -> None:
@@ -1042,6 +1239,8 @@ def _router_recovery_shard():
 async def test_agentic_run_ir_requeues_empty_delta_abort_without_clearing_prefix():
     shard, _group, session, ir = _router_recovery_shard()
     ir.pending_logprob_delta = [-0.5]
+    ir.pending_topk_token_ids_delta = [np.array([[300, 301]], dtype=np.int32)]
+    ir.pending_topk_logprob_delta = [np.array([[-0.5, -2.0]], dtype=np.float32)]
     ir.pending_weight_version_delta = ["v1"]
     ir.pending_spec_delta["completion_token_num"] = 1
     ir.pending_prefix_cache_delta["cached_tokens"] = 2
@@ -1057,9 +1256,49 @@ async def test_agentic_run_ir_requeues_empty_delta_abort_without_clearing_prefix
     assert list(session.queued_irs) == [ir]
     assert ir.pending_token_delta == [300] and ir.abort_count == 1
     assert ir.pending_logprob_delta == [-0.5]
+    np.testing.assert_array_equal(ir.pending_topk_token_ids_delta[0], [[300, 301]])
+    np.testing.assert_array_equal(ir.pending_topk_logprob_delta[0], [[-0.5, -2.0]])
     assert ir.pending_weight_version_delta == ["v1"]
     assert ir.pending_spec_delta["completion_token_num"] == 1
     assert ir.pending_prefix_cache_delta["cached_tokens"] == 2
+
+
+async def test_score_centering_partial_attempts_commit_aligned_candidates() -> None:
+    shard, _group, session, ir = _router_recovery_shard()
+    shard.args.agentic_reasoning_parser = None
+    shard.args.agentic_tool_call_parser = None
+    shard._generation_backend = SimpleNamespace(tokenizer=_FakeTokenizer())
+    forest, observation = _forest_with_initial_obs(
+        session_id=session.session_id,
+        messages=[{"role": "user", "content": "p"}],
+        train_token_delta=[112],
+        rollout_token_delta=[112],
+    )
+    session.forest = forest
+    ir.parent_state_hash = observation.state_hash
+    ir.pending_token_delta = []
+    for token, logprob, finish_type in ((97, -1.0, "abort"), (98, -0.5, "stop")):
+        shard._apply_generate_result(
+            ir,
+            BackendGenerateResult(
+                new_tokens=[token],
+                new_log_probs=[logprob],
+                finish_type=finish_type,
+                meta_info={"prompt_tokens": 1},
+                elapsed=0.1,
+                new_topk_token_ids=np.array([[token, 100]], dtype=np.int32),
+                new_topk_log_probs=np.array([[logprob, -2.0]], dtype=np.float32),
+            ),
+        )
+    ir.pending_status = "completed"
+    shard._terminal_response_locked(session=session, ir=ir, finish_type="stop")
+    sample = forest.build_sample(
+        leaf_state_hash=session.resp_state_hash_by_request_id[ir.request_id], tokenizer=_FakeTokenizer()
+    )
+    assert sample.tokens == [112, 97, 98]
+    assert sample.rollout_log_probs == [-1.0, -0.5]
+    np.testing.assert_array_equal(sample.rollout_topk_token_ids, [[97, 100], [98, 100]])
+    np.testing.assert_array_equal(sample.rollout_topk_log_probs, [[-1.0, -2.0], [-0.5, -2.0]])
 
 
 @pytest.mark.asyncio
@@ -1108,8 +1347,10 @@ async def test_agentic_persistent_router_503_fails_after_one_wait(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_agentic_router_503_waits_once_without_losing_prefix(monkeypatch):
+@pytest.mark.parametrize("history", [[], [100, 200]])
+async def test_agentic_router_503_waits_once_without_losing_prefix(monkeypatch, history):
     shard, _group, session, ir = _router_recovery_shard()
+    ir.history_rollout_token_prefix = history
     calls, sleeps = [], []
 
     async def generate(**kwargs):
@@ -1130,7 +1371,8 @@ async def test_agentic_router_503_waits_once_without_losing_prefix(monkeypatch):
     await task
 
     assert len(calls) == 2 and calls[0]["request_id"] == calls[1]["request_id"]
-    assert calls[0]["input_ids"] == calls[1]["input_ids"] == [300]
+    assert calls[0]["input_ids"] == calls[1]["input_ids"] == history + [300]
+    assert calls[0]["sampling_params"] == calls[1]["sampling_params"] == {"max_new_tokens": 7}
     assert sleeps == [2.0]
     assert ir.pending_token_delta == [300, 7]
     assert ir.waiter.result() == {"ok": True}
