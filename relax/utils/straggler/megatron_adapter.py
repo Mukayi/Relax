@@ -102,7 +102,7 @@ REQUIRED_TIMER_NAMES: Mapping[str, frozenset[str]] = {
 
 
 def phase_timers(sink: EventSink) -> dict[str, StragglerTimers]:
-    """The ``config.timers`` of each phase, feeding ``sink`` (the collector).
+    """The ``config.timers`` of each phase, feeding ``sink`` (the recorder).
 
     One object per phase, so that the same call sites land in different buckets
     during training and forward-only passes.

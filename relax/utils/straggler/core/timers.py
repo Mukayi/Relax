@@ -20,7 +20,7 @@ from relax.utils.straggler.core.stats import FIELD_INDEX
 
 
 class EventSink(Protocol):
-    """Describe the owner a ``_SegmentTimer`` reports to (the collector)."""
+    """Describe the owner a ``_SegmentTimer`` reports to (the recorder)."""
 
     def record_event(self) -> Any:
         """Return a timing event already recorded on the current stream, or

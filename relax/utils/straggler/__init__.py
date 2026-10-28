@@ -2,7 +2,7 @@
 """Always-on, low-overhead straggler (slow rank) analysis for the Megatron
 backend; off unless ``RELAX_STRAGGLER_PROFILER`` is set.
 
-Four parts, each importing only the ones before it (a CPU test checks):
+Its parts, each importing only the ones before it (a CPU test checks):
 
 * ``core``: data collection, the part that runs inside every training step;
   standard library only.
@@ -10,8 +10,15 @@ Four parts, each importing only the ones before it (a CPU test checks):
   torch, Megatron or other Relax imports.
 * ``megatron_adapter``: Megatron's timer names, layer blocks, parallel state
   and schedule, pinned by contract tests.
-* ``relax_integration``: settings, install, Gloo gathers, metrics, timeline;
+* ``collectives``: the dedicated Gloo group and the collectives on it; torch
+  only.
+* ``relax_integration``: settings, install, metrics, timeline;
   ``control_routes`` is the metrics service's side.
+
+Switching the level while training runs spans three of them: the control page
+and the primary rank's poller (``analysis.control``), their HTTP routes
+(``control_routes``, mounted by the metrics service) and the level request
+that the primary rank's row carries to every rank (``core.collector``).
 
 The training code calls only the functions below. They are imported on first
 use, so that importing ``core``, ``analysis`` or ``control_routes`` does not

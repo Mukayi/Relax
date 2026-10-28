@@ -100,7 +100,7 @@ def _collector(world=2, gather=None, **kwargs):
 def test_drain_error_never_reaches_training_and_is_counted_in_the_window():
     collector = _collector()
     bracket(collector)
-    _, _, start, _, _, _, _ = collector._pending[0]
+    _, _, start, _, _, _, _ = collector.recorder._pending[0]
 
     def boom(other):
         raise RuntimeError("device error")
@@ -119,10 +119,10 @@ def test_timer_errors_skip_the_bracket_and_are_counted():
     def broken_factory():
         raise RuntimeError("cudaErrorLaunchFailure")
 
-    collector._pool._free.clear()
-    collector._pool._factory = broken_factory
+    collector.recorder._pool._free.clear()
+    collector.recorder._pool._factory = broken_factory
     bracket(collector)  # must not raise
-    assert collector.pending_events == 0
+    assert collector.recorder.pending_events == 0
     assert collector.health.errors_total == 1
 
 
@@ -144,7 +144,7 @@ def test_one_rank_asking_to_disable_turns_the_profiler_off_on_every_rank():
     # every gather, with a row that repeats the switch-off request.
     assert len(gc.callbacks) == before - 1
     bracket(collector)
-    assert collector.pending_events == 0 and len(collector._pool) == 4
+    assert collector.recorder.pending_events == 0 and len(collector.recorder._pool) == 4
     assert collector.end_step(rollout_id=5) == []
     assert len(collector.gather_calls) == 2
     assert collector.gather_calls[1][FIELD_INDEX["health"]] == float(HEALTH_DISABLE)
@@ -168,7 +168,7 @@ def test_repeated_drain_errors_escalate_to_disable_across_windows():
         raise RuntimeError("device error")
 
     bracket(collector)
-    collector._pending[0][2].elapsed_time = boom
+    collector.recorder._pending[0][2].elapsed_time = boom
     collector.end_step(rollout_id=0)  # 1 error -> degraded
     assert not collector.disabled
     collector.end_step(rollout_id=1)  # same pair fails again -> 2 errors -> disable requested and applied

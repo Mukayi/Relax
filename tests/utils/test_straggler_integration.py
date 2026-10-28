@@ -174,7 +174,7 @@ def test_micro_batch_tokens_reach_the_profiler_only_as_host_lists(monkeypatch):
     profiler = _profiler()
     noted = []
     monkeypatch.setattr(integration, "_PROFILER", profiler)
-    monkeypatch.setattr(profiler.collector, "note_tokens", noted.append)
+    monkeypatch.setattr(profiler.collector.recorder, "note_tokens", noted.append)
     for lengths in ([100, 250], (7,), None, _DeviceLengths()):
         integration.note_microbatch_tokens(lengths)
     assert noted == [350, 7]
@@ -213,12 +213,12 @@ def test_the_first_call_with_a_model_hands_it_to_the_collector(monkeypatch):
     profiler = _profiler()
     monkeypatch.setattr(integration, "_PROFILER", profiler)
     assert integration.straggler_timers("train") is profiler.timers["train"]
-    assert profiler.collector.module_timers is None, "the optimizer config's call names no model"
+    assert profiler.collector.recorder.module_timers is None, "the optimizer config's call names no model"
     assert integration.straggler_timers("forward_only", [_Chunk(), _Chunk()]) is profiler.timers["forward_only"]
-    first = profiler.collector.module_timers
-    assert not first.counts() and profiler.collector.model_chunks == 2
+    first = profiler.collector.recorder.module_timers
+    assert not first.counts() and profiler.collector.recorder.model_chunks == 2
     integration.straggler_timers("train", [object()])
-    assert profiler.collector.module_timers is first, "only the first model is taken"
+    assert profiler.collector.recorder.module_timers is first, "only the first model is taken"
 
 
 def test_a_model_without_modules_is_a_profiler_error(monkeypatch):
@@ -226,7 +226,7 @@ def test_a_model_without_modules_is_a_profiler_error(monkeypatch):
     monkeypatch.setattr(integration, "_PROFILER", profiler)
     integration.straggler_timers("train", [object()])
     assert profiler.collector.health.errors_total == 1
-    assert profiler.collector.module_timers is None
+    assert profiler.collector.recorder.module_timers is None
 
 
 def test_traces_go_to_the_env_dir_or_under_the_timeline_dir(monkeypatch):
@@ -335,8 +335,8 @@ def test_install_uses_the_metrics_primary_rank_and_names_brackets_by_schedule_on
     profiler = install_straggler_profiler("actor", args)
     try:
         assert profiler.collector.is_primary is primary
-        assert profiler.collector._cpu_events_source is integration._cpu_events
-        assert profiler.collector._interleaved is (vpp is not None)
+        assert profiler.collector.recorder._cpu_events_source is (integration._cpu_events if primary else None)
+        assert profiler.collector.recorder._interleaved is (vpp is not None)
     finally:
         profiler.collector.close()
 
@@ -352,7 +352,7 @@ def test_the_schedule_table_comes_from_the_model_config(monkeypatch, forward_onl
     profiler = _profiler(interleaved=True)
     monkeypatch.setattr(integration, "_PROFILER", profiler)
     integration.straggler_timers("forward_only" if forward_only else "train", _vpp_model(combined), 4)
-    _, table, _ = profiler.collector._schedule
+    _, table, _ = profiler.collector.recorder._schedule
     assert list(table) == expected
 
 
@@ -367,7 +367,7 @@ def test_the_calls_of_one_forward_only_number_their_micro_batches_in_order(monke
     profiler = _profiler(interleaved=True)
     monkeypatch.setattr(integration, "_PROFILER", profiler)
     integration.straggler_timers("forward_only", _vpp_model(), [4, 2])
-    _, table, _ = profiler.collector._schedule
+    _, table, _ = profiler.collector.recorder._schedule
     assert list(table) == _TABLE_4 + [(4, 0), (5, 0), (4, 1), (5, 1)]
 
 
@@ -375,7 +375,7 @@ def test_without_a_count_no_schedule_is_noted(monkeypatch):
     profiler = _profiler(interleaved=True)
     monkeypatch.setattr(integration, "_PROFILER", profiler)
     integration.straggler_timers("train", _vpp_model())
-    assert profiler.collector._schedule is None
+    assert profiler.collector.recorder._schedule is None
 
 
 @pytest.mark.parametrize(("tp", "last_pp", "dp"), list(itertools.product([0, 1], [True, False], [0, 1])))

@@ -1,84 +1,46 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Per-rank event collection, lazy readout and the per-window gather.
+"""The window close: the per-window gather and keeping every rank on the same
+collectives.
 
-Hot path (the framework's timer call sites, through ``timers``):
-``record_event`` / ``push`` record events on the current stream and append to
-a queue. Once per step ``end_step`` reads completed pairs with
-``event.query()`` (never ``synchronize``); every ``report_interval`` steps all
-ranks gather one small vector and the primary rank queues the table for the
-``analyze`` passed in (``analysis.report.WindowAnalyzer`` in production) on
-a background thread, whose reports a later ``end_step`` returns.
+This rank's brackets are recorded and read into its window statistics by
+``recorder.EventRecorder``. Every ``report_interval`` steps ``end_step``
+closes the window: all ranks gather one small vector, and the primary rank
+queues the table for the ``analyze`` passed in
+(``analysis.report.WindowAnalyzer`` in production) on a background thread,
+whose reports a later ``end_step`` returns.
 
-A "step" in this package is one ``end_step`` call, i.e. one rollout, which may
-contain several optimizer steps.
-
-With tracing on, the first step of every window after the first is also
-placed on a real time axis (see ``analysis.trace``): it starts with one device
-synchronize and an anchor event, its brackets keep their offsets from that
-anchor, and the window close gathers every rank's sample to the primary rank:
-once tracing is on, in every window, with ``None`` from a rank without one.
-At the ``modules`` level that step also carries module brackets (see
-``modules``), which are attached only while it runs.
+With tracing on, the first step of every window after the first is sampled
+(see ``recorder``), and the window close gathers every rank's sample to the
+primary rank: once tracing is on, in every window, with ``None`` from a rank
+without one.
 """
 
 from __future__ import annotations
 
-import gc
 import logging
 import math
-import threading
-from array import array
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from time import perf_counter, time
-from typing import Any, Callable, Sequence
+from typing import Any, Callable
 
 from relax.utils.straggler.core.health import HEALTH_DISABLE, HealthConfig, ProfilerHealth
-from relax.utils.straggler.core.modules import ModuleTimers
+from relax.utils.straggler.core.recorder import CpuEventsFn, EventRecorder
 from relax.utils.straggler.core.stats import (
     FIELD_INDEX,
     LEVELS,
-    NUM_FIELDS,
-    RECORD_WIDTH,
-    STEP_PEAK_FIELDS,
-    STEP_PEAK_SEGMENTS,
     RankMeta,
     RankTrace,
     WindowStats,
     disabled_row,
 )
-from relax.utils.straggler.core.timers import EventPool
 from relax.utils.straggler.core.worker import AnalysisWorker
 
 
 logger = logging.getLogger(__name__)
 
-_FWD_INDEX = FIELD_INDEX["fwd"]
-_BWD_INDEX = FIELD_INDEX["bwd"]
-_LP_FWD_INDEX = FIELD_INDEX["lp_fwd"]
-_PP_RECV_INDEX = FIELD_INDEX["pp_recv"]
-# Segments whose brackets are numbered within the step (micro-batch order).
-_NUMBERED = (_FWD_INDEX, _BWD_INDEX, _LP_FWD_INDEX)
-_CPU_FWD_INDEX = FIELD_INDEX["cpu_fwd"]
-_CPU_BWD_INDEX = FIELD_INDEX["cpu_bwd"]
-_NUM_FWD_INDEX = FIELD_INDEX["num_fwd"]
-_TOKENS_INDEX = FIELD_INDEX["tokens"]
-_GC_INDEX = FIELD_INDEX["gc"]
-_DROPPED_INDEX = FIELD_INDEX["dropped"]
 _HEALTH_INDEX = FIELD_INDEX["health"]
 _CONTROL_INDEX = FIELD_INDEX["control"]
-_MB_FWD_MAX_INDEX = FIELD_INDEX["mb_fwd_max"]
-_MB_FWD_MIN_INDEX = FIELD_INDEX["mb_fwd_min"]
-_MB_BWD_MAX_INDEX = FIELD_INDEX["mb_bwd_max"]
-_MB_BWD_MIN_INDEX = FIELD_INDEX["mb_bwd_min"]
-_MB_FWD_ARGMAX_INDEX = FIELD_INDEX["mb_fwd_argmax"]
-_MB_FWD_ARGMAX_TOKENS_INDEX = FIELD_INDEX["mb_fwd_argmax_tokens"]
-_MB_TOKENS_MAX_INDEX = FIELD_INDEX["mb_tokens_max"]
-_MB_TOKENS_MIN_INDEX = FIELD_INDEX["mb_tokens_min"]
-# (window total, one-step maximum) of each segment whose slowest step the window keeps.
-_STEP_PEAK_INDICES = tuple(
-    (FIELD_INDEX[name], FIELD_INDEX[peak]) for name, peak in zip(STEP_PEAK_SEGMENTS, STEP_PEAK_FIELDS)
-)
 
 # An analysis takes milliseconds (35 ms at 2048 ranks); this only bounds a stuck worker at the end of a run.
 _FINAL_FLUSH_TIMEOUT_S = 10.0
@@ -87,8 +49,6 @@ GatherFn = Callable[[list[float]], list[list[float]]]
 GatherObjectsFn = Callable[[Any], list[Any]]
 # (object, destination rank) -> every rank's object on the destination, None elsewhere.
 GatherToFn = Callable[[Any, int], list[Any] | None]
-# (start, end) wall-clock seconds -> the primary rank's CPU timeline events in that span.
-CpuEventsFn = Callable[[float, float], list[dict[str, Any]]]
 
 
 @dataclass
@@ -120,33 +80,14 @@ class ClosedWindow:
 AnalyzeFn = Callable[[ClosedWindow, Callable[..., Any]], Any]
 
 
-@dataclass
-class _TraceCapture:
-    """The sampled step being read out: its anchor event and wall-clock time,
-    the sequence numbers of its first window pair and one past its last (set
-    when the step ends), its brackets so far (``modules`` of them module
-    brackets) and how many were lost."""
-
-    anchor: Any
-    wall: float
-    first: int
-    end: int | None = None
-    records: array = field(default_factory=lambda: array("f"))
-    lost: int = 0
-    modules: int = 0
-
-    def covers(self, seq: int) -> bool:
-        return self.first <= seq and (self.end is None or seq < self.end)
-
-
 class StragglerCollector:
-    """Queue this rank's timing events, fold them lazily, and gather one window
-    every ``report_interval`` steps.
+    """Record this rank's brackets (``recorder``) and gather one window every
+    ``report_interval`` steps.
 
     Torch-free: device events, stream-capture detection, the gathers and what
     becomes of a closed window (``analyze``) are injected (``relax_integration``
-    passes the real ones, tests pass fakes); the timers that feed it are built
-    by the adapter around it (``megatron_adapter.phase_timers``).
+    passes the real ones, tests pass fakes); the timers that feed the recorder
+    are built by the adapter around it (``megatron_adapter.phase_timers``).
     """
 
     def __init__(
@@ -192,72 +133,40 @@ class StragglerCollector:
         self.rank_meta = rank_meta
         self.is_primary = is_primary
         self.report_interval = report_interval
+        self.health = ProfilerHealth(health_config)
+        self.recorder = EventRecorder(
+            event_factory=event_factory,
+            is_capturing=is_capturing,
+            health=self.health,
+            pool_size=pool_size,
+            max_pending=max_pending,
+            clock=clock,
+            wall_clock=wall_clock,
+            synchronize=synchronize,
+            cpu_events=cpu_events if is_primary else None,
+            max_trace_brackets=max_trace_brackets,
+            max_module_brackets=max_module_brackets,
+            interleaved=interleaved,
+            register_gc_callback=register_gc_callback,
+        )
         self._analyze = analyze
-        self._pool = EventPool(pool_size, event_factory)
-        self._max_pending = max_pending
-        # Window brackets: (segment, PP phase field or -1, start event, end event, CPU ms, micro-batch or -1,
-        # tokens or -1); tokens only for a training forward.
-        self._pending: deque[tuple[int, int, Any, Any, float, int, float]] = deque()
-        # Window pairs ever pushed and ever popped (folded or dropped): the sequence number of the queue head.
-        self._pushed = 0
-        self._popped = 0
-        # Module brackets of the sampled step: (segment, layer, start event, end event). They share
-        # ``max_pending`` with the window brackets, take at most half of it and exist only while a sample is read out.
-        self._modules: deque[tuple[int, int, Any, Any]] = deque()
-        # Brackets of each numbered segment pushed in this step, and the token
-        # count reported for the training forward bracket that is open (-1 when none was).
-        self._step_numbers = dict.fromkeys(_NUMBERED, 0)
-        self._next_tokens = -1.0
-        # Under interleaved PP the n-th forward / backward of a step is not micro-batch n: ``note_schedule`` names
-        # the brackets of each forward-backward call, and the rest carry -1.
-        self._interleaved = interleaved
-        # The noted forward-backward call: bracket counts of its segments at its start, its table, model chunks.
-        self._schedule: tuple[dict[int, int], Sequence[tuple[int, int]], int] | None = None
         self._trace_enabled = trace
         self.level = self._usable(level)
-        # Plain attribute because ``record_event`` checks it on every bracket.
-        self._paused = self.level == 0
+        self.recorder.recording = self.level > 0
+        self.recorder.modules_on = self.level == 3
         # Primary rank: the level the operator asks for, ``None`` without a request.
         self._level_request = level_request
-        self._synchronize = synchronize
         self._gather_to = gather_to
         # Where samples go, the same on every rank (agreed on at install); ``None``: no samples.
         self._primary_rank = primary_rank
         self._sample_gather = trace and gather_to is not None and primary_rank is not None
-        self._max_trace_brackets = max_trace_brackets
-        self._max_module_brackets = max_module_brackets
-        # Set by the integration once the model exists; attached only during a sampled step at level 3.
-        self.module_timers: ModuleTimers | None = None
-        self.model_chunks = 1
-        # The first window has no sample: its first step carries the warm-up.
-        self._trace_next = False
-        self._trace: _TraceCapture | None = None
-        self._trace_done: RankTrace | None = None
-        # Primary rank only: the CPU events of the step traced last, read when it ends.
-        self._cpu_events_source = cpu_events
-        self._cpu_events: list[dict[str, Any]] = []
-        self._window = WindowStats()
-        # The window's totals of the step-peak segments at the end of its previous step.
-        self._step_base = [0.0] * len(_STEP_PEAK_INDICES)
         self._wall = wall_clock
         self.window_start_wall = wall_clock()
         self._gather = gather
         self._gather_objects = gather_objects
         self._clock = clock
-        self._is_capturing = is_capturing
         self._all_meta: list[RankMeta] | None = None
         self._meta_gathered = False
-        # True from the first bracket of a step until ``end_step``; GC pauses are
-        # only attributed to the step while it is set (not during train_wait,
-        # offload / clear_memory, etc.).
-        self._step_open = False
-        self._gc_start: float | None = None
-        # Thread that first calls record_event; only that thread's GC pauses
-        # are attributed to the training window (gc.callbacks fire on the
-        # triggering thread, so a background GC must not corrupt _gc_start).
-        self._train_thread: int | None = None
-        self.health = ProfilerHealth(health_config)
-        # Plain attribute (not ``health.disabled``) because ``record_event`` checks it on every bracket.
         self._disabled = False
         # Reports from ``analyze``: appended by the worker, drained by ``end_step`` (deque append / popleft are atomic).
         self._reports: deque[Any] = deque()
@@ -265,34 +174,14 @@ class StragglerCollector:
         self._window_first_rollout: int | None = None
         self._window_last_rollout = -1
         self._worker = AnalysisWorker(self._handle_job) if background and is_primary else None
-        if register_gc_callback:
-            gc.callbacks.append(self._on_gc)
 
-    # ---- hot path -----------------------------------------------------------------------------------------------
+    @property
+    def window(self) -> WindowStats:
+        return self.recorder.window
 
-    def record_event(self) -> Any:
-        """Record a pooled event on the current stream and open the step for GC
-        attribution.
-
-        Returns ``None`` (the bracket is skipped) once the profiler is
-        disabled, and during CUDA graph capture, where ``elapsed_time`` would
-        be meaningless on replay.
-        """
-        if self._disabled or self._paused or self._is_capturing():
-            return None
-        if not self._step_open:
-            self._step_open = True
-            if self._trace_next:
-                self._begin_trace()
-        if self._train_thread is None:
-            self._train_thread = threading.get_ident()
-        event = self._pool.acquire()
-        event.record()
-        return event
-
-    def discard_event(self, event: Any) -> None:
-        """Return the start event of a bracket that could not be closed."""
-        self._pool.release(event)
+    @property
+    def disabled(self) -> bool:
+        return self._disabled
 
     def on_error(self, where: str, exc: BaseException) -> None:
         """Count an exception caught anywhere in the profiler (see
@@ -303,237 +192,6 @@ class StragglerCollector:
         """Record a lasting gap in what this rank measures (see
         ``ProfilerHealth.mark_degraded``)."""
         self.health.mark_degraded(reason)
-
-    def _guarded(self, where: str, call: Callable[..., Any], *args: Any, default: Any = None) -> Any:
-        """``call(*args)``, or ``default`` once its exception is counted under
-        ``where``."""
-        try:
-            return call(*args)
-        except Exception as exc:
-            self.on_error(where, exc)
-            return default
-
-    def push(self, segment_index: int, phase_index: int, start_event: Any, end_event: Any, cpu_ms: float) -> None:
-        """Queue one bracket for ``drain``; when the queue is full drop the
-        oldest pair, so a rank that stops draining cannot grow without bound.
-
-        Module brackets give way to window brackets: one that finds the queue
-        full, or half of it taken by module brackets, is dropped itself, and a
-        window bracket that finds the queue full drops the oldest module
-        bracket before it drops a window bracket. A dropped window bracket
-        counts in ``dropped``; a dropped module bracket only in the sample's
-        ``lost``.
-
-        A fwd / bwd / log-prob fwd bracket takes the next micro-batch number of
-        its segment in the step, under interleaved PP the micro-batch and model
-        chunk that ``note_schedule`` gives it; a training forward also takes the
-        token count reported while it was open.
-        """
-        trace = self._trace
-        full = len(self._pending) + len(self._modules) >= self._max_pending
-        if segment_index >= NUM_FIELDS:
-            if trace is not None and not full and 2 * len(self._modules) < self._max_pending:
-                self._modules.append((segment_index, phase_index, start_event, end_event))
-                return
-            self._pool.release(start_event, end_event)
-            if trace is not None:
-                trace.lost += 1
-            return
-        if full and trace is not None and self._modules:
-            _, _, old_start, old_end = self._modules.popleft()
-            self._pool.release(old_start, old_end)
-            trace.lost += 1
-        elif full:
-            _, _, old_start, old_end, _, _, _ = self._pending.popleft()
-            self._pool.release(old_start, old_end)
-            self._window.add_index(_DROPPED_INDEX, 1.0)
-            if trace is not None and trace.covers(self._popped):
-                trace.lost += 1
-            self._popped += 1
-        micro_batch = self._step_numbers.get(segment_index, -1)
-        tokens = -1.0
-        if micro_batch >= 0:
-            self._step_numbers[segment_index] = micro_batch + 1
-            if segment_index == _FWD_INDEX:
-                tokens, self._next_tokens = self._next_tokens, -1.0
-            if self._interleaved:
-                # The phase slot of a micro-batch bracket holds its model chunk.
-                micro_batch, phase_index = self._scheduled(segment_index, micro_batch)
-        self._pending.append((segment_index, phase_index, start_event, end_event, cpu_ms, micro_batch, tokens))
-        self._pushed += 1
-
-    def note_schedule(self, build_table: Callable[[], Sequence[tuple[int, int]]], forward_only: bool) -> None:
-        """Take the schedule table of the forward-backward call about to run:
-        the (micro-batch, model chunk) of each forward step in call order.
-
-        Megatron runs the backward steps in the same order with the model
-        chunks reversed; an empty table names no bracket. ``build_table`` is
-        only called under interleaved PP.
-        """
-        if not self._interleaved:
-            return
-        table = self._guarded("schedule", build_table, default=())
-        segments = (_LP_FWD_INDEX,) if forward_only else (_FWD_INDEX, _BWD_INDEX)
-        chunks = 1 + max((chunk for _, chunk in table), default=-1)
-        self._schedule = ({segment: self._step_numbers[segment] for segment in segments}, table, chunks)
-
-    def _scheduled(self, segment_index: int, count: int) -> tuple[int, int]:
-        """Micro-batch and model chunk of the ``count``-th bracket of a
-        numbered segment in the step; (-1, -1) outside the noted call."""
-        if self._schedule is None:
-            return -1, -1
-        starts, table, chunks = self._schedule
-        start = starts.get(segment_index)
-        if start is None or count - start >= len(table):
-            return -1, -1
-        micro_batch, chunk = table[count - start]
-        if segment_index == _BWD_INDEX:
-            chunk = chunks - 1 - chunk
-        # Each earlier call of the step ran ``chunks`` brackets per micro-batch.
-        return start // chunks + micro_batch, chunk
-
-    def _begin_trace(self) -> None:
-        """Anchor the sampled step: an event recorded on an idle device marks
-        the wall-clock time that every bracket of the step is placed
-        against."""
-        self._trace_next = False
-        self._synchronize()
-        anchor = self._pool.acquire()
-        anchor.record()
-        self._trace = _TraceCapture(anchor=anchor, wall=self._wall(), first=self._pushed)
-        if self.level == 3 and self.module_timers is not None:
-            try:
-                self.module_timers.attach()
-            except Exception as exc:
-                self._detach_modules()
-                self.on_error("modules", exc)
-
-    def _detach_modules(self) -> None:
-        if self.module_timers is not None:
-            self._guarded("modules", self.module_timers.detach)
-
-    def note_tokens(self, tokens: int) -> None:
-        """Take the token count of the training micro-batch whose forward
-        bracket is open; that bracket's ``push`` claims it, and the window
-        counts it once per micro-batch (each model chunk runs its own
-        forward)."""
-        self._next_tokens = float(tokens)
-        self._window.add_index(_TOKENS_INDEX, tokens / self.model_chunks)
-
-    def _on_gc(self, phase: str, info: dict[str, Any]) -> None:
-        if self._train_thread is not None and threading.get_ident() != self._train_thread:
-            return
-        if phase == "start":
-            self._gc_start = self._clock() if self._step_open else None
-        elif self._gc_start is not None:
-            self._window.add_index(_GC_INDEX, (self._clock() - self._gc_start) * 1e3)
-            self._gc_start = None
-
-    # ---- cold path ----------------------------------------------------------------------------------------------
-
-    @property
-    def pending_events(self) -> int:
-        return len(self._pending) + len(self._modules)
-
-    @property
-    def window(self) -> WindowStats:
-        return self._window
-
-    def drain(self) -> int:
-        """Fold completed event pairs from the front of each queue into the
-        window or the sample; stop at the first pair that is still in flight.
-
-        Pairs are queued in stream order, so an incomplete pair implies every
-        later pair of its queue is incomplete too. Each pair is popped only
-        after it has been folded, so an exception leaves the queues consistent
-        and no event is released twice. Returns the number of pairs folded.
-        """
-        started = self._clock()
-        folded = 0
-        pending = self._pending
-        window = self._window
-        trace = self._trace
-        while pending:
-            segment_index, phase_index, start_event, end_event, cpu_ms, micro_batch, tokens = pending[0]
-            if not (end_event.query() and start_event.query()):
-                break
-            ms = start_event.elapsed_time(end_event)
-            # Read before anything is folded, so a failing readout leaves no partial update.
-            traced = trace is not None and trace.covers(self._popped)
-            if traced:
-                offsets = (trace.anchor.elapsed_time(start_event), trace.anchor.elapsed_time(end_event))
-            window.add_index(segment_index, ms)
-            # Only a PP wait's phase is a field; a gradient sync's names its timer, for the trace.
-            if segment_index == _PP_RECV_INDEX and phase_index >= 0:
-                window.add_index(phase_index, ms)
-            if segment_index == _FWD_INDEX:
-                window.add_index(_CPU_FWD_INDEX, cpu_ms)
-                window.add_index(_NUM_FWD_INDEX, 1.0)
-                if window.max_index(_MB_FWD_MAX_INDEX, ms):
-                    window.values[_MB_FWD_ARGMAX_INDEX] = float(micro_batch)
-                    window.values[_MB_FWD_ARGMAX_TOKENS_INDEX] = tokens
-                window.min_index(_MB_FWD_MIN_INDEX, ms)
-                if tokens >= 0:
-                    window.max_index(_MB_TOKENS_MAX_INDEX, tokens)
-                    window.min_index(_MB_TOKENS_MIN_INDEX, tokens)
-            elif segment_index == _BWD_INDEX:
-                window.add_index(_CPU_BWD_INDEX, cpu_ms)
-                window.max_index(_MB_BWD_MAX_INDEX, ms)
-                window.min_index(_MB_BWD_MIN_INDEX, ms)
-            if traced:
-                if len(trace.records) // RECORD_WIDTH - trace.modules < self._max_trace_brackets:
-                    trace.records.extend((segment_index, phase_index, micro_batch, tokens, *offsets))
-                else:
-                    trace.lost += 1
-            pending.popleft()
-            self._pool.release(start_event, end_event)
-            self._popped += 1
-            folded += 1
-        modules = self._modules
-        while modules and trace is not None:
-            segment_index, layer, start_event, end_event = modules[0]
-            if not (end_event.query() and start_event.query()):
-                break
-            offsets = (trace.anchor.elapsed_time(start_event), trace.anchor.elapsed_time(end_event))
-            if trace.modules < self._max_module_brackets:
-                # The phase slot holds the layer number.
-                trace.records.extend((segment_index, layer, -1, -1.0, *offsets))
-                trace.modules += 1
-            else:
-                trace.lost += 1
-            modules.popleft()
-            self._pool.release(start_event, end_event)
-            folded += 1
-        self._finish_trace()
-        window.add("overhead", (self._clock() - started) * 1e3)
-        return folded
-
-    def _finish_trace(self) -> None:
-        """Hand the sampled step over once every pair of it has been read."""
-        trace = self._trace
-        if trace is None or trace.end is None or self._popped < trace.end or self._modules:
-            return
-        self._pool.release(trace.anchor)
-        self._trace = None
-        self._trace_done = RankTrace(wall=trace.wall, records=trace.records, lost=trace.lost)
-
-    def _drop_trace(self) -> None:
-        """Abandon the sampled step and its module brackets."""
-        if self._trace is None:
-            return
-        self._pool.release(self._trace.anchor)
-        self._trace = None
-        self._release_all(self._modules)
-
-    def _release_all(self, queue: deque) -> None:
-        """Empty ``queue`` and return its events to the pool."""
-        while queue:
-            _, _, start_event, end_event, *_ = queue.popleft()
-            self._pool.release(start_event, end_event)
-
-    @property
-    def disabled(self) -> bool:
-        return self._disabled
 
     def end_step(self, rollout_id: int = -1, final: bool = False) -> list[Any]:
         """Close one training step; every ``report_interval`` steps gather and
@@ -547,46 +205,24 @@ class StragglerCollector:
         windows). On the ``final`` step of a run it waits (bounded) for the
         pending analyses, since no later call would pick them up.
         """
-        self._guarded("drain", self.drain)
-        self._step_open = False
-        self._step_numbers = dict.fromkeys(_NUMBERED, 0)
-        self._schedule = None
-        if self._trace is not None and self._trace.end is None:
-            self._detach_modules()
-            self._trace.end = self._pushed
-            if self.is_primary and self._cpu_events_source is not None:
-                # Read before this call can close the window, so the sample leaves with the events of its own step.
-                self._cpu_events = self._guarded(
-                    "trace", self._cpu_events_source, self._trace.wall, self._wall(), default=[]
-                )
-            self._finish_trace()
-        self._note_step_peaks()
-        self._window.add("num_steps", 1.0)
+        self.recorder.end_step()
         if self._window_first_rollout is None:
             self._window_first_rollout = rollout_id
         self._window_last_rollout = rollout_id
-        if self._window.get("num_steps") >= self.report_interval:
+        if self.window.get("num_steps") >= self.report_interval:
             self._close_window()
         if final and not self.flush(timeout=_FINAL_FLUSH_TIMEOUT_S):
             self.on_error("analyze", TimeoutError(f"analysis still running {_FINAL_FLUSH_TIMEOUT_S} s after the run"))
         return self._take_reports()
 
-    def _note_step_peaks(self) -> None:
-        """Keep the largest one-step total of each step-peak segment; a bracket
-        still unread at ``end_step`` counts towards the step that reads it."""
-        values = self._window.values
-        for k, (total, peak) in enumerate(_STEP_PEAK_INDICES):
-            self._window.max_index(peak, values[total] - self._step_base[k])
-            self._step_base[k] = values[total]
-
     def _close_window(self) -> None:
         closed_wall = self._wall()
-        errors, code = self.health.close_window(self._window.get("dropped"))
+        errors, code = self.health.close_window(self.window.get("dropped"))
         code = self._health_code(code)
-        self._window.set("unread", float(len(self._pending)))
-        self._window.set("errors", errors)
-        self._window.set("health", code)
-        self._window.set("control", self._control_code())
+        self.window.set("unread", float(self.recorder.unread))
+        self.window.set("errors", errors)
+        self.window.set("health", code)
+        self.window.set("control", self._control_code())
         level = self.level
         try:
             started = self._clock()
@@ -621,7 +257,7 @@ class StragglerCollector:
         request."""
         if not self.is_primary:
             return 0.0
-        requested = self._guarded("control", self._level_request)
+        requested = self.health.guarded("control", self._level_request)
         return 0.0 if requested is None else float(requested + 1)
 
     def _usable(self, level: int) -> int:
@@ -642,7 +278,8 @@ class StragglerCollector:
                 self._window_last_rollout + 1,
             )
         self.level = level
-        self._paused = level == 0
+        self.recorder.recording = level > 0 and not self._disabled
+        self.recorder.modules_on = level == 3
 
     def status(self) -> dict[str, Any]:
         """What the primary rank reports to the control page."""
@@ -659,13 +296,8 @@ class StragglerCollector:
         Returns the gathered list on the primary rank, ``None`` elsewhere or on
         failure.
         """
-        # A sample still in flight at the close (only with very short windows) is dropped.
-        self._drop_trace()
-        sample, self._trace_done = self._trace_done, None
-        if sample is not None:
-            sample.cpu_events = self._cpu_events
-        self._cpu_events = []
-        return self._guarded("trace", self._gather_to, None if self._disabled else sample, self._primary_rank)
+        sample = self.recorder.take_sample()
+        return self.health.guarded("trace", self._gather_to, None if self._disabled else sample, self._primary_rank)
 
     def _health_code(self, code: float) -> float:
         """Return this window's ``health`` code, logging a new local switch-off
@@ -713,9 +345,9 @@ class StragglerCollector:
                 )
         if self._all_meta is None:
             code = HEALTH_DISABLE
-            self._window.set("health", code)
+            self.window.set("health", code)
         try:
-            table = self._gather(disabled_row() if self._disabled else self._window.as_list())
+            table = self._gather(disabled_row() if self._disabled else self.window.as_list())
         except Exception as exc:
             self.on_error("gather", exc)
             if code >= HEALTH_DISABLE and not self._disabled:
@@ -747,11 +379,9 @@ class StragglerCollector:
     def _reset_window(self) -> None:
         """Start the next window; every close path has to reach this, or the
         window would close (and gather) again on every following step."""
-        self._window.reset()
-        self._step_base = [0.0] * len(_STEP_PEAK_INDICES)
+        self.recorder.reset_window(sample_next=self._sample_gather and self.level >= 2 and not self._disabled)
         self.window_start_wall = self._wall()
         self._window_first_rollout = None
-        self._trace_next = self._sample_gather and self.level >= 2 and not self._disabled
 
     def _job(self, table: list[list[float]], **kwargs: Any) -> ClosedWindow:
         first = self._window_first_rollout
@@ -788,7 +418,7 @@ class StragglerCollector:
 
         Windows arrive one at a time, in window order.
         """
-        report = self._guarded("analyze", self._analyze, job, self._guarded)
+        report = self.health.guarded("analyze", self._analyze, job, self.health.guarded)
         if report is not None:
             self._reports.append(report)
 
@@ -808,9 +438,7 @@ class StragglerCollector:
             return
         self._disabled = True
         self.health.disable(reason)
-        self._release_all(self._pending)
-        self._drop_trace()
-        self._detach_modules()
+        self.recorder.stop()
         self.close()
         logger.warning(
             "[straggler] profiler disabled on rank %d: %s. Training continues; config.timers now records nothing.",
@@ -821,7 +449,6 @@ class StragglerCollector:
     def close(self) -> None:
         """Unregister the GC callback and stop the worker once its queue is
         empty; safe to call more than once."""
-        if self._on_gc in gc.callbacks:
-            gc.callbacks.remove(self._on_gc)
+        self.recorder.close()
         if self._worker is not None:
             self._worker.stop()

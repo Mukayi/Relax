@@ -1,8 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """The profiler inside Relax: its settings (``RELAX_STRAGGLER_*`` in ``Envs``),
 the process-wide profiler the Megatron actor holds, and what it needs from
-Relax and torch: device events, the Gloo gathers, the metrics service, the CPU
-timeline and the rollout step numbers.
+Relax and torch: device events, the Gloo gathers (``collectives``), the metrics
+service, the CPU timeline and the rollout step numbers.
 
 The training code calls only the functions in ``__init__``; everything that
 touches the accelerator (through ``relax.utils.device``, so CUDA and NPU alike)
@@ -13,10 +13,8 @@ tested) on CPU with fakes.
 from __future__ import annotations
 
 import os
-import pickle
 import socket
 from dataclasses import replace
-from datetime import timedelta
 from functools import partial
 from typing import Any, Callable, Sequence
 
@@ -38,6 +36,13 @@ from relax.utils.straggler.analysis.report import (
     timeline_bars,
 )
 from relax.utils.straggler.analysis.trace import write_window_trace
+from relax.utils.straggler.collectives import (
+    gloo_all_gather,
+    gloo_all_gather_objects,
+    gloo_gather_objects_to,
+    gloo_primary_rank,
+    init_straggler_gather_group,
+)
 from relax.utils.straggler.core.collector import StragglerCollector
 from relax.utils.straggler.core.stats import LEVELS, RankMeta
 from relax.utils.straggler.core.timers import StragglerTimers
@@ -52,7 +57,7 @@ PROFILED_ROLES: frozenset[str] = frozenset({"actor"})
 
 
 # ---------------------------------------------------------------------------
-# Collection: device events, Gloo gathers, rank identity, CPU timeline
+# Collection: device events, rank identity, CPU timeline (the gathers are in ``collectives``)
 # ---------------------------------------------------------------------------
 
 
@@ -86,104 +91,6 @@ def _never() -> bool:
 def device_synchronize() -> Callable[[], None]:
     """The active accelerator's synchronize, which anchors a sampled step."""
     return device.device_module.synchronize if device.is_available() else (lambda: None)
-
-
-_GATHER_GROUP: Any = None
-
-
-def init_straggler_gather_group(timeout_s: float) -> None:
-    """Create the profiler's dedicated Gloo group, with a timeout far shorter
-    than the training one.
-
-    The generic Gloo group is shared with weight sync and other paths, so its
-    timeout cannot be lowered for this; a straggler gather is ``world × 312 B``
-    of CPU copies (milliseconds), and a rank that vanished must not park the
-    rest of the job for ``--distributed-timeout-minutes``. Every member of the
-    default group must call this in the same order, so it runs on all ranks of
-    the actor group before any gather.
-    """
-    global _GATHER_GROUP
-    if _GATHER_GROUP is None:
-        _GATHER_GROUP = dist.new_group(backend="gloo", timeout=timedelta(seconds=timeout_s))
-
-
-def get_straggler_gather_group() -> Any:
-    if _GATHER_GROUP is None:
-        raise RuntimeError("the straggler Gloo group has not been initialized; call install_straggler_profiler first")
-    return _GATHER_GROUP
-
-
-def gloo_all_gather(values: list[float]) -> list[list[float]]:
-    """All-gather one CPU vector over the straggler Gloo group (ranks == global
-    ranks).
-
-    Every rank issues the collective whatever fails locally: a rank that cannot
-    build its tensor sends NaN in every slot and raises after the gather, and
-    the collector skips a window with such a row on every rank.
-    """
-    group = get_straggler_gather_group()
-    error = None
-    try:
-        local = torch.tensor(values, dtype=torch.float64)
-    except Exception as exc:
-        error, local = exc, torch.full((len(values),), float("nan"), dtype=torch.float64)
-    gathered = [torch.empty_like(local) for _ in range(dist.get_world_size(group))]
-    dist.all_gather(gathered, local, group=group)
-    if error is not None:
-        raise error
-    return [row.tolist() for row in gathered]
-
-
-def gloo_primary_rank(is_primary: bool) -> int | None:
-    """The primary rank's global rank, the same on every rank: one
-    ``all_reduce`` over the straggler Gloo group; ``None`` without a
-    primary."""
-    value = torch.tensor([dist.get_rank() if is_primary else -1], dtype=torch.int64)
-    dist.all_reduce(value, op=dist.ReduceOp.MAX, group=get_straggler_gather_group())
-    rank = int(value.item())
-    return rank if rank >= 0 else None
-
-
-def _pickled(obj: Any) -> tuple[bytes, Exception | None]:
-    """``obj`` pickled, or ``None`` pickled and the error.
-
-    The object collectives pickle their argument before their first collective,
-    so a rank whose pickling failed there would skip the collectives its peers
-    issue; pickling first keeps every rank on them.
-    """
-    try:
-        return pickle.dumps(obj), None
-    except Exception as exc:
-        return pickle.dumps(None), exc
-
-
-def gloo_all_gather_objects(obj: Any) -> list[Any]:
-    """All-gather one picklable object per rank over the straggler Gloo group;
-    every rank raises when one of them could not send its object."""
-    group = get_straggler_gather_group()
-    data, error = _pickled(obj)
-    gathered: list[Any] = [None] * dist.get_world_size(group)
-    dist.all_gather_object(gathered, data, group=group)
-    if error is not None:
-        raise error
-    objects = [pickle.loads(item) for item in gathered]
-    missing = [rank for rank, item in enumerate(objects) if item is None]
-    if missing:
-        raise RuntimeError(f"ranks {missing} sent no object")
-    return objects
-
-
-def gloo_gather_objects_to(obj: Any, dst: int) -> list[Any] | None:
-    """Gather one picklable object per rank on rank ``dst`` (``None``
-    elsewhere) over the straggler Gloo group; a rank that could not send its
-    object raises after the gather."""
-    group = get_straggler_gather_group()
-    data, error = _pickled(obj)
-    gathered = [None] * dist.get_world_size(group) if dist.get_rank() == dst else None
-    dist.gather_object(data, gathered, dst=dst, group=group)
-    if error is not None:
-        raise error
-    return [pickle.loads(item) for item in gathered] if gathered is not None else None
 
 
 def local_rank_meta() -> RankMeta:
@@ -282,7 +189,7 @@ class StragglerProfiler:
 
     def __init__(self, collector: StragglerCollector, args: Any) -> None:
         self.collector = collector
-        self.timers = megatron_adapter.phase_timers(collector)
+        self.timers = megatron_adapter.phase_timers(collector.recorder)
         self._args = args
         self._model_seen = False
         self._unchecked_phases = set(megatron_adapter.REQUIRED_TIMER_NAMES)
@@ -294,15 +201,15 @@ class StragglerProfiler:
         if self._model_seen:
             return
         self._model_seen = True
-        collector = self.collector
-        collector.model_chunks = max(len(model_chunks), 1)
+        recorder = self.collector.recorder
+        recorder.model_chunks = max(len(model_chunks), 1)
         try:
-            timers = megatron_adapter.module_timers(model_chunks, collector)
+            timers = megatron_adapter.module_timers(model_chunks, recorder)
         except Exception as exc:
-            collector.on_error("modules", exc)
+            recorder.on_error("modules", exc)
             return
-        collector.module_timers = timers
-        if collector.is_primary:
+        recorder.module_timers = timers
+        if self.collector.is_primary:
             counts = timers.counts()
             logger.info(
                 "[straggler] modules level: %d blocks on this rank (%s)",
@@ -466,7 +373,7 @@ def straggler_timers(
         _PROFILER.see_model(model)
         if num_microbatches is not None:
             forward_only = phase == "forward_only"
-            _PROFILER.collector.note_schedule(
+            _PROFILER.collector.recorder.note_schedule(
                 partial(megatron_adapter.interleaved_schedule_table, model, num_microbatches, forward_only),
                 forward_only,
             )
@@ -491,4 +398,4 @@ def note_microbatch_tokens(total_lengths: Any) -> None:
     Only a host-side list is summed: summing a device tensor would synchronize.
     """
     if _PROFILER is not None and isinstance(total_lengths, (list, tuple)):
-        _PROFILER.collector.note_tokens(int(sum(total_lengths)))
+        _PROFILER.collector.recorder.note_tokens(int(sum(total_lengths)))

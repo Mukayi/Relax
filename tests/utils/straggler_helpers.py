@@ -91,7 +91,7 @@ def timers(collector, phase="train"):
     """The ``config.timers`` of ``phase`` feeding ``collector``, one set per
     collector as the profiler holds them."""
     if collector not in _TIMERS:
-        _TIMERS[collector] = phase_timers(collector)
+        _TIMERS[collector] = phase_timers(collector.recorder)
     return _TIMERS[collector][phase]
 
 

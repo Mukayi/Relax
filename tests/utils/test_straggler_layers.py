@@ -1,8 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """The profiler's parts import only the parts before them: ``core`` (the
 collection) the standard library and itself; ``analysis`` also numpy, requests
-and ``core``; ``megatron_adapter`` Megatron and ``core``; ``relax_integration``
-anything."""
+and ``core``; ``megatron_adapter`` Megatron and ``core``; ``collectives``
+torch; ``relax_integration`` anything."""
 
 import ast
 import subprocess
@@ -56,6 +56,10 @@ def test_the_analysis_imports_only_the_standard_library_numpy_requests_and_the_c
 
 def test_the_megatron_adapter_imports_only_megatron_and_the_collection():
     assert _disallowed(_PACKAGE / "megatron_adapter.py", [_CORE], frozenset({"megatron"})) == []
+
+
+def test_the_collectives_import_only_torch():
+    assert _disallowed(_PACKAGE / "collectives.py", [], frozenset({"torch"})) == []
 
 
 def test_importing_any_torch_free_part_loads_neither_torch_nor_megatron():

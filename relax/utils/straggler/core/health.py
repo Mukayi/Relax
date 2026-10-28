@@ -24,6 +24,7 @@ import logging
 import threading
 from collections import deque
 from dataclasses import dataclass
+from typing import Any, Callable
 
 
 logger = logging.getLogger(__name__)
@@ -104,6 +105,15 @@ class ProfilerHealth:
                 self.config.max_errors,
                 self.config.error_windows,
             )
+
+    def guarded(self, where: str, call: Callable[..., Any], *args: Any, default: Any = None) -> Any:
+        """``call(*args)``, or ``default`` once its exception is counted under
+        ``where``."""
+        try:
+            return call(*args)
+        except Exception as exc:
+            self.record_error(where, exc)
+            return default
 
     def close_window(self, dropped: float) -> tuple[float, float]:
         """Return ``(errors, health_code)`` for this rank's closing window and

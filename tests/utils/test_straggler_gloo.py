@@ -22,7 +22,7 @@ class _Unpicklable(str):
 def _rank_worker(rank, world_size, init_file, out_dir, failure):
     import torch.distributed as dist
 
-    from relax.utils.straggler import relax_integration as integration
+    from relax.utils.straggler import collectives
     from relax.utils.straggler.analysis.report import WindowAnalyzer
     from relax.utils.straggler.core.collector import StragglerCollector
     from relax.utils.straggler.core.stats import RankMeta
@@ -36,16 +36,16 @@ def _rank_worker(rank, world_size, init_file, out_dir, failure):
         timeout=timedelta(seconds=60),
     )
     try:
-        integration.init_straggler_gather_group(timeout_s=10)
+        collectives.init_straggler_gather_group(timeout_s=10)
         calls = []
 
         def gather(values):
             calls.append("row")
-            return integration.gloo_all_gather(values)
+            return collectives.gloo_all_gather(values)
 
         def gather_objects(obj):
             calls.append("objects")
-            gathered = integration.gloo_all_gather_objects(obj)
+            gathered = collectives.gloo_all_gather_objects(obj)
             if failure == "decode" and rank == 0:
                 # Like a MemoryError while decoding: the collectives are done on every rank, only rank 0 fails.
                 raise MemoryError("injected after the metadata collectives")
@@ -76,7 +76,7 @@ def _rank_worker(rank, world_size, init_file, out_dir, failure):
 def _trace_worker(rank, world_size, init_file, out_dir, failure):
     import torch.distributed as dist
 
-    from relax.utils.straggler import relax_integration as integration
+    from relax.utils.straggler import collectives
     from relax.utils.straggler.analysis.report import WindowAnalyzer
     from relax.utils.straggler.core.collector import StragglerCollector
     from relax.utils.straggler.core.stats import RankMeta
@@ -90,7 +90,7 @@ def _trace_worker(rank, world_size, init_file, out_dir, failure):
         timeout=timedelta(seconds=60),
     )
     try:
-        integration.init_straggler_gather_group(timeout_s=10)
+        collectives.init_straggler_gather_group(timeout_s=10)
         calls, sunk = [], []
         window = itertools.count(1)
 
@@ -98,8 +98,8 @@ def _trace_worker(rank, world_size, init_file, out_dir, failure):
             failing = failure if rank == 0 and next(window) == 2 else None
             if failing == "pack":
                 # torch.tensor cannot take the row: rank 0 sends NaN and raises after the collective.
-                return integration.gloo_all_gather([*values[:-1], object()])
-            gathered = integration.gloo_all_gather(values)
+                return collectives.gloo_all_gather([*values[:-1], object()])
+            gathered = collectives.gloo_all_gather(values)
             if failing == "readout":
                 # Like Tensor.tolist() failing: the collective is done on every rank, only rank 0 has no table.
                 raise MemoryError("injected after the row collective")
@@ -107,7 +107,7 @@ def _trace_worker(rank, world_size, init_file, out_dir, failure):
 
         def gather_to(sample, dst):
             calls.append(dst)
-            return integration.gloo_gather_objects_to(sample, dst)
+            return collectives.gloo_gather_objects_to(sample, dst)
 
         def sink(traces, meta, first_rollout):
             sunk.append([None if trace is None else len(trace.records) for trace in traces])
@@ -119,14 +119,14 @@ def _trace_worker(rank, world_size, init_file, out_dir, failure):
             report_interval=1,
             event_factory=FakeEvent,
             gather=gather,
-            gather_objects=integration.gloo_all_gather_objects,
+            gather_objects=collectives.gloo_all_gather_objects,
             is_capturing=lambda: False,
             analyze=WindowAnalyzer(trace_sink=sink),
             register_gc_callback=False,
             background=False,
             trace=True,
             gather_to=gather_to,
-            primary_rank=integration.gloo_primary_rank(rank == 1),
+            primary_rank=collectives.gloo_primary_rank(rank == 1),
             level=2,
         )
         for rollout_id in range(4):

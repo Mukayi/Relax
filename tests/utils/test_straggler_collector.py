@@ -54,21 +54,21 @@ def test_drain_folds_completed_events_in_order_and_recycles_them():
     bracket(collector)
     bracket(collector, "backward-compute")
     # Hold the second pair back: its end event is "still running".
-    _, _, _, pending_end, _, _, _ = collector._pending[1]
+    _, _, _, pending_end, _, _, _ = collector.recorder._pending[1]
     pending_end.done = False
-    assert collector.pending_events == 2
-    assert collector.drain() == 1
-    assert collector.pending_events == 1
+    assert collector.recorder.pending_events == 2
+    assert collector.recorder.drain() == 1
+    assert collector.recorder.pending_events == 1
     assert collector.window.get("fwd") == 1.0
     assert collector.window.get("num_fwd") == 1.0
     assert collector.window.get("bwd") == 0.0
     pending_end.done = True
-    assert collector.drain() == 1
+    assert collector.recorder.drain() == 1
     assert collector.window.get("bwd") == 1.0
     assert collector.window.get("cpu_bwd") >= 0.0
     assert collector.window.get("overhead") >= 0.0
     # The pool got all four events back.
-    assert len(collector._pool) == 4
+    assert len(collector.recorder._pool) == 4
 
 
 def test_drain_stops_at_first_incomplete_pair_and_requires_both_events():
@@ -77,33 +77,33 @@ def test_drain_stops_at_first_incomplete_pair_and_requires_both_events():
     bracket(collector, "backward-compute")
     # Pairs complete in stream order: an incomplete *start* of the first pair
     # blocks the (complete) second pair as well, so nothing is folded.
-    _, _, first_start, _, _, _, _ = collector._pending[0]
+    _, _, first_start, _, _, _, _ = collector.recorder._pending[0]
     first_start.done = False
-    assert collector.drain() == 0
-    assert collector.pending_events == 2
+    assert collector.recorder.drain() == 0
+    assert collector.recorder.pending_events == 2
     first_start.done = True
-    assert collector.drain() == 2
+    assert collector.recorder.drain() == 2
 
 
 def test_drain_leaves_queue_consistent_when_readout_raises():
     collector = _collector(world=1)
     bracket(collector)
     bracket(collector, "backward-compute")
-    _, _, start, _, _, _, _ = collector._pending[1]
+    _, _, start, _, _, _, _ = collector.recorder._pending[1]
 
     def boom(other):
         raise RuntimeError("device error")
 
     start.elapsed_time = boom
     with pytest.raises(RuntimeError):
-        collector.drain()
+        collector.recorder.drain()
     # First pair folded once and released; the failing pair is still queued and
     # its events were not handed back to the pool.
     assert collector.window.get("fwd") == 1.0
-    assert collector.pending_events == 1
-    assert len(collector._pool) == 2
+    assert collector.recorder.pending_events == 1
+    assert len(collector.recorder._pool) == 2
     with pytest.raises(RuntimeError):
-        collector.drain()
+        collector.recorder.drain()
     assert collector.window.get("fwd") == 1.0  # not double counted
 
 
@@ -111,14 +111,14 @@ def test_pending_queue_is_bounded_and_counts_drops():
     collector = _collector(world=1, max_pending=2)
     for _ in range(4):
         bracket(collector)
-    assert collector.pending_events == 2
+    assert collector.recorder.pending_events == 2
     assert collector.window.get("dropped") == 2.0
     # Dropped pairs go back to the pool, so the pool stops growing once the queue is full.
-    created = collector._pool.created
+    created = collector.recorder._pool.created
     assert created <= 2 * (2 + 1)
     for _ in range(20):
         bracket(collector)
-    assert collector._pool.created == created
+    assert collector.recorder._pool.created == created
     assert collector.window.get("dropped") == 22.0
 
 
@@ -127,23 +127,23 @@ def test_no_events_are_recorded_while_the_stream_is_being_captured():
     collector = _collector(world=1, is_capturing=capture)
     capture.active = True
     bracket(collector)
-    assert collector.pending_events == 0 and len(collector._pool) == 4
+    assert collector.recorder.pending_events == 0 and len(collector.recorder._pool) == 4
     # Capture begins between start and stop: the started event is recycled.
     capture.active = False
     timers(collector)("forward-compute").start()
     capture.active = True
     timers(collector)("forward-compute").stop()
-    assert collector.pending_events == 0 and len(collector._pool) == 4
+    assert collector.recorder.pending_events == 0 and len(collector.recorder._pool) == 4
     capture.active = False
     bracket(collector)
-    assert collector.pending_events == 1
+    assert collector.recorder.pending_events == 1
 
 
 def test_end_step_reports_every_interval_and_resets_window():
     collector = _collector(world=2, interval=3)
     reports = []
     for _ in range(6):
-        collector.note_tokens(1000)
+        collector.recorder.note_tokens(1000)
         bracket(collector)
         reports.append(collector.end_step())
     assert [len(ready) for ready in reports] == [0, 0, 1, 0, 0, 1]
@@ -210,7 +210,7 @@ def test_gather_table_from_other_ranks_drives_detection():
         return [values, slow]
 
     collector = _collector(world=2, interval=1, gather=gather)
-    collector.note_tokens(500)
+    collector.recorder.note_tokens(500)
     bracket(collector)
     bracket(collector, "backward-compute")
     (report,) = collector.end_step()
@@ -241,18 +241,18 @@ def test_forward_only_timers_land_in_lp_buckets():
     collector = _collector(world=1)
     timers(collector, "forward_only")("forward-compute", log_level=2).start()
     timers(collector, "forward_only")("forward-compute").stop()
-    collector.drain()
+    collector.recorder.drain()
     assert collector.window.get("lp_fwd") == 1.0
     assert collector.window.get("fwd") == 0.0
 
 
 def test_the_window_counts_a_micro_batch_once_whatever_its_model_chunks():
     collector = _collector(world=1)
-    collector.model_chunks = 2
+    collector.recorder.model_chunks = 2
     for tokens in (300, 300, 500, 500):  # each model chunk's forward of micro-batches 0 and 1
-        collector.note_tokens(tokens)
+        collector.recorder.note_tokens(tokens)
         bracket(collector)
-    collector.drain()
+    collector.recorder.drain()
     assert collector.window.get("tokens") == 800.0
     assert collector.window.get("mb_tokens_max") == 500.0
 
@@ -263,7 +263,7 @@ def _timed(collector, name, ms, tokens=None):
     timer = timers(collector)(name)
     timer.start()
     if tokens is not None:
-        collector.note_tokens(tokens)
+        collector.recorder.note_tokens(tokens)
     for _ in range(ms - 1):
         FakeEvent().record()
     timer.stop()
@@ -274,7 +274,7 @@ def test_unnumbered_brackets_carry_no_micro_batch_number_but_keep_their_tokens()
     collector, calls = _tracing_collector(interleaved=True)
     for rollout_id in range(2):
         collector.end_step(rollout_id=rollout_id)
-    collector.note_schedule(lambda: (), forward_only=False)
+    collector.recorder.note_schedule(lambda: (), forward_only=False)
     _timed(collector, "forward-compute", 3, tokens=300)
     _timed(collector, "forward-compute", 7, tokens=900)
     _timed(collector, "backward-compute", 5)
@@ -298,13 +298,13 @@ def test_under_interleaved_pp_brackets_take_the_micro_batch_and_model_chunk_of_t
     collector, calls = _tracing_collector(interleaved=True)
     for rollout_id in range(2):
         collector.end_step(rollout_id=rollout_id)
-    collector.note_schedule(lambda: _TABLE_5, forward_only=False)
+    collector.recorder.note_schedule(lambda: _TABLE_5, forward_only=False)
     for name in ("forward-compute", "backward-compute"):
         for _ in _TABLE_5:
             bracket(collector, name)
     # The next call of the step continues the micro-batch numbers; a bracket beyond its table has none,
     # and neither has a log-prob forward, which a training call's table does not cover.
-    collector.note_schedule(lambda: [(0, 0), (0, 1)], forward_only=False)
+    collector.recorder.note_schedule(lambda: [(0, 0), (0, 1)], forward_only=False)
     for _ in range(3):
         bracket(collector)
     bracket(collector, phase="forward_only")
@@ -327,7 +327,7 @@ def test_gradient_syncs_count_in_dp_grad_sync_only():
     collector = _collector(world=1)
     for name in GRAD_SYNC_TIMERS:
         bracket(collector, name)
-    collector.drain()
+    collector.recorder.drain()
     assert [collector.window.get(name) for name in GPU_SEGMENTS] == [
         float(len(GRAD_SYNC_TIMERS)) if name == "dp_grad_sync" else 0.0 for name in GPU_SEGMENTS
     ]
@@ -339,7 +339,7 @@ def test_training_pp_waits_are_also_split_by_1f1b_phase():
         bracket(collector, name)
     bracket(collector, "forward-send-forward-recv")  # interleaved schedule: total only
     bracket(collector, "forward-recv", phase="forward_only")
-    collector.drain()
+    collector.recorder.drain()
     assert collector.window.get("pp_recv") == 5.0
     assert [collector.window.get(name) for name in PP_PHASE_FIELDS] == [1.0, 1.0, 1.0, 1.0]
     assert collector.window.get("lp_pp_recv") == 1.0
@@ -481,12 +481,12 @@ def test_a_sample_still_in_flight_at_the_close_is_dropped():
     collector, calls = _tracing_collector(interval=1)
     collector.end_step(rollout_id=0)
     bracket(collector)
-    _, _, _, end, _, _, _ = collector._pending[0]
+    _, _, _, end, _, _, _ = collector.recorder._pending[0]
     end.done = False
     collector.end_step(rollout_id=1)
     assert calls["gathered"][-1][0] is None
     # The anchor is back in the pool; the unread pair still holds its two events.
-    assert len(collector._pool) == 2
+    assert len(collector.recorder._pool) == 2
 
 
 @pytest.mark.parametrize(
@@ -540,7 +540,7 @@ def test_a_paused_rank_records_nothing_and_its_windows_are_not_analyzed():
     analyzer = report_module.WindowAnalyzer()
     collector = _collector(world=1, interval=1, level=0, analyzer=analyzer)
     bracket(collector)
-    assert collector.pending_events == 0
+    assert collector.recorder.pending_events == 0
     (report,) = collector.end_step(rollout_id=0)
     assert (report.note, report.metrics) == ("paused", {"straggler/control/level": 0.0})
     assert analyzer.state.consecutive == {}
@@ -554,7 +554,7 @@ def test_the_requested_level_travels_in_the_primary_row_and_applies_from_the_nex
     assert collector.gather_calls[-1][FIELD_INDEX["control"]] == 1.0
     assert collector.status() == {"level": 0, "rollout": 0, "health": "active"}
     bracket(collector)
-    assert collector.pending_events == 0
+    assert collector.recorder.pending_events == 0
 
 
 class _ModuleTimers:
@@ -569,16 +569,16 @@ class _ModuleTimers:
 
 
 def _module_bracket(collector, layer):
-    start = collector.record_event()
-    end = collector.record_event()
+    start = collector.recorder.record_event()
+    end = collector.recorder.record_event()
     if start is not None:
-        collector.push(_ATTN_FWD, layer, start, end, 0.0)
+        collector.recorder.push(_ATTN_FWD, layer, start, end, 0.0)
 
 
 def test_the_modules_level_times_only_the_sampled_step_and_keeps_module_brackets_out_of_the_window():
     gathered, gather = _recording_gather()
     collector, calls = _tracing_collector(level=3, gather=gather, max_trace_brackets=1, max_module_brackets=1)
-    timers = collector.module_timers = _ModuleTimers()
+    timers = collector.recorder.module_timers = _ModuleTimers()
     after_step = []
     for rollout_id in range(4):
         bracket(collector)
@@ -605,7 +605,7 @@ def test_a_module_bracket_finding_the_queue_full_is_dropped_instead_of_a_window_
     collector.end_step(rollout_id=0)
     bracket(collector)
     _module_bracket(collector, 1)
-    assert (collector.pending_events, collector.window.get("dropped")) == (1, 0.0)
+    assert (collector.recorder.pending_events, collector.window.get("dropped")) == (1, 0.0)
     collector.end_step(rollout_id=1)
     sample, _ = calls["gathered"][-1]
     assert [int(r[0]) for r in _rows(sample)] == [FIELD_INDEX["fwd"]] and sample.lost == 1
@@ -617,16 +617,16 @@ def test_module_brackets_take_at_most_half_the_queue_and_make_room_without_count
     collector.end_step(rollout_id=0)
     for layer in (1, 2, 3):
         _module_bracket(collector, layer)
-    assert collector.pending_events == 2, "the third module bracket found half the queue taken"
+    assert collector.recorder.pending_events == 2, "the third module bracket found half the queue taken"
     for _ in range(4):
         bracket(collector)
     # Two window brackets filled the queue; the next two pushed out the module brackets.
-    assert (collector.pending_events, collector.window.get("dropped")) == (4, 0.0)
+    assert (collector.recorder.pending_events, collector.window.get("dropped")) == (4, 0.0)
     bracket(collector)
     assert collector.window.get("dropped") == 1.0, "only a window bracket counts once the queue is all its own"
-    collector.drain()
+    collector.recorder.drain()
     _module_bracket(collector, 4)
-    assert collector.pending_events == 1
+    assert collector.recorder.pending_events == 1
 
 
 def test_a_window_bracket_pushes_out_a_module_bracket_queued_after_older_window_brackets():
@@ -656,14 +656,14 @@ def test_module_brackets_in_flight_at_the_close_do_not_count_as_unread():
     collector, calls = _tracing_collector(level=3, interval=1, gather=gather)
     collector.end_step(rollout_id=0)
     bracket(collector)
-    start = collector.record_event()
-    end = collector.record_event()
+    start = collector.recorder.record_event()
+    end = collector.recorder.record_event()
     end.done = False
-    collector.push(_ATTN_FWD, 1, start, end, 0.0)
+    collector.recorder.push(_ATTN_FWD, 1, start, end, 0.0)
     collector.end_step(rollout_id=1)
     assert rows[-1][FIELD_INDEX["unread"]] == 0.0
     # The sample is dropped, its module bracket with it.
-    assert calls["gathered"][-1][0] is None and collector.pending_events == 0
+    assert calls["gathered"][-1][0] is None and collector.recorder.pending_events == 0
 
 
 @pytest.mark.parametrize(
@@ -693,19 +693,19 @@ def test_gc_on_another_thread_does_not_touch_the_training_threads_pause():
     collector = make_collector(world=1, clock=lambda: clock[0])
     bracket(collector)  # the first bracket fixes the training thread
     clock[0] = 1.0
-    collector._on_gc("start", {})
+    collector.recorder.on_gc("start", {})
 
     def worker_gc():
         clock[0] = 2.0
-        collector._on_gc("start", {})
+        collector.recorder.on_gc("start", {})
         clock[0] = 3.0
-        collector._on_gc("stop", {})
+        collector.recorder.on_gc("stop", {})
 
     worker = threading.Thread(target=worker_gc)
     worker.start()
     worker.join()
     clock[0] = 6.0
-    collector._on_gc("stop", {})
+    collector.recorder.on_gc("stop", {})
     # Checked before end_step, which resets the window at interval=1.
     assert collector.window.get("gc") == pytest.approx(5000.0)
 
@@ -728,9 +728,9 @@ def test_collector_constructed_on_another_thread_uses_bracket_thread():
     # First bracket on the main thread establishes the training thread
     bracket(collector)
     clock[0] = 1.0
-    collector._on_gc("start", {})
+    collector.recorder.on_gc("start", {})
     clock[0] = 3.0
-    collector._on_gc("stop", {})
+    collector.recorder.on_gc("stop", {})
     # Check before end_step, which would reset the window (interval=1)
     assert collector.window.get("gc") == pytest.approx(2000.0)
     collector.close()
