@@ -141,6 +141,7 @@ closed; their time lands in the next window
 | `{pp_wait_fill,pp_wait_up,pp_wait_down,pp_wait_drain}/{max_ms,max_rank}` | 训练阶段的 PP 等待按非交错 1F1B 的阶段拆开：`fill` 填充时等上游激活，`up` / `down` 稳态时等上游激活 / 下游梯度，`drain` 排空时等下游梯度。均衡的流水线在稳态不空等，`up + down` 超出传输时间的部分就是多出来的气泡；上游 rank 在一步开头停顿时体现在下游 stage 的 `fill` 上。只在开 PP 时输出 |
 | `pp_bubble/ratio` | `pp_recv` 占已计时训练时间的比例，取各 PP stage 中位数的最大值；只在开 PP 时输出 |
 | `micro_batch/{fwd_max_ms,fwd_max_rank,fwd_argmax,fwd_argmax_tokens,fwd_min_ms,bwd_max_ms,bwd_max_rank,tokens_max,tokens_min}` | 本窗口单个训练 micro-batch 的极值：最慢的前向及其 rank、它在所在 rollout 里的 micro-batch 序号（从 0 起）和 token 数（拿不到时为 −1），最快的前向，最慢的反向及其 rank，单个 micro-batch 的最大 / 最小 token 数（没有 token 数时不输出） |
+| `step_max/{fwd,bwd,optim,pp_recv,dp_grad_sync}_{ms,rank}` | 本窗口内各段单个 rollout 的最大耗时及其 rank：窗口平均值看不出的单次变慢（某个 rollout 慢了一次，或到窗口末尾才开始变慢）在这里能看到；从未计时的段不输出 |
 | `gc/{median_ms,max_ms}` | Python GC 停顿 |
 | `waiting/count` | 因上游 PP stage 慢而在等待的 rank 数；它们是被拖慢的，不计入 `flagged` |
 | `uncertain/{rank,cause}` | 第一个「不确定」的 rank（没有时为 −1）及其原因。cause 编码：0 none、1 dropped_events、2 unread_events、3 profiler_errors、4 no_peers、5 missing_tokens、6 no_wait_reference |
@@ -190,7 +191,7 @@ primary 自己的 CPU 侧计时（例如 `actor_train`、每个 micro-batch 的 
 
 ## 开销
 
-- 每个计时点一对非阻塞的 CUDA event，每步结束时只读取已完成的事件；每个窗口一次 Gloo all-gather，每个 rank 发送 272 B。
+- 每个计时点一对非阻塞的 CUDA event，每步结束时只读取已完成的事件；每个窗口一次 Gloo all-gather，每个 rank 发送 312 B。
 - 8×A100、Qwen3-0.6B DP8（每步约 1 s）、完整功能（级别 2、trace 目录、metrics service、overlap）下，分析器在 rank 0 上的直接开销约每步 1.5 ms（约 0.15%），其中计时点约占六成；其他 rank 在下一个集合通信上等 rank 0。端到端运行内交叉对照为 +0.13%（95% CI −0.05%～+0.30%，4 组），区间上界低于 0.5%。
 - 采样步 trace：每个窗口多一次设备同步和锚点（约 1.1 ms），并在窗口结束时把采样步 gather 到 primary（窗口结束的两次 gather 共约 2 ms）；默认窗口下每步最多约 0.03%。
 - `modules` 级别：同样的端到端交叉对照为 +0.34%（95% CI +0.20%～+0.48%，4 组）。每个块的前向多约 21 µs、反向多约 15 µs CPU 时间（单卡微基准），每个窗口读取模块计时多约 3.5 ms；Qwen3-0.6B TP1×PP4×DP2 上采样步的前向、反向与 detail 级别分不开（±3% 以内）。
@@ -202,6 +203,6 @@ primary 自己的 CPU 侧计时（例如 `actor_train`、每个 micro-batch 的 
 - 同一 TP 组的 rank 在前向 / 反向里互相等待，其中一个变慢时整组都会被报出，分不出谁先变慢；所有 rank 同时变慢时（整机降频、共享存储抖动、整组通信变慢）发现不了。
 - PP 阶段拆分、trace 里的阶段命名和气泡推算只适用于非交错 1F1B，VPP 的收发只计入 `pp_recv`。VPP 下的 micro-batch 序号和模型块按 Megatron 的交错调度表（`get_schedule_table`，用模型自己的 config 生成）由调用顺序换算；`combined_1f1b` 的训练调用把前向和反向合并执行，不编号。
 - 跨卡对齐依赖各 rank 的墙钟，跨机器时受 NTP 精度影响，误差见日志 `other metrics` 一行里的 `trace/align_spread_ms`。窗口只有 1 个 rollout 时，采样步可能来不及读完，这个窗口就没有 trace。CUDA graph 捕获期间不计时。
-- 告警有延迟：默认参数下从开始变慢到告警约 21–30 个 rollout。调小 `REPORT_INTERVAL` 或 `PERSIST_WINDOWS` 能更早告警，但更容易被一次性抖动触发。
+- 告警有延迟：默认参数下从开始变慢到告警约 21–30 个 rollout。延迟按 rollout 个数计，rollout 很长（例如每个几分钟）时建议把 `REPORT_INTERVAL` 设为 1–2：在 Qwen3-0.6B DP8 上设为 1 时两次运行分别在第 3、4 个 rollout 告警，40 个 rollout 的正常运行没有误报，代价是每个 rollout 一次 gather（8 卡约 1 ms）。调小 `PERSIST_WINDOWS` 也能更早告警，但更容易被一次性抖动触发。
 - 计时依赖 Megatron 的计时接口（`config.timers`）。Megatron 版本的调用方式变了（出现不认识的计时点名字，给 `timers()` / `start` / `stop` 传入新参数，或调用 `Timers.log` / `write`），或者第一个 rollout 没有走到每步都会调用的计时点（`forward-compute`、`backward-compute`、`all-grads-sync`、`optimizer-copy-to-main-grad`；log-prob 前向为 `forward-compute`）时，训练不会中断：这次调用被忽略，打一条警告，这个 rank 此后的 `straggler/health/state` 记为 1（degraded），但不计入自动关闭的条件，相应的时间不进统计。适配层的 CPU 契约测试会对照已安装的 Megatron 检查这些变化。关闭 profiler（`RELAX_STRAGGLER_PROFILER=0`）即恢复 `config.timers = None`。
 - 某个 rank 进程整个消失时，其余 rank 的每次 gather 都要等到 `RELAX_STRAGGLER_GATHER_TIMEOUT_S` 超时，失败多次后各自关闭分析器。
