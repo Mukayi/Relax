@@ -150,6 +150,30 @@ def test_relapse_during_recovery_keeps_the_alert_without_a_new_warning():
     assert analyze_window(_clean(), _meta(4), config, state).metrics["straggler/flagged/count"] == 0
 
 
+def test_a_new_reason_replaces_the_active_one_only_after_persist_windows():
+    # Near a threshold the evidence can tip between reasons from one window to the next
+    # (0.6B DP8, 100 ms sleep: one window of slow_device, forward 1.11x, among late_arrival windows).
+    config = DetectorConfig(persist_windows=2)
+    state = DetectorState()
+    late = [_healthy_row(dp_grad_sync=150.0) for _ in range(8)]
+    late[3] = _healthy_row(dp_grad_sync=5.0)
+    slow = [_healthy_row(dp_grad_sync=150.0) for _ in range(8)]
+    slow[3] = _healthy_row(fwd=130.0, dp_grad_sync=5.0)
+    reports = [analyze_window(table, _meta(8), config, state) for table in (late, late, slow, late, slow, slow)]
+    assert [[(a.rank, a.reason, a.new) for a in report.alerts] for report in reports] == [
+        [],
+        [(3, "late_arrival", True)],
+        [(3, "late_arrival", False)],
+        [(3, "late_arrival", False)],
+        [(3, "late_arrival", False)],
+        [(3, "slow_device", True)],
+    ]
+    assert "-> slow_device; kept as late_arrival until slow_device holds for 2 windows (1/2)" in (
+        reports[2].alerts[0].message
+    )
+    assert state.pending == {}
+
+
 def test_rank_with_a_single_member_stage_is_uncertain_not_silently_ok():
     # PP=2 with one rank per stage: nobody to compare with.
     report = _analyze_once([_healthy_row(), _healthy_row(fwd=500.0)], _meta(2, pp_size=2))
@@ -414,7 +438,7 @@ def test_late_arrival_under_overlapped_grad_reduce_shows_in_the_peers_backward()
     assert report.metrics["straggler/late/peer_idle_ms"] == pytest.approx(158.0)
 
 
-def test_slow_tp_pair_does_not_make_its_unflagged_stage_peers_upstream_wait():
+def _slow_tp_pair_4b():
     # Qwen3-4B TP2 x PP2 x DP2 with SM contention on GPU 1 (numbers from that run): ranks 0 / 1
     # (dp0, stage 0) are slow, so they hardly wait on PP; ranks 2 / 3 wait as usual
     # (820 ms) and must not be compared with 0 / 1. Ranks 4 / 5 (dp0, stage 1) wait
@@ -431,9 +455,28 @@ def test_slow_tp_pair_does_not_make_its_unflagged_stage_peers_upstream_wait():
         _healthy_row(fwd=995.0, bwd=1955.0, pp_recv=800.0, dp_grad_sync=100.0),
         _healthy_row(fwd=995.0, bwd=1955.0, pp_recv=801.0, dp_grad_sync=100.0),
     ]
-    report = _analyze_once(stage0 + stage1, _meta(8, pp_size=2, tp_size=2))
+    return stage0 + stage1
+
+
+def test_slow_tp_pair_does_not_make_its_unflagged_stage_peers_upstream_wait():
+    report = _analyze_once(_slow_tp_pair_4b(), _meta(8, pp_size=2, tp_size=2))
     assert _reasons(report) == [(0, "slow_device"), (1, "slow_device"), (4, "upstream_wait"), (5, "upstream_wait")]
     assert report.uncertain == []
+
+
+def test_a_tp_group_flagged_as_a_whole_is_named_as_the_finding():
+    report = _analyze_once(_slow_tp_pair_4b(), _meta(8, pp_size=2, tp_size=2))
+    named = [alert.rank for alert in report.alerts if "its whole TP group (ranks 0, 1) is flagged" in alert.message]
+    assert named == [0, 1]
+    assert "which of them slowed down first is not known" in report.alerts[0].message
+
+
+def test_a_tp_rank_flagged_without_the_rest_of_its_group_does_not_name_the_group():
+    table = [_healthy_row() for _ in range(8)]
+    table[2] = _healthy_row(fwd=150.0, bwd=300.0)  # TP group of ranks 2 and 3
+    report = _analyze_once(table, _meta(8, tp_size=2))
+    assert _reasons(report) == [(2, "slow_device")]
+    assert "TP group" not in report.alerts[0].message
 
 
 def test_rank_late_to_the_grad_sync_because_it_waits_on_pp_is_upstream_wait():
@@ -462,6 +505,65 @@ def test_pp_wait_without_an_unflagged_stage_peer_is_uncertain():
     assert _reasons(report) == [(0, "slow_device"), (2, "upstream_wait")]
     assert [(u.rank, u.cause) for u in report.uncertain] == [(1, "no_wait_reference")]
     assert report.metrics["straggler/uncertain/cause"] == UNCERTAIN_CODE["no_wait_reference"]
+
+
+def test_rank_late_because_it_waits_on_a_slow_rank_of_its_pipeline_is_upstream_wait():
+    # Qwen3-0.6B TP1 x PP4 x DP2 with GPU 3 <-> 4 copies slowing rank 3 (pp1 dp1) and rank 4 (pp2 dp0);
+    # window numbers from that run. Rank 2 waits on PP for slow rank 4 of its pipeline and rank 5 for slow
+    # rank 3, so each reaches the grad-sync late (88.0 / 56.4 ms), and the only other rank of its stage is
+    # flagged: there is no on-time rank to compare its PP wait with, only its grad-sync peer.
+    table = [
+        _healthy_row(fwd=205.0, bwd=376.4, optim=2.0, pp_recv=904.8),
+        _healthy_row(fwd=206.0, bwd=379.8, optim=2.0, pp_recv=900.7),
+        _healthy_row(fwd=214.0, bwd=354.7, optim=2.0, pp_recv=870.7),
+        _healthy_row(fwd=244.0, bwd=405.2, optim=2.0, pp_recv=752.0, dp_grad_sync=42.5),
+        _healthy_row(fwd=240.0, bwd=409.7, optim=2.0, pp_recv=756.9),
+        _healthy_row(fwd=210.0, bwd=349.7, optim=2.0, pp_recv=844.1, dp_grad_sync=8.6),
+        _healthy_row(fwd=520.0, bwd=737.4, optim=2.0, pp_recv=219.6),
+        _healthy_row(fwd=518.0, bwd=732.0, optim=2.0, pp_recv=215.1),
+    ]
+    report = _analyze_once(table, _meta(8, pp_size=4))
+    assert _reasons(report) == [(2, "upstream_wait"), (3, "slow_device"), (4, "slow_device"), (5, "upstream_wait")]
+    assert (
+        "waits on PP peers 870.7 ms/step, 118.7 ms more than its grad-sync peers, "
+        "and reaches the grad-sync 88.0 ms after them" in report.alerts[0].message
+    )
+    assert report.uncertain == []
+
+
+def test_late_rank_whose_pp_wait_matches_its_peers_stays_late_arrival():
+    # The same layout, rank 2 now stalled on its host: it waits on PP no longer than rank 3 does.
+    table = [_healthy_row(optim=2.0, pp_recv=800.0, dp_grad_sync=90.0) for _ in range(8)]
+    table[2] = _healthy_row(optim=2.0, pp_recv=790.0, dp_grad_sync=5.0)
+    table[3] = _healthy_row(fwd=130.0, optim=2.0, pp_recv=760.0, dp_grad_sync=90.0)
+    report = _analyze_once(table, _meta(8, pp_size=4))
+    assert (2, "late_arrival") in _reasons(report)
+
+
+def test_peer_of_a_late_rank_whose_backward_holds_the_wait_is_not_slow_device():
+    # Qwen3-0.6B TP1 x PP4 x DP2 with overlap, rank 0 (pp0 dp0) sleeping 200 ms at the start of each step;
+    # window numbers from that run. Rank 1, the only other rank of stage 0, waits for rank 0's
+    # reduce-scatter inside its backward: its self total is 1.31x rank 0's, its forward is not longer.
+    table = [
+        _healthy_row(fwd=200.0, bwd=388.5, optim=2.0, pp_recv=896.2),
+        _healthy_row(fwd=200.0, bwd=572.3, optim=2.0, pp_recv=894.3, dp_grad_sync=23.2),
+        _healthy_row(fwd=195.0, bwd=369.2, optim=2.0, pp_recv=1078.2, dp_grad_sync=1.4),
+        _healthy_row(fwd=195.0, bwd=368.7, optim=2.0, pp_recv=878.2, dp_grad_sync=201.6),
+        _healthy_row(fwd=197.0, bwd=376.2, optim=2.0, pp_recv=1036.5, dp_grad_sync=1.4),
+        _healthy_row(fwd=198.0, bwd=379.5, optim=2.0, pp_recv=833.2, dp_grad_sync=199.5),
+        _healthy_row(fwd=500.0, bwd=768.0, optim=2.0, pp_recv=306.4, dp_grad_sync=108.0),
+        _healthy_row(fwd=502.0, bwd=770.4, optim=2.0, pp_recv=99.8, dp_grad_sync=107.8),
+    ]
+    report = _analyze_once(table, _meta(8, pp_size=4))
+    assert _reasons(report) == [(0, "late_arrival"), (2, "upstream_wait"), (4, "upstream_wait"), (6, "upstream_wait")]
+    # Its stage has no on-time, unflagged rank to compare its own PP wait with.
+    assert [(u.rank, u.cause) for u in report.uncertain] == [(1, "no_wait_reference")]
+
+
+def test_a_slow_backward_without_a_late_peer_is_still_slow_device():
+    # Without overlap rank 0 waits the extra 60 ms in the grad-sync, so nobody is late.
+    table = [_healthy_row(dp_grad_sync=65.0), _healthy_row(bwd=260.0)]
+    assert _reasons(_analyze_once(table, _meta(2))) == [(1, "slow_device")]
 
 
 def test_missing_tokens_disables_token_metrics():

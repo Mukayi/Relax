@@ -31,7 +31,17 @@ A rank that is neither but waits on its PP neighbours much longer than the
 unflagged, on-time ranks of its stage is ``upstream_wait``; flagged and late
 ranks wait *less* (their neighbours wait for them), so they are left out of
 that reference. A rank that is late only because of such a PP wait is
-``upstream_wait`` too.
+``upstream_wait`` too, also when its stage has no such rank: then its PP wait
+is compared with its grad-sync peers', and the excess must account for at
+least half its lateness.
+
+Waiting is not slowness: with an overlapped grad reduce a rank's backward
+also holds its wait for a late grad-sync peer, so a rank whose self total but
+not its forward stands out is not a culprit when a late peer accounts for at
+least half the excess. TP ranks wait for each other inside every layer, so
+one slow rank can flag its whole TP group; the alerts then say the group is
+the finding. A new reason replaces a rank's active one only after holding for
+``persist_windows`` windows, so a window near a threshold does not flip it.
 
 Segment times come from events on the compute stream, so they include host
 launch gaps inside the bracket; "GPU time" below is shorthand for that.
@@ -48,7 +58,7 @@ an alert, which needs ``recover_windows`` consecutive clean windows.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Hashable, Sequence
 
 import numpy as np
@@ -138,6 +148,8 @@ class DetectorState:
     clean: dict[int, int] = field(default_factory=dict)
     # Uncertain cause per rank in the previous window.
     uncertain: dict[int, str] = field(default_factory=dict)
+    # A reason other than the rank's active one, and the windows in a row it has held.
+    pending: dict[int, tuple[str, int]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -332,6 +344,7 @@ class _Peers:
     rel_fwd_ktok: np.ndarray
     rel_wait: np.ndarray
     segment_rel: dict[str, np.ndarray]
+    self_peer: np.ndarray  # leave-one-out median self time of the rank's stage peers
     stage_self: np.ndarray  # median self time of the rank's stage
     stage_medians: list[float]
     group_size: np.ndarray
@@ -344,6 +357,7 @@ def _stage_peers(w: _Window, meta: Sequence[RankMeta]) -> _Peers:
     p = _Peers(
         **{name: np.zeros(world) for name in zeros},
         segment_rel={name: np.zeros(world) for name in GPU_SEGMENTS},
+        self_peer=w.self_ms.copy(),
         stage_self=np.zeros(world),
         stage_medians=[],
         group_size=np.zeros(world),
@@ -357,7 +371,7 @@ def _stage_peers(w: _Window, meta: Sequence[RankMeta]) -> _Peers:
         p.stage_self[idx] = median_self
         p.group_size[idx] = idx.shape[0]
         p.group_has_tokens[idx] = bool(np.all(w.tokens[idx] > 0))
-        p.rel_self[idx], p.z_self[idx], _ = _relative_and_z(w.self_ms[idx])
+        p.rel_self[idx], p.z_self[idx], p.self_peer[idx] = _relative_and_z(w.self_ms[idx])
         p.rel_fwd[idx], p.z_fwd[idx], _ = _relative_and_z(fwd[idx])
         p.rel_tok[idx], _, _ = _relative_and_z(w.tokens[idx])
         p.rel_ktok[idx], _, _ = _relative_and_z(w.per_ktok[idx])
@@ -395,6 +409,65 @@ def _late_arrival(w: _Window, meta: Sequence[RankMeta]) -> _Late:
         late.rel[idx] = late.ms[idx] / np.maximum(late.peer_idle[idx], _EPS)
         late.z[idx] = np.maximum(-z, 0.0)
     return late
+
+
+# A wait explains an excess (lateness, a longer self total) when it accounts for at least this fraction of it.
+_EXPLAINED_FRACTION = 0.5
+
+
+def _sync_groups(meta: Sequence[RankMeta]) -> list[np.ndarray]:
+    """The grad-sync groups ``_late_arrival`` measures lateness within."""
+    return _group_indices(meta, lambda m: (m.pp, m.tp))
+
+
+def _pp_excess_over_sync_peers(pp_recv: np.ndarray, meta: Sequence[RankMeta]) -> np.ndarray:
+    """Each rank's ``pp_recv`` above the leave-one-out median of its grad-sync
+    peers."""
+    excess = np.zeros(len(meta))
+    for idx in _sync_groups(meta):
+        if idx.shape[0] >= 2:
+            excess[idx] = pp_recv[idx] - _leave_one_out_median(pp_recv[idx])
+    return excess
+
+
+def _late_peer_ms(late_ms: np.ndarray, late_candidates: np.ndarray, meta: Sequence[RankMeta]) -> np.ndarray:
+    """The largest lateness among each rank's grad-sync peers that are late
+    candidates; 0 without one."""
+    out = np.zeros(len(meta))
+    for idx in _sync_groups(meta):
+        if idx.shape[0] < 2:
+            continue
+        late = np.where(late_candidates[idx], late_ms[idx], 0.0)
+        top = int(np.argmax(late))
+        out[idx] = late[top]
+        out[idx[top]] = np.max(np.delete(late, top))
+    return out
+
+
+_TP_GROUP_REASONS = ("slow_device", "cpu_bound")
+
+
+def _name_tp_groups(alerts: list[Alert], meta: Sequence[RankMeta], active: dict[int, str]) -> list[Alert]:
+    """Culprits whose whole TP group is flagged with them say so: TP ranks wait
+    for each other inside every layer, so the one that slowed down first is not
+    known."""
+    groups: dict[tuple[int, int, int], list[int]] = {}
+    for m in meta:
+        groups.setdefault((m.pp, m.dp, m.cp), []).append(m.rank)
+    whole: dict[int, list[int]] = {}
+    for ranks in groups.values():
+        if len(ranks) > 1 and all(active.get(rank) in _TP_GROUP_REASONS for rank in ranks):
+            whole.update({rank: ranks for rank in ranks})
+    return [
+        replace(
+            alert,
+            message=f"{alert.message}; its whole TP group (ranks {', '.join(map(str, whole[alert.rank]))}) is "
+            "flagged: TP ranks wait for each other inside every layer, so which of them slowed down first is not known",
+        )
+        if alert.rank in whole
+        else alert
+        for alert in alerts
+    ]
 
 
 @dataclass
@@ -724,12 +797,23 @@ def analyze_window(
     # A rank that is late because it waits on PP is not a culprit; ranks that had
     # no reference without it are compared with it too.
     late_candidates &= ~_wait_signal(pp_recv, wait, peers, config)
-    wait = _with_fallback(wait, _pp_wait(pp_recv, meta, unflagged & ~late_candidates))
+    pp_excess = _pp_excess_over_sync_peers(pp_recv, meta)
+    late_on_pp = late_candidates & (pp_excess >= _EXPLAINED_FRACTION * late.ms)
+    late_candidates &= ~late_on_pp
+    self_excess = w.self_ms - peers.self_peer
+    waits_on_late_peer = (
+        self_signal
+        & ~fwd_signal
+        & (_late_peer_ms(late.ms, late_candidates & certain, meta) >= _EXPLAINED_FRACTION * self_excess)
+    )
+    self_candidates &= ~waits_on_late_peer
+    unflagged = certain & ~self_candidates
+    wait = _with_fallback(wait, _pp_wait(pp_recv, meta, unflagged & ~late_candidates & ~late_on_pp))
     candidates = self_candidates | (late_candidates & certain)
-    for i in np.flatnonzero(certain & ~candidates & (pp_recv > _EPS) & ~wait.has_reference):
+    for i in np.flatnonzero(certain & ~candidates & ~late_on_pp & (pp_recv > _EPS) & ~wait.has_reference):
         causes[i] = "no_wait_reference"
         certain[i] = False
-    waits = certain & ~candidates & _wait_signal(pp_recv, wait, peers, config)
+    waits = certain & ~candidates & (_wait_signal(pp_recv, wait, peers, config) | late_on_pp)
     _update_streaks(state, meta, certain, candidates, waits)
 
     alerts: list[Alert] = []
@@ -748,11 +832,31 @@ def analyze_window(
             )
         elif not cause and state.waiting.get(rank, 0) >= config.persist_windows:
             reason = "upstream_wait"
+            if late_on_pp[i]:
+                lead = (
+                    f"waits on PP peers {pp_recv[i]:.1f} ms/step, {pp_excess[i]:.1f} ms more than its grad-sync "
+                    f"peers, and reaches the grad-sync {late.ms[i]:.1f} ms after them"
+                )
+            else:
+                lead = f"waits on PP peers {pp_recv[i]:.1f} ms/step = {1 + wait.rel[i]:.2f}x its stage"
             message = (
-                f"rank {rank} ({rank_meta.tag}) waits on PP peers {pp_recv[i]:.1f} ms/step = "
-                f"{1 + wait.rel[i]:.2f}x its stage for {state.waiting[rank]} windows; its own compute is normal"
+                f"rank {rank} ({rank_meta.tag}) {lead} for {state.waiting[rank]} windows; its own compute is normal"
             )
         previous = state.active.get(rank)
+        if reason != "none" and previous not in (None, reason):
+            seen, held = state.pending.get(rank, (reason, 0))
+            held = held + 1 if seen == reason else 1
+            if held < config.persist_windows:
+                state.pending[rank] = (reason, held)
+                message = (
+                    f"{message}; kept as {previous} until {reason} holds for {config.persist_windows} windows "
+                    f"({held}/{config.persist_windows})"
+                )
+                reason = previous
+            else:
+                state.pending.pop(rank, None)
+        else:
+            state.pending.pop(rank, None)
         if reason == "none" and previous is not None:
             clean = state.clean.get(rank, 0)
             if cause or clean < config.recover_windows:
@@ -788,7 +892,7 @@ def analyze_window(
 
     return WindowReport(
         metrics=_metrics(w, peers, late, meta, active, uncertain, recovered),
-        alerts=alerts,
+        alerts=_name_tp_groups(alerts, meta, active),
         rows=rows,
         uncertain=uncertain,
         recovered=recovered,
