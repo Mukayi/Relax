@@ -183,10 +183,10 @@ primary 自己的 CPU 侧计时（例如 `actor_train`、每个 micro-batch 的 
 | `slow_device` | 自身计算时间或前向时间显著高于同 PP stage 的其他 rank，token 数正常 | `nvidia-smi -q -d CLOCK,PERFORMANCE,TEMPERATURE`、ECC、同机邻居、NVLink 拓扑 |
 | `data_imbalance` | 自身计算时间或前向时间偏高，但按 token 归一化后正常，token 数明显偏多 | `--balance-data`、动态 batch 切分、超长样本 |
 | `cpu_bound` | 自身计算时间或前向时间偏高，**且**训练步内的 Python GC 停顿占自身计算时间 ≥ 5% | `gc.freeze()`、数据处理线程与训练线程争抢 GIL、Python 侧逐 token 的循环 |
-| `upstream_wait` | 自身计算时间正常，但 `pp_recv` 显著高于同 stage 中没被判为慢或晚到的 rank，且超出量 ≥ 该 stage 自身计算时间中位数的 5%；因为等 PP 而晚到梯度同步的 rank 也归为这一类 | 看上游 stage 被告警的 rank，或 `pp_stage_imbalance`（层划分不均） |
+| `upstream_wait` | 自身计算时间正常，但 `pp_recv` 显著高于同 stage 中没被判为慢或晚到的 rank，且超出量 ≥ 该 stage 自身计算时间中位数的 5%；因为等 PP 而晚到梯度同步的 rank 也归为这一类。同 stage 没有这样的 rank 时（例如每个 stage 只有 2 个 rank、另一个已被告警），改和同一梯度同步组的 rank 比 `pp_recv`，多出的部分至少占它晚到时间的一半 | 看上游 stage 被告警的 rank，或 `pp_stage_imbalance`（层划分不均） |
 | `late_arrival` | 自身 GPU 时间正常，但 `bwd + dp_grad_sync` 显著**短于**同 DP 组其他 rank：集合通信对所有 rank 同时结束，最后到的 rank 等得最少 | GPU 之间的 CPU 侧空隙：取数据、同步 I/O / HTTP、GIL、launch 间隙；对该 rank 执行 `py-spy dump --pid <pid>` 最直接 |
 
-`late_arrival` 只看 GPU 时间发现不了：该 rank 的 GPU 时间和其他 rank 一样，只是每步都晚到梯度同步，常见原因是训练线程上的同步阻塞（例如在训练线程上用同步 HTTP 上报指标）。开启 `--overlap-grad-reduce` 时，等最慢 rank 的时间落在其他 rank 的 `bwd` 里，所以晚到按 `bwd + dp_grad_sync` 比较，慢 rank 另外单独比较前向时间。
+`late_arrival` 只看 GPU 时间发现不了：该 rank 的 GPU 时间和其他 rank 一样，只是每步都晚到梯度同步，常见原因是训练线程上的同步阻塞（例如在训练线程上用同步 HTTP 上报指标）。开启 `--overlap-grad-reduce` 时，等最慢 rank 的时间落在其他 rank 的 `bwd` 里，所以晚到按 `bwd + dp_grad_sync` 比较，慢 rank 另外单独比较前向时间。同样的原因，晚到 rank 的同伴反向会变长：只是自身计算时间偏高、前向不高的 rank，如果同一梯度同步组里晚到 rank 的晚到时间至少能解释它多出时间的一半，不报为慢。同一 TP 组整组都被报为慢时，告警会写明是整组：组内 rank 互相等待，分不出谁先变慢。已告警的 rank 换原因，要新原因连续 `PERSIST_WINDOWS` 个窗口都成立，在那之前保留原来的原因。
 
 ## 开销
 
@@ -199,7 +199,7 @@ primary 自己的 CPU 侧计时（例如 `actor_train`、每个 micro-batch 的 
 ## 限制
 
 - 计时复用 Megatron 已有的计时点。窗口统计里 attention、MoE、head / logits、MTP 的内部都包含在 `fwd` / `bwd` 中，`modules` 级别只在 trace 里给出每层 attention、MLP / MoE 和 MoE 层内各部分的耗时；EP all-to-all 计入计算时间；不给真实的通信计算重叠比例，`dp_grad_sync` 变小不能理解为重叠变好。
-- 同一 TP 组的 rank 在前向 / 反向里互相等待，其中一个变慢时整组都会被报出；所有 rank 同时变慢时（整机降频、共享存储抖动、整组通信变慢）发现不了。
+- 同一 TP 组的 rank 在前向 / 反向里互相等待，其中一个变慢时整组都会被报出，分不出谁先变慢；所有 rank 同时变慢时（整机降频、共享存储抖动、整组通信变慢）发现不了。
 - PP 阶段拆分、trace 里的阶段命名和气泡推算只适用于非交错 1F1B，VPP 的收发只计入 `pp_recv`。VPP 下的 micro-batch 序号和模型块按 Megatron 的交错调度表（`get_schedule_table`，用模型自己的 config 生成）由调用顺序换算；`combined_1f1b` 的训练调用把前向和反向合并执行，不编号。
 - 跨卡对齐依赖各 rank 的墙钟，跨机器时受 NTP 精度影响，误差见日志 `other metrics` 一行里的 `trace/align_spread_ms`。窗口只有 1 个 rollout 时，采样步可能来不及读完，这个窗口就没有 trace。CUDA graph 捕获期间不计时。
 - 告警有延迟：默认参数下从开始变慢到告警约 21–30 个 rollout。调小 `REPORT_INTERVAL` 或 `PERSIST_WINDOWS` 能更早告警，但更容易被一次性抖动触发。
