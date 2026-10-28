@@ -69,6 +69,7 @@ from relax.utils.straggler.core.stats import (
     PP_PHASE_FIELDS,
     SELF_SEGMENTS,
     WAIT_SEGMENTS,
+    RankMeta,
 )
 
 
@@ -88,26 +89,6 @@ UNCERTAIN_CAUSES: tuple[str, ...] = (
 UNCERTAIN_CODE: dict[str, int] = {cause: code for code, cause in enumerate(UNCERTAIN_CAUSES)}
 
 _EPS = 1e-9
-
-
-@dataclass(frozen=True)
-class RankMeta:
-    """Static identity of one training rank."""
-
-    rank: int
-    dp: int
-    tp: int
-    pp: int
-    cp: int = 0
-    ep: int = 0
-    host: str = ""
-    device: int = -1
-    # The rank that logs metrics and receives the sampled-step traces.
-    primary: bool = False
-
-    @property
-    def tag(self) -> str:
-        return f"rank{self.rank}_dp{self.dp}_tp{self.tp}_pp{self.pp}"
 
 
 @dataclass(frozen=True)
@@ -190,7 +171,7 @@ class WindowReport:
     metrics: dict[str, float]
     alerts: list[Alert]
     rows: list[dict[str, float | int | str]]
-    # Wall-clock start of the window; filled in by the collector for the timeline.
+    # Wall-clock start of the window, for the timeline.
     window_start_wall: float = 0.0
     # Free-text status for the log, e.g. why the profiler switched itself off.
     note: str = ""

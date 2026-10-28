@@ -3,7 +3,7 @@
 
 import threading
 
-from relax.utils.straggler.core import collector as collector_module
+from relax.utils.straggler.analysis import report as report_module
 from relax.utils.straggler.core.health import HealthConfig
 from relax.utils.straggler.core.stats import FIELD_INDEX
 from tests.utils.straggler_helpers import bracket, make_collector
@@ -21,14 +21,14 @@ def _step(collector, rollout_id):
 
 def _gated_analysis(monkeypatch):
     """Make the analysis wait until the test opens the gate."""
-    gate, started, real = threading.Event(), threading.Event(), collector_module.analyze_window
+    gate, started, real = threading.Event(), threading.Event(), report_module.analyze_window
 
     def gated(*args):
         started.set()
         assert gate.wait(10), "test never opened the gate"
         return real(*args)
 
-    monkeypatch.setattr(collector_module, "analyze_window", gated)
+    monkeypatch.setattr(report_module, "analyze_window", gated)
     return gate, started
 
 
@@ -95,7 +95,7 @@ def test_a_failing_analysis_is_counted_and_training_carries_on(monkeypatch):
     def boom(*args):
         raise ValueError("bad table")
 
-    monkeypatch.setattr(collector_module, "analyze_window", boom)
+    monkeypatch.setattr(report_module, "analyze_window", boom)
     collector = _collector()
     try:
         _step(collector, rollout_id=0)

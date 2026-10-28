@@ -13,7 +13,7 @@ block's output (its gradient arriving opens the bracket) and on its input
 and outputs, which also holds under activation recompute, where the block's
 forward runs again inside the backward. Which micro-batch a bracket belongs
 to, and whether a forward was a recompute, is read off the trace by
-containment (see ``trace``).
+containment (see ``analysis.trace``).
 
 Timing the blocks of another model means adding specs to the adapter's list.
 """

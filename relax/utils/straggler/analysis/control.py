@@ -1,12 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Switching the profiler's level while training runs, through the metrics
 service: an operator sets a level on a small HTTP page, the primary rank polls
-for it on a daemon thread, and the window gather hands it to every rank.
-
-Levels: 0 paused (no brackets recorded, windows not analyzed), 1 coarse (the
-per-window statistics), 2 detail (plus the sampled-step trace), 3 modules
-(plus the forward and backward of the blocks of every layer in that trace;
-never the default).
+for it on a daemon thread, and the window gather hands it to every rank. The
+levels are ``core.stats.LEVELS``.
 """
 
 from __future__ import annotations
@@ -17,10 +13,10 @@ import threading
 from time import time
 from typing import Any, Callable
 
+from relax.utils.straggler.core.stats import LEVELS
+
 
 logger = logging.getLogger(__name__)
-
-LEVELS: tuple[str, ...] = ("paused", "coarse", "detail", "modules")
 
 
 class ControlState:

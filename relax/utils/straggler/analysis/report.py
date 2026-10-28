@@ -1,7 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Turn one analyzed straggler window into scalars, timeline bars and log
-lines.
+"""Turn the primary rank's closed windows into reports, and each report into
+scalars, timeline bars and log lines.
 
+* ``WindowAnalyzer`` -> the collector's ``analyze``: the detector's verdict,
+  the sampled-step trace file and the log lines, on the analysis thread
 * the scalars in ``REPORTED_METRICS`` -> returned for the step's metrics call
 * per-rank segment bars -> one timeline row per rank
 * alerts, recoveries, uncertain ranks and the rest of the window's numbers -> logger, from the analysis thread
@@ -13,12 +15,14 @@ integration's business (``relax_integration``).
 from __future__ import annotations
 
 import logging
-from typing import NamedTuple
+from time import perf_counter, time
+from typing import Any, Callable, NamedTuple
 
-from relax.utils.straggler.core.detector import WindowReport
+from relax.utils.straggler.analysis.detector import DetectorConfig, DetectorState, WindowReport, analyze_window
+from relax.utils.straggler.analysis.trace import TIMELINE_PID_BASE
+from relax.utils.straggler.core.collector import ClosedWindow
 from relax.utils.straggler.core.health import HEALTH_DISABLE
-from relax.utils.straggler.core.stats import GPU_SEGMENTS
-from relax.utils.straggler.core.trace import TIMELINE_PID_BASE
+from relax.utils.straggler.core.stats import FIELD_INDEX, GPU_SEGMENTS, RankMeta, RankTrace
 
 
 logger = logging.getLogger(__name__)
@@ -63,6 +67,72 @@ REPORTED_METRICS: frozenset[str] = frozenset(
         "straggler/latency/analyzed_ms",
     }
 )
+
+_ERRORS_INDEX = FIELD_INDEX["errors"]
+
+# (gathered traces, rank metadata, first rollout of the window) -> trace scalars.
+TraceSink = Callable[[list[RankTrace | None], list[RankMeta], int], dict[str, float]]
+
+
+class WindowAnalyzer:
+    """The collector's ``analyze`` on the primary rank: turn a closed window
+    into its report (the detector's verdict, the paused note or the switch-off
+    notice), add the sampled-step trace's scalars and hand the report to
+    ``on_report``.
+
+    The collector calls it one window at a time in window order, so ``state``
+    needs no lock. ``guard`` is the collector's (see
+    ``core.collector.AnalyzeFn``), which also counts a failing analysis.
+    """
+
+    def __init__(
+        self,
+        config: DetectorConfig | None = None,
+        *,
+        trace_sink: TraceSink | None = None,
+        on_report: Callable[[WindowReport], None] | None = None,
+        clock: Callable[[], float] = perf_counter,
+        wall_clock: Callable[[], float] = time,
+    ) -> None:
+        self.config = config or DetectorConfig()
+        self.state = DetectorState()
+        self._trace_sink = trace_sink
+        self._on_report = on_report
+        self._clock = clock
+        self._wall = wall_clock
+
+    def __call__(self, window: ClosedWindow, guard: Callable[..., Any]) -> WindowReport:
+        if window.switch_off:
+            report = WindowReport(
+                metrics={
+                    "straggler/health/state": float(HEALTH_DISABLE),
+                    "straggler/health/requested_by": float(window.requested_by),
+                    "straggler/health/errors": float(sum(row[_ERRORS_INDEX] for row in window.table)),
+                },
+                alerts=[],
+                rows=[],
+                note=window.switch_off,
+            )
+        elif window.level == 0:
+            report = WindowReport(metrics={"straggler/control/level": 0.0}, alerts=[], rows=[], note="paused")
+        else:
+            started = self._clock()
+            report = analyze_window(window.table, window.meta, self.config, self.state)
+            report.metrics["straggler/gather_ms"] = window.gather_ms
+            report.metrics["straggler/analyze_ms"] = (self._clock() - started) * 1e3
+            report.metrics["straggler/control/level"] = float(window.level)
+            report.window_start_wall = window.window_start_wall
+            if window.traces is not None and self._trace_sink is not None:
+                report.metrics.update(
+                    guard("trace", self._trace_sink, window.traces, window.meta, window.first_rollout, default={})
+                )
+        report.first_rollout = window.first_rollout
+        report.last_rollout = window.last_rollout
+        report.closed_wall = window.closed_wall
+        report.analyzed_wall = self._wall()
+        if self._on_report is not None:
+            guard("report", self._on_report, report)
+        return report
 
 
 class TimelineBar(NamedTuple):

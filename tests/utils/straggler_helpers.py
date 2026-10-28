@@ -1,11 +1,13 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Shared fakes for the CPU-only straggler profiler tests."""
 
+from time import perf_counter, time
 from weakref import WeakKeyDictionary
 
+from relax.utils.straggler.analysis.detector import DetectorConfig
+from relax.utils.straggler.analysis.report import WindowAnalyzer
 from relax.utils.straggler.core.collector import StragglerCollector
-from relax.utils.straggler.core.detector import DetectorConfig, RankMeta
-from relax.utils.straggler.core.stats import FIELD_INDEX, NUM_FIELDS
+from relax.utils.straggler.core.stats import FIELD_INDEX, NUM_FIELDS, RankMeta
 from relax.utils.straggler.megatron_adapter import phase_timers
 
 
@@ -51,15 +53,26 @@ def make_collector(
     background=False,
     register_gc=False,
     is_capturing=None,
+    analyzer=None,
+    trace_sink=None,
+    on_report=None,
     **kwargs,
 ):
     """A CPU collector for rank 0 of ``world`` fake ranks; by default every
-    rank reports the same vector as rank 0."""
+    rank reports the same vector as rank 0, and the windows go to a
+    ``WindowAnalyzer`` on the collector's clocks."""
+    analyzer = analyzer or WindowAnalyzer(
+        DetectorConfig(persist_windows=persist),
+        trace_sink=trace_sink,
+        on_report=on_report,
+        clock=kwargs.get("clock", perf_counter),
+        wall_clock=kwargs.get("wall_clock", time),
+    )
     return StragglerCollector(
         rank_meta=RankMeta(rank=0, dp=0, tp=0, pp=0),
         is_primary=is_primary,
         report_interval=interval,
-        detector_config=DetectorConfig(persist_windows=persist),
+        analyze=analyzer,
         event_factory=FakeEvent,
         pool_size=kwargs.pop("pool_size", 4),
         gather=gather or (lambda values: [list(values) for _ in range(world)]),

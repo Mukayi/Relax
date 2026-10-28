@@ -14,7 +14,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from relax.utils.straggler.core.control import CONTROL_PAGE, ControlState
+from relax.utils.straggler.analysis.control import CONTROL_PAGE, ControlState
 
 
 router = APIRouter()

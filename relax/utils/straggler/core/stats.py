@@ -1,5 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Fixed layout of the per-rank straggler statistics vector.
+"""What the collection hands to the analysis: the fixed layout of the per-rank
+statistics vector, each rank's static identity, the records of a sampled step
+and the profiler levels.
 
 Every training rank accumulates one ``WindowStats`` over ``report_interval``
 steps and ships it as a flat ``float64[NUM_FIELDS]`` vector, so the cross-rank
@@ -8,7 +10,9 @@ gather is a single small collective regardless of model or parallelism.
 
 from __future__ import annotations
 
-from typing import Mapping
+from array import array
+from dataclasses import dataclass, field
+from typing import Any, Mapping
 
 from relax.utils.straggler.core.health import HEALTH_DISABLE
 
@@ -84,7 +88,7 @@ def disabled_row() -> list[float]:
 
 
 # Segments whose sum is "time this rank spent computing on its own" versus
-# "time this rank spent waiting for a peer". Used by the detector.
+# "time this rank spent waiting for a peer". Used by ``analysis.detector``.
 SELF_SEGMENTS: tuple[str, ...] = ("fwd", "bwd", "optim")
 WAIT_SEGMENTS: tuple[str, ...] = ("pp_recv", "dp_grad_sync", "dp_param_gather")
 
@@ -136,3 +140,49 @@ class WindowStats:
 
     def as_list(self) -> list[float]:
         return list(self.values)
+
+
+@dataclass(frozen=True)
+class RankMeta:
+    """Static identity of one training rank."""
+
+    rank: int
+    dp: int
+    tp: int
+    pp: int
+    cp: int = 0
+    ep: int = 0
+    host: str = ""
+    device: int = -1
+    # The rank that logs metrics and receives the sampled-step traces.
+    primary: bool = False
+
+    @property
+    def tag(self) -> str:
+        return f"rank{self.rank}_dp{self.dp}_tp{self.tp}_pp{self.pp}"
+
+
+# One bracket of a sampled step: segment, phase slot (see ``EventSink.push``; -1
+# if none), micro-batch (-1), tokens (-1), start and end in ms after the rank's
+# anchor event.
+RECORD_WIDTH = 6
+
+
+@dataclass
+class RankTrace:
+    """One rank's sampled step: the wall-clock time of its anchor event, its
+    brackets as flat ``RECORD_WIDTH``-float rows, how many brackets of the step
+    are missing, and on the primary rank its own CPU timeline events."""
+
+    wall: float
+    records: array = field(default_factory=lambda: array("f"))
+    lost: int = 0
+    cpu_events: list[dict[str, Any]] = field(default_factory=list)
+
+
+# The levels an operator can switch the profiler to while training runs: 0
+# paused (no brackets recorded, windows not analyzed), 1 coarse (the per-window
+# statistics), 2 detail (plus the sampled-step trace), 3 modules (plus the
+# forward and backward of the blocks of every layer in that trace; never the
+# default).
+LEVELS: tuple[str, ...] = ("paused", "coarse", "detail", "modules")

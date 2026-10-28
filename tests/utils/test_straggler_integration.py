@@ -13,8 +13,8 @@ import pytest
 
 from relax.utils.straggler import megatron_adapter
 from relax.utils.straggler import relax_integration as integration
-from relax.utils.straggler.core.detector import WindowReport
-from relax.utils.straggler.core.report import REPORTED_METRICS
+from relax.utils.straggler.analysis.detector import WindowReport
+from relax.utils.straggler.analysis.report import REPORTED_METRICS
 from relax.utils.straggler.relax_integration import StragglerProfiler, install_straggler_profiler
 from relax.utils.timer import TimelineEvent, Timer
 from tests.utils.straggler_helpers import FakeEvent, bracket, make_collector, meta

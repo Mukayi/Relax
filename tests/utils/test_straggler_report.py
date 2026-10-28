@@ -7,10 +7,10 @@ import pytest
 
 from relax.utils import tracking_utils
 from relax.utils.straggler import relax_integration as reporter
-from relax.utils.straggler.core import report as core_report
-from relax.utils.straggler.core.detector import DetectorConfig, DetectorState, WindowReport, analyze_window
-from relax.utils.straggler.core.report import REPORTED_METRICS
-from relax.utils.straggler.core.trace import TIMELINE_PID_BASE
+from relax.utils.straggler.analysis import report as report_module
+from relax.utils.straggler.analysis.detector import DetectorConfig, DetectorState, WindowReport, analyze_window
+from relax.utils.straggler.analysis.report import REPORTED_METRICS
+from relax.utils.straggler.analysis.trace import TIMELINE_PID_BASE
 from relax.utils.timer import Timer
 from tests.utils.straggler_helpers import meta as _meta
 from tests.utils.straggler_helpers import row as _row
@@ -33,8 +33,8 @@ def records():
 @pytest.fixture
 def captured(monkeypatch):
     warnings, infos = [], []
-    monkeypatch.setattr(core_report.logger, "warning", lambda msg, *a: warnings.append(msg % a))
-    monkeypatch.setattr(core_report.logger, "info", lambda msg, *a: infos.append(msg % a))
+    monkeypatch.setattr(report_module.logger, "warning", lambda msg, *a: warnings.append(msg % a))
+    monkeypatch.setattr(report_module.logger, "info", lambda msg, *a: infos.append(msg % a))
     return warnings, infos
 
 

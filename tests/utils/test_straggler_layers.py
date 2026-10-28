@@ -1,7 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""The profiler's layers import only the layers before them: ``core`` the
-standard library, numpy, requests and itself; ``megatron_adapter`` also
-Megatron; ``relax_integration`` anything."""
+"""The profiler's parts import only the parts before them: ``core`` (the
+collection) the standard library and itself; ``analysis`` also numpy, requests
+and ``core``; ``megatron_adapter`` Megatron and ``core``; ``relax_integration``
+anything."""
 
 import ast
 import subprocess
@@ -13,8 +14,9 @@ import pytest
 
 _PACKAGE = Path(__file__).resolve().parents[2] / "relax" / "utils" / "straggler"
 _CORE = "relax.utils.straggler.core"
+_ANALYSIS = "relax.utils.straggler.analysis"
 # requests: the level poller's HTTP client, imported when a poller is created.
-_CORE_THIRD_PARTY = frozenset({"numpy", "requests"})
+_ANALYSIS_THIRD_PARTY = frozenset({"numpy", "requests"})
 
 
 def _imports(path):
@@ -26,30 +28,40 @@ def _imports(path):
             yield node.module
 
 
-def _is_core(name):
-    return name == _CORE or name.startswith(_CORE + ".")
-
-
-def _disallowed(path, *, third_party=frozenset()):
+def _disallowed(path, packages, third_party=frozenset()):
     return [
         name
         for name in _imports(path)
-        if not (name.split(".")[0] in sys.stdlib_module_names or name.split(".")[0] in third_party or _is_core(name))
+        if not (
+            name.split(".")[0] in sys.stdlib_module_names
+            or name.split(".")[0] in third_party
+            or any(name == package or name.startswith(package + ".") for package in packages)
+        )
     ]
 
 
-@pytest.mark.parametrize("path", sorted((_PACKAGE / "core").glob("*.py")), ids=lambda path: path.name)
-def test_the_core_imports_only_the_standard_library_numpy_and_itself(path):
-    assert _disallowed(path, third_party=_CORE_THIRD_PARTY) == []
+def _files(part):
+    return sorted((_PACKAGE / part).glob("*.py"))
 
 
-def test_the_megatron_adapter_imports_only_megatron_and_the_core():
-    assert _disallowed(_PACKAGE / "megatron_adapter.py", third_party=frozenset({"megatron"})) == []
+@pytest.mark.parametrize("path", _files("core"), ids=lambda path: path.name)
+def test_the_collection_imports_only_the_standard_library_and_itself(path):
+    assert _disallowed(path, [_CORE]) == []
 
 
-def test_importing_the_core_the_adapter_or_the_control_routes_loads_neither_torch_nor_megatron():
+@pytest.mark.parametrize("path", _files("analysis"), ids=lambda path: path.name)
+def test_the_analysis_imports_only_the_standard_library_numpy_requests_and_the_collection(path):
+    assert _disallowed(path, [_CORE, _ANALYSIS], _ANALYSIS_THIRD_PARTY) == []
+
+
+def test_the_megatron_adapter_imports_only_megatron_and_the_collection():
+    assert _disallowed(_PACKAGE / "megatron_adapter.py", [_CORE], frozenset({"megatron"})) == []
+
+
+def test_importing_any_torch_free_part_loads_neither_torch_nor_megatron():
     modules = [
-        *(f"{_CORE}.{path.stem}" for path in sorted((_PACKAGE / "core").glob("*.py")) if path.stem != "__init__"),
+        *(f"{_CORE}.{path.stem}" for path in _files("core") if path.stem != "__init__"),
+        *(f"{_ANALYSIS}.{path.stem}" for path in _files("analysis") if path.stem != "__init__"),
         "relax.utils.straggler.megatron_adapter",
         "relax.utils.straggler.control_routes",
     ]

@@ -22,11 +22,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-from array import array
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Sequence
 
-from relax.utils.straggler.core.detector import RankMeta
 from relax.utils.straggler.core.modules import module_block
 from relax.utils.straggler.core.stats import (
     DP_REDUCTION_PHASE,
@@ -34,6 +32,9 @@ from relax.utils.straggler.core.stats import (
     GPU_SEGMENTS,
     NUM_FIELDS,
     PP_PHASE_FIELDS,
+    RECORD_WIDTH,
+    RankMeta,
+    RankTrace,
 )
 
 
@@ -42,9 +43,6 @@ logger = logging.getLogger(__name__)
 # Above any real pid (kernel.pid_max <= 2**22) so the straggler rows never merge
 # with a live process's track in Perfetto.
 TIMELINE_PID_BASE = 1 << 30
-# Segment, phase slot (see ``EventSink.push``; -1 if none), micro-batch (-1),
-# tokens (-1), start and end in ms after the rank's anchor event.
-RECORD_WIDTH = 6
 FILE_PREFIX = "straggler_trace_rollout"
 # Gaps between brackets shorter than this are launch latency, not host stalls.
 _UNTIMED_MS = 0.5
@@ -66,18 +64,6 @@ _LEVEL2_NAMES = {
     "dp_param_gather": "param gather",
     "optim": "optimizer",
 }
-
-
-@dataclass
-class RankTrace:
-    """One rank's sampled step: the wall-clock time of its anchor event, its
-    brackets as flat ``RECORD_WIDTH``-float rows, how many brackets of the step
-    are missing, and on the primary rank its own CPU timeline events."""
-
-    wall: float
-    records: array = field(default_factory=lambda: array("f"))
-    lost: int = 0
-    cpu_events: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass

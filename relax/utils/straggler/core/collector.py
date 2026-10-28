@@ -6,13 +6,14 @@ Hot path (the framework's timer call sites, through ``timers``):
 a queue. Once per step ``end_step`` reads completed pairs with
 ``event.query()`` (never ``synchronize``); every ``report_interval`` steps all
 ranks gather one small vector and the primary rank queues the table for the
-background analysis, whose reports a later ``end_step`` returns.
+``analyze`` passed in (``analysis.report.WindowAnalyzer`` in production) on
+a background thread, whose reports a later ``end_step`` returns.
 
 A "step" in this package is one ``end_step`` call, i.e. one rollout, which may
 contain several optimizer steps.
 
 With tracing on, the first step of every window after the first is also
-placed on a real time axis (see ``trace``): it starts with one device
+placed on a real time axis (see ``analysis.trace``): it starts with one device
 synchronize and an anchor event, its brackets keep their offsets from that
 anchor, and the window close gathers every rank's sample to the primary rank:
 once tracing is on, in every window, with ``None`` from a rank without one.
@@ -32,13 +33,19 @@ from dataclasses import dataclass, field
 from time import perf_counter, time
 from typing import Any, Callable, Sequence
 
-from relax.utils.straggler.core.control import LEVELS
-from relax.utils.straggler.core.detector import DetectorConfig, DetectorState, RankMeta, WindowReport, analyze_window
 from relax.utils.straggler.core.health import HEALTH_DISABLE, HealthConfig, ProfilerHealth
 from relax.utils.straggler.core.modules import ModuleTimers
-from relax.utils.straggler.core.stats import FIELD_INDEX, NUM_FIELDS, WindowStats, disabled_row
+from relax.utils.straggler.core.stats import (
+    FIELD_INDEX,
+    LEVELS,
+    NUM_FIELDS,
+    RECORD_WIDTH,
+    RankMeta,
+    RankTrace,
+    WindowStats,
+    disabled_row,
+)
 from relax.utils.straggler.core.timers import EventPool
-from relax.utils.straggler.core.trace import RECORD_WIDTH, RankTrace
 from relax.utils.straggler.core.worker import AnalysisWorker
 
 
@@ -56,7 +63,6 @@ _NUM_FWD_INDEX = FIELD_INDEX["num_fwd"]
 _TOKENS_INDEX = FIELD_INDEX["tokens"]
 _GC_INDEX = FIELD_INDEX["gc"]
 _DROPPED_INDEX = FIELD_INDEX["dropped"]
-_ERRORS_INDEX = FIELD_INDEX["errors"]
 _HEALTH_INDEX = FIELD_INDEX["health"]
 _CONTROL_INDEX = FIELD_INDEX["control"]
 _MB_FWD_MAX_INDEX = FIELD_INDEX["mb_fwd_max"]
@@ -75,28 +81,37 @@ GatherFn = Callable[[list[float]], list[list[float]]]
 GatherObjectsFn = Callable[[Any], list[Any]]
 # (object, destination rank) -> every rank's object on the destination, None elsewhere.
 GatherToFn = Callable[[Any, int], list[Any] | None]
-# (gathered traces, rank metadata, first rollout of the window) -> trace scalars.
-TraceSink = Callable[[list[RankTrace | None], list[RankMeta], int], dict[str, float]]
 # (start, end) wall-clock seconds -> the primary rank's CPU timeline events in that span.
 CpuEventsFn = Callable[[float, float], list[dict[str, Any]]]
 
 
 @dataclass
-class _WindowJob:
-    """One closed window on its way to the analysis; ``ready`` carries a report
-    that needs no analysis (the switch-off notice) through the same queue so
-    reports stay in window order."""
+class ClosedWindow:
+    """One closed window of the primary rank on its way to ``analyze``: every
+    rank's row and metadata, the sampled step's traces (``None`` below the
+    detail level) and the level it ran at.
 
-    table: list[list[float]] | None
+    A paused window (level 0) and the switch-off notice (``switch_off`` says
+    why) take the same queue, so reports stay in window order.
+    """
+
+    table: list[list[float]]
     meta: list[RankMeta]
     window_start_wall: float
     first_rollout: int
     last_rollout: int
     closed_wall: float = 0.0
     gather_ms: float = 0.0
-    ready: WindowReport | None = None
     traces: list[RankTrace | None] | None = None
     level: int = 1
+    switch_off: str = ""
+    # The first rank whose row asked to switch off.
+    requested_by: int = -1
+
+
+# (closed window, guard) -> its report, which ``end_step`` hands back; ``guard(where, call, *args, default=None)``
+# runs ``call`` and counts its exception under ``where``.
+AnalyzeFn = Callable[[ClosedWindow, Callable[..., Any]], Any]
 
 
 @dataclass
@@ -122,10 +137,10 @@ class StragglerCollector:
     """Queue this rank's timing events, fold them lazily, and gather one window
     every ``report_interval`` steps.
 
-    Torch-free: device events, stream-capture detection and the gathers are
-    injected (``relax_integration`` passes the real ones, tests pass fakes);
-    the timers that feed it are built by the adapter around it
-    (``megatron_adapter.phase_timers``).
+    Torch-free: device events, stream-capture detection, the gathers and what
+    becomes of a closed window (``analyze``) are injected (``relax_integration``
+    passes the real ones, tests pass fakes); the timers that feed it are built
+    by the adapter around it (``megatron_adapter.phase_timers``).
     """
 
     def __init__(
@@ -137,22 +152,20 @@ class StragglerCollector:
         gather: GatherFn,
         gather_objects: GatherObjectsFn,
         is_capturing: Callable[[], bool],
+        analyze: AnalyzeFn,
         report_interval: int = 10,
-        detector_config: DetectorConfig | None = None,
         pool_size: int = 4096,
         max_pending: int = 16384,
         clock: Callable[[], float] = perf_counter,
         register_gc_callback: bool = True,
         health_config: HealthConfig | None = None,
         background: bool = True,
-        on_report: Callable[[WindowReport], None] | None = None,
         max_backlog: int = 4,
         wall_clock: Callable[[], float] = time,
         trace: bool = False,
         synchronize: Callable[[], None] = lambda: None,
         gather_to: GatherToFn | None = None,
         primary_rank: int | None = None,
-        trace_sink: TraceSink | None = None,
         cpu_events: CpuEventsFn | None = None,
         max_trace_brackets: int = 4096,
         max_module_brackets: int = 8192,
@@ -173,8 +186,7 @@ class StragglerCollector:
         self.rank_meta = rank_meta
         self.is_primary = is_primary
         self.report_interval = report_interval
-        self.detector_config = detector_config or DetectorConfig()
-        self.detector_state = DetectorState()
+        self._analyze = analyze
         self._pool = EventPool(pool_size, event_factory)
         self._max_pending = max_pending
         # Window brackets: (segment, PP phase field or -1, start event, end event, CPU ms, micro-batch or -1,
@@ -206,7 +218,6 @@ class StragglerCollector:
         # Where samples go, the same on every rank (agreed on at install); ``None``: no samples.
         self._primary_rank = primary_rank
         self._sample_gather = trace and gather_to is not None and primary_rank is not None
-        self._trace_sink = trace_sink
         self._max_trace_brackets = max_trace_brackets
         self._max_module_brackets = max_module_brackets
         # Set by the integration once the model exists; attached only during a sampled step at level 3.
@@ -240,9 +251,8 @@ class StragglerCollector:
         self.health = ProfilerHealth(health_config)
         # Plain attribute (not ``health.disabled``) because ``record_event`` checks it on every bracket.
         self._disabled = False
-        # Appended by the worker, drained by ``end_step`` (deque append / popleft are atomic).
-        self._reports: deque[WindowReport] = deque()
-        self._on_report = on_report
+        # Reports from ``analyze``: appended by the worker, drained by ``end_step`` (deque append / popleft are atomic).
+        self._reports: deque[Any] = deque()
         self._max_backlog = max_backlog
         self._window_first_rollout: int | None = None
         self._window_last_rollout = -1
@@ -517,7 +527,7 @@ class StragglerCollector:
     def disabled(self) -> bool:
         return self._disabled
 
-    def end_step(self, rollout_id: int = -1, final: bool = False) -> list[WindowReport]:
+    def end_step(self, rollout_id: int = -1, final: bool = False) -> list[Any]:
         """Close one training step; every ``report_interval`` steps gather and
         analyze.
 
@@ -571,18 +581,17 @@ class StragglerCollector:
                 return
             if self._handle_switch_off(table, closed_wall):
                 return
-            # A switched-off primary has already stopped its worker, so there
-            # is nothing to analyse; a paused window recorded nothing.
+            # A switched-off primary has already stopped its worker.
             if self.is_primary and not self._disabled:
-                if level == 0:
-                    paused = WindowReport(metrics={"straggler/control/level": 0.0}, alerts=[], rows=[], note="paused")
-                    self._submit(self._job(None, closed_wall=closed_wall, ready=paused))
-                else:
-                    gather_ms = (gathered - started) * 1e3
-                    traces = traces if level >= 2 else None
-                    self._submit(
-                        self._job(table, closed_wall=closed_wall, gather_ms=gather_ms, traces=traces, level=level)
+                self._submit(
+                    self._job(
+                        table,
+                        closed_wall=closed_wall,
+                        gather_ms=(gathered - started) * 1e3,
+                        traces=traces if level >= 2 else None,
+                        level=level,
                     )
+                )
             requested = int(max(row[_CONTROL_INDEX] for row in table)) - 1
             if requested >= 0:
                 self._set_level(requested)
@@ -714,17 +723,7 @@ class StragglerCollector:
             + "; the reason is in that rank's log"
         )
         if self.is_primary:
-            notice = WindowReport(
-                metrics={
-                    "straggler/health/state": float(HEALTH_DISABLE),
-                    "straggler/health/requested_by": float(requesting[0]),
-                    "straggler/health/errors": float(sum(row[_ERRORS_INDEX] for row in table)),
-                },
-                alerts=[],
-                rows=[],
-                note=note,
-            )
-            self._submit(self._job(None, closed_wall=closed_wall, ready=notice))
+            self._submit(self._job(table, closed_wall=closed_wall, switch_off=note, requested_by=requesting[0]))
         self._disable(note)
         return True
 
@@ -736,9 +735,9 @@ class StragglerCollector:
         self._window_first_rollout = None
         self._trace_next = self._sample_gather and self.level >= 2 and not self._disabled
 
-    def _job(self, table: list[list[float]] | None, **kwargs: Any) -> _WindowJob:
+    def _job(self, table: list[list[float]], **kwargs: Any) -> ClosedWindow:
         first = self._window_first_rollout
-        return _WindowJob(
+        return ClosedWindow(
             table=table,
             meta=list(self._all_meta or []),
             window_start_wall=self.window_start_wall,
@@ -747,15 +746,14 @@ class StragglerCollector:
             **kwargs,
         )
 
-    def _submit(self, job: _WindowJob) -> None:
+    def _submit(self, job: ClosedWindow) -> None:
         if self._worker is None:
             self._handle_job(job)
             return
-        # A ready notice (job.ready is not None) bypasses the backlog check so
-        # the health/state=2 report reaches end_step even when the queue is
-        # full. There is at most one such notice per profiler lifetime, so the
-        # queue stays bounded at max_backlog + 1.
-        if job.ready is None and self._worker.backlog >= self._max_backlog:
+        # Only windows to analyse count against the backlog: a paused window
+        # and the switch-off notice cost nothing to handle, and the notice
+        # (health/state=2) has to reach end_step even when the queue is full.
+        if job.level and not job.switch_off and self._worker.backlog >= self._max_backlog:
             self.on_error(
                 "analyze",
                 RuntimeError(
@@ -766,39 +764,18 @@ class StragglerCollector:
             return
         self._worker.submit(job)
 
-    def _handle_job(self, job: _WindowJob) -> None:
-        """Analyze one window (worker thread, or inline without a worker) and
-        queue its report for ``end_step``; never raises.
+    def _handle_job(self, job: ClosedWindow) -> None:
+        """Hand one window to ``analyze`` (worker thread, or inline without a
+        worker) and queue its report for ``end_step``; never raises.
 
-        Only this method touches ``detector_state``, and jobs run one at a time
-        in window order.
+        Windows arrive one at a time, in window order.
         """
-        report = job.ready
-        if report is None:
-            started = self._clock()
-            report = self._guarded(
-                "analyze", analyze_window, job.table, job.meta, self.detector_config, self.detector_state
-            )
-            if report is None:
-                return
-            report.metrics["straggler/gather_ms"] = job.gather_ms
-            report.metrics["straggler/analyze_ms"] = (self._clock() - started) * 1e3
-            report.metrics["straggler/control/level"] = float(job.level)
-            report.window_start_wall = job.window_start_wall
-            if job.traces is not None and self._trace_sink is not None:
-                report.metrics.update(
-                    self._guarded("trace", self._trace_sink, job.traces, job.meta, job.first_rollout, default={})
-                )
-        report.first_rollout = job.first_rollout
-        report.last_rollout = job.last_rollout
-        report.closed_wall = job.closed_wall
-        report.analyzed_wall = self._wall()
-        if self._on_report is not None:
-            self._guarded("report", self._on_report, report)
-        self._reports.append(report)
+        report = self._guarded("analyze", self._analyze, job, self._guarded)
+        if report is not None:
+            self._reports.append(report)
 
-    def _take_reports(self) -> list[WindowReport]:
-        reports: list[WindowReport] = []
+    def _take_reports(self) -> list[Any]:
+        reports: list[Any] = []
         while self._reports:
             reports.append(self._reports.popleft())
         return reports

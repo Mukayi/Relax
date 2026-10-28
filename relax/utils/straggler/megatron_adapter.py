@@ -6,8 +6,8 @@ its metrics rank and its interleaved schedule.
 A Megatron upgrade that renames a timer, moves a block or changes one of the
 functions used here should fail the contract tests
 (``tests/utils/test_straggler_megatron_contract.py``), not a training run.
-Megatron is imported only inside the functions that call it, and nothing else
-from Relax but the core is imported here.
+Megatron is imported only inside the functions that call it, and of the rest
+of Relax only ``core`` is imported here.
 """
 
 from __future__ import annotations

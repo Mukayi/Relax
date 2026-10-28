@@ -2,16 +2,20 @@
 """Always-on, low-overhead straggler (slow rank) analysis for the Megatron
 backend; off unless ``RELAX_STRAGGLER_PROFILER`` is set.
 
-Three layers, each importing only the ones before it (a CPU test checks):
+Four parts, each importing only the ones before it (a CPU test checks):
 
-* ``core``: the profiler itself; no torch, Megatron or other Relax imports.
+* ``core``: data collection, the part that runs inside every training step;
+  standard library only.
+* ``analysis``: detection, reporting and display of the collected windows; no
+  torch, Megatron or other Relax imports.
 * ``megatron_adapter``: Megatron's timer names, layer blocks, parallel state
   and schedule, pinned by contract tests.
 * ``relax_integration``: settings, install, Gloo gathers, metrics, timeline;
   ``control_routes`` is the metrics service's side.
 
 The training code calls only the functions below. They are imported on first
-use, so that importing ``core`` or ``control_routes`` does not import torch.
+use, so that importing ``core``, ``analysis`` or ``control_routes`` does not
+import torch.
 """
 
 from typing import Any

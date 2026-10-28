@@ -4,18 +4,17 @@
 import numpy as np
 import pytest
 
-from relax.utils.straggler.core.detector import (
+from relax.utils.straggler.analysis.detector import (
     REASON_CODE,
     UNCERTAIN_CODE,
     DetectorConfig,
     DetectorState,
-    RankMeta,
     _leave_one_out_mad,
     _leave_one_out_median,
     _relative_and_z,
     analyze_window,
 )
-from relax.utils.straggler.core.stats import FIELD_INDEX
+from relax.utils.straggler.core.stats import FIELD_INDEX, RankMeta
 from tests.utils.straggler_helpers import meta as _meta
 from tests.utils.straggler_helpers import row as _row
 

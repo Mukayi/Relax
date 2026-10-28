@@ -8,11 +8,10 @@ from dataclasses import replace
 
 import pytest
 
-from relax.utils.straggler.core import collector as collector_module
+from relax.utils.straggler.analysis import report as report_module
 from relax.utils.straggler.core.health import HEALTH_DISABLE
 from relax.utils.straggler.core.modules import module_segment
-from relax.utils.straggler.core.stats import FIELD_INDEX, GPU_SEGMENTS, PP_PHASE_FIELDS
-from relax.utils.straggler.core.trace import RECORD_WIDTH
+from relax.utils.straggler.core.stats import FIELD_INDEX, GPU_SEGMENTS, PP_PHASE_FIELDS, RECORD_WIDTH
 from relax.utils.straggler.megatron_adapter import GRAD_SYNC_TIMERS, MODULE_NAMES
 from tests.utils.straggler_helpers import FakeEvent, bracket, make_collector, meta, timers
 
@@ -161,7 +160,7 @@ def test_end_step_reports_every_interval_and_resets_window():
 
 def test_gather_and_analysis_are_timed_separately(monkeypatch):
     now = [0.0]
-    real_analyze = collector_module.analyze_window
+    real_analyze = report_module.analyze_window
 
     def slow_gather(values):
         now[0] += 0.005
@@ -171,7 +170,7 @@ def test_gather_and_analysis_are_timed_separately(monkeypatch):
         now[0] += 0.007
         return real_analyze(*args)
 
-    monkeypatch.setattr(collector_module, "analyze_window", slow_analyze)
+    monkeypatch.setattr(report_module, "analyze_window", slow_analyze)
     collector = _collector(world=2, interval=1, gather=slow_gather, clock=lambda: now[0])
     bracket(collector)
     (report,) = collector.end_step()
@@ -527,12 +526,13 @@ def test_a_window_with_a_nan_row_is_skipped_like_a_failed_gather():
 
 
 def test_a_paused_rank_records_nothing_and_its_windows_are_not_analyzed():
-    collector = _collector(world=1, interval=1, level=0)
+    analyzer = report_module.WindowAnalyzer()
+    collector = _collector(world=1, interval=1, level=0, analyzer=analyzer)
     bracket(collector)
     assert collector.pending_events == 0
     (report,) = collector.end_step(rollout_id=0)
     assert (report.note, report.metrics) == ("paused", {"straggler/control/level": 0.0})
-    assert collector.detector_state.consecutive == {}
+    assert analyzer.state.consecutive == {}
 
 
 def test_the_requested_level_travels_in_the_primary_row_and_applies_from_the_next_window():

@@ -23,8 +23,9 @@ def _rank_worker(rank, world_size, init_file, out_dir, failure):
     import torch.distributed as dist
 
     from relax.utils.straggler import relax_integration as integration
+    from relax.utils.straggler.analysis.report import WindowAnalyzer
     from relax.utils.straggler.core.collector import StragglerCollector
-    from relax.utils.straggler.core.detector import RankMeta
+    from relax.utils.straggler.core.stats import RankMeta
     from tests.utils.straggler_helpers import FakeEvent, bracket
 
     dist.init_process_group(
@@ -59,6 +60,7 @@ def _rank_worker(rank, world_size, init_file, out_dir, failure):
             gather=gather,
             gather_objects=gather_objects,
             is_capturing=lambda: False,
+            analyze=WindowAnalyzer(),
             register_gc_callback=False,
             background=False,
         )
@@ -75,8 +77,9 @@ def _trace_worker(rank, world_size, init_file, out_dir, failure):
     import torch.distributed as dist
 
     from relax.utils.straggler import relax_integration as integration
+    from relax.utils.straggler.analysis.report import WindowAnalyzer
     from relax.utils.straggler.core.collector import StragglerCollector
-    from relax.utils.straggler.core.detector import RankMeta
+    from relax.utils.straggler.core.stats import RankMeta
     from tests.utils.straggler_helpers import FakeEvent, bracket
 
     dist.init_process_group(
@@ -118,12 +121,12 @@ def _trace_worker(rank, world_size, init_file, out_dir, failure):
             gather=gather,
             gather_objects=integration.gloo_all_gather_objects,
             is_capturing=lambda: False,
+            analyze=WindowAnalyzer(trace_sink=sink),
             register_gc_callback=False,
             background=False,
             trace=True,
             gather_to=gather_to,
             primary_rank=integration.gloo_primary_rank(rank == 1),
-            trace_sink=sink,
             level=2,
         )
         for rollout_id in range(4):
