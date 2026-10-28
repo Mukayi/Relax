@@ -12,14 +12,13 @@ never the default).
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from time import time
 from typing import Any, Callable
 
-from relax.utils.logging_utils import get_logger
 
-
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 LEVELS: tuple[str, ...] = ("paused", "coarse", "detail", "modules")
 

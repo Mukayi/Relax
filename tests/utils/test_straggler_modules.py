@@ -10,7 +10,9 @@ torch = pytest.importorskip("torch")
 from torch import nn  # noqa: E402
 from torch.utils.checkpoint import checkpoint  # noqa: E402
 
-from relax.utils.straggler.modules import ModuleTimers, module_block  # noqa: E402
+from relax.utils.straggler.core.modules import module_block  # noqa: E402
+from relax.utils.straggler.megatron_adapter import MODULE_NAMES  # noqa: E402
+from relax.utils.straggler.megatron_adapter import module_timers as ModuleTimers  # noqa: E402
 
 
 class _Sink:
@@ -30,7 +32,7 @@ class _Sink:
         return self.clock
 
     def push(self, segment, layer, start, end, cpu_ms):
-        name, backward = module_block(segment)
+        name, backward = module_block(MODULE_NAMES, segment)
         self.pushed.append((f"{name}_{'bwd' if backward else 'fwd'}", layer, start, end))
 
     def discard_event(self, event):

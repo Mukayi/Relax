@@ -13,7 +13,7 @@ pipeline sit next to each other. Within a row the slices nest by time:
   ``grad sync`` is the DP reduction, the other syncs keep their Megatron timer
   names;
 * level 3 (modules, only at the ``modules`` level): inside ``F{i}`` / ``B{i}``,
-  the forward / backward of the blocks ``modules.MODULE_SPECS`` names in
+  the forward / backward of the blocks the adapter's module specs name in
   every layer, e.g. ``attn fwd L3``, ``dispatch bwd L3`` (``attn fwd MTP L1``
   for an MTP layer); a forward inside a ``B{i}`` is an activation recompute.
 """
@@ -21,24 +21,24 @@ pipeline sit next to each other. Within a row the slices nest by time:
 from __future__ import annotations
 
 import json
+import logging
 import os
 from array import array
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
-from relax.utils.logging_utils import get_logger
-from relax.utils.straggler.detector import RankMeta
-from relax.utils.straggler.modules import module_block
-from relax.utils.straggler.stats import (
+from relax.utils.straggler.core.detector import RankMeta
+from relax.utils.straggler.core.modules import module_block
+from relax.utils.straggler.core.stats import (
+    DP_REDUCTION_PHASE,
     FIELD_INDEX,
     GPU_SEGMENTS,
-    GRAD_SYNC_TIMERS,
     NUM_FIELDS,
     PP_PHASE_FIELDS,
 )
 
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # Above any real pid (kernel.pid_max <= 2**22) so the straggler rows never merge
 # with a live process's track in Perfetto.
@@ -55,8 +55,6 @@ _BWD = FIELD_INDEX["bwd"]
 _LP_FWD = FIELD_INDEX["lp_fwd"]
 _OPTIM = FIELD_INDEX["optim"]
 _GRAD_SYNC = FIELD_INDEX["dp_grad_sync"]
-_DP_GRAD_SYNC = GRAD_SYNC_TIMERS.index("all-grads-sync")
-_GRAD_SYNC_NAMES = dict(enumerate(GRAD_SYNC_TIMERS)) | {_DP_GRAD_SYNC: "grad sync"}
 _RECV = FIELD_INDEX["pp_recv"]
 _LP_RECV = FIELD_INDEX["lp_pp_recv"]
 _SEGMENT_NAMES = {FIELD_INDEX[name]: name for name in GPU_SEGMENTS}
@@ -121,7 +119,7 @@ def _micro_batch_args(bracket: _Bracket) -> dict[str, Any]:
     return args
 
 
-def _name(bracket: _Bracket) -> str:
+def _name(bracket: _Bracket, sync_names: Sequence[str]) -> str:
     name = _MICRO_BATCH_NAMES.get(bracket.segment)
     if name is not None:
         if bracket.micro_batch >= 0:
@@ -132,7 +130,9 @@ def _name(bracket: _Bracket) -> str:
     if bracket.segment == _RECV:
         return f"bubble {_PHASE_NAMES.get(bracket.phase, 'recv')}"
     if bracket.segment == _GRAD_SYNC:
-        return _GRAD_SYNC_NAMES[bracket.phase]
+        if bracket.phase == DP_REDUCTION_PHASE:
+            return "grad sync"
+        return sync_names[bracket.phase] if 0 <= bracket.phase < len(sync_names) else f"grad sync {bracket.phase}"
     return _LEVEL2_NAMES[_SEGMENT_NAMES[bracket.segment]]
 
 
@@ -159,7 +159,9 @@ def _slice(
     return event
 
 
-def _rank_events(brackets: list[_Bracket], pid: int, wall_us: float) -> list[dict[str, Any]]:
+def _rank_events(
+    brackets: list[_Bracket], pid: int, wall_us: float, sync_names: Sequence[str]
+) -> list[dict[str, Any]]:
     """Level-1 busy runs, waits and untimed gaps, with the level-2 brackets of
     each busy run."""
     events: list[dict[str, Any]] = []
@@ -174,7 +176,7 @@ def _rank_events(brackets: list[_Bracket], pid: int, wall_us: float) -> list[dic
             if bracket.is_wait:
                 phase = _PHASE_NAMES.get(bracket.phase)
                 args = {"waits_for": _WAITS_FOR[phase]} if phase else None
-                events.append(_slice(_name(bracket), pid, wall_us, bracket.start, bracket.end, args))
+                events.append(_slice(_name(bracket, sync_names), pid, wall_us, bracket.start, bracket.end, args))
     previous_end = None
     for start, end, members in runs:
         if previous_end is not None and start - previous_end > _UNTIMED_MS:
@@ -187,12 +189,12 @@ def _rank_events(brackets: list[_Bracket], pid: int, wall_us: float) -> list[dic
             args = _micro_batch_args(bracket)
             if bracket.tokens >= 0:
                 args["tokens"] = bracket.tokens
-            events.append(_slice(_name(bracket), pid, wall_us, bracket.start, bracket.end, args))
+            events.append(_slice(_name(bracket, sync_names), pid, wall_us, bracket.start, bracket.end, args))
     return events
 
 
 def _module_events(
-    modules: list[_Bracket], brackets: list[_Bracket], pid: int, wall_us: float
+    modules: list[_Bracket], brackets: list[_Bracket], pid: int, wall_us: float, module_names: Sequence[str]
 ) -> list[dict[str, Any]]:
     """Level-3 slices.
 
@@ -210,7 +212,7 @@ def _module_events(
             outers[j] if j < len(outers) and outers[j].start <= module.start <= module.end <= outers[j].end else None
         )
         layer, mtp = abs(module.phase), module.phase < 0
-        block, backward = module_block(module.segment)
+        block, backward = module_block(module_names, module.segment)
         name = f"{block} {'bwd' if backward else 'fwd'} {'MTP ' if mtp else ''}L{layer}"
         args: dict[str, Any] = {"layer": layer, "mtp": True} if mtp else {"layer": layer}
         if outer is not None:
@@ -244,11 +246,19 @@ def _expected_bubble(brackets: list[_Bracket], stages: int) -> float | None:
 
 
 def build_trace(
-    traces: Sequence[RankTrace | None], meta: Sequence[RankMeta]
+    traces: Sequence[RankTrace | None],
+    meta: Sequence[RankMeta],
+    sync_names: Sequence[str] = (),
+    module_names: Sequence[str] = (),
 ) -> tuple[dict[str, Any], dict[str, float]]:
     """The Chrome trace of one sampled step and its ``straggler/trace/*``
     scalars; ``traces[i]`` belongs to ``meta[i]`` (``None`` when that rank has
-    no complete sample)."""
+    no complete sample).
+
+    ``sync_names`` names the gradient syncs by phase slot and ``module_names``
+    the blocks by index (the adapter's ``GRAD_SYNC_TIMERS`` and
+    ``MODULE_NAMES``); a slot or index beyond them gets a numbered name.
+    """
     stages = 1 + max((m.pp for m in meta), default=0)
     events: list[dict[str, Any]] = []
     grad_sync_ends: dict[tuple[int, int], list[float]] = {}
@@ -277,10 +287,10 @@ def build_trace(
             {"ph": "M", "name": "process_sort_index", "pid": pid, "args": {"sort_index": sort_index}},
             {"ph": "M", "name": "thread_name", "pid": pid, "tid": 0, "args": {"name": "GPU compute stream"}},
         ]
-        events += _rank_events(brackets, pid, wall_us)
-        events += _module_events(modules, brackets, pid, wall_us)
-        # Only the DP reduction ends at the same time on DP peers (see ``GRAD_SYNC_TIMERS``).
-        syncs = [b.end for b in brackets if b.segment == _GRAD_SYNC and b.phase == _DP_GRAD_SYNC]
+        events += _rank_events(brackets, pid, wall_us, sync_names)
+        events += _module_events(modules, brackets, pid, wall_us, module_names)
+        # Only the DP reduction ends at the same time on DP peers.
+        syncs = [b.end for b in brackets if b.segment == _GRAD_SYNC and b.phase == DP_REDUCTION_PHASE]
         if syncs:
             grad_sync_ends.setdefault((rank_meta.pp, rank_meta.tp), []).append(trace.wall * 1e3 + syncs[-1])
         events += trace.cpu_events
@@ -304,12 +314,18 @@ def build_trace(
 
 
 def write_window_trace(
-    trace_dir: str, keep: int, traces: Sequence[RankTrace | None], meta: Sequence[RankMeta], first_rollout: int
+    trace_dir: str,
+    keep: int,
+    traces: Sequence[RankTrace | None],
+    meta: Sequence[RankMeta],
+    first_rollout: int,
+    sync_names: Sequence[str] = (),
+    module_names: Sequence[str] = (),
 ) -> dict[str, float]:
     """Write the sampled step of the window starting at ``first_rollout`` and
     keep the newest ``keep`` (at least one) trace files; returns the trace
-    scalars."""
-    trace, metrics = build_trace(traces, meta)
+    scalars (names as in ``build_trace``)."""
+    trace, metrics = build_trace(traces, meta, sync_names, module_names)
     if not metrics["straggler/trace/ranks"]:
         return metrics
     os.makedirs(trace_dir, exist_ok=True)

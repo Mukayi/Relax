@@ -10,14 +10,14 @@ from __future__ import annotations
 
 from typing import Mapping
 
-from relax.utils.straggler.health import HEALTH_DISABLE
+from relax.utils.straggler.core.health import HEALTH_DISABLE
 
 
 # Compute-stream time (ms, summed over the window) per coarse segment. The
-# first block is fed by Megatron's own ``config.timers`` call sites (see
-# MEGATRON_TIMER_SEGMENTS); the ``lp_*`` block is the same call sites during
-# ``forward_only`` (log-prob passes). Adding a segment is one entry here plus
-# one mapping below.
+# first block is fed by the training framework's timer call sites (the Megatron
+# adapter maps its timer names onto them); the ``lp_*`` block is the same call
+# sites during forward-only passes (log-probs). Adding a segment is one entry
+# here plus one in the adapter's mapping.
 GPU_SEGMENTS: tuple[str, ...] = (
     "fwd",
     "bwd",
@@ -31,7 +31,8 @@ GPU_SEGMENTS: tuple[str, ...] = (
     "lp_pp_send",
 )
 # The training-phase ``pp_recv`` split by the 1F1B phase of each bracket (ms,
-# summed over the window); ``pp_recv`` keeps the total. See PP_PHASE_TIMERS.
+# summed over the window); ``pp_recv`` keeps the total. The adapter tells the
+# phase from the timer name (see its PP_PHASE_TIMERS).
 PP_PHASE_FIELDS: tuple[str, ...] = ("pp_wait_fill", "pp_wait_up", "pp_wait_down", "pp_wait_drain")
 # CPU wall time (ms) of the same fwd / bwd brackets, and Python GC pauses that
 # happened while a step was in flight.
@@ -87,73 +88,11 @@ def disabled_row() -> list[float]:
 SELF_SEGMENTS: tuple[str, ...] = ("fwd", "bwd", "optim")
 WAIT_SEGMENTS: tuple[str, ...] = ("pp_recv", "dp_grad_sync", "dp_param_gather")
 
-# The Megatron timers of ``dp_grad_sync``, in the order finalize_model_grads
-# runs them. Only ``all-grads-sync`` waits for the DP reduction; the others
-# reduce over pipeline-stage or tensor-parallel peers.
-GRAD_SYNC_TIMERS: tuple[str, ...] = (
-    "all-grads-sync",
-    "conditional-embedder-grads-all-reduce",
-    "non-tensor-parallel-grads-all-reduce",
-    "embedding-grads-all-reduce",
-)
-
-# Megatron timer name -> segment, for the training phase. Names come from
-# megatron/core/pipeline_parallel/schedules.py, p2p_communication.py,
-# distributed/finalize_model_grads.py, optimizer/optimizer.py and
-# optimizer/distrib_optimizer.py. ``forward-backward`` wraps a whole step and is
-# deliberately absent (it duplicates Relax's ``actor_train`` timer).
-MEGATRON_TIMER_SEGMENTS: Mapping[str, str] = {
-    "forward-compute": "fwd",
-    "backward-compute": "bwd",
-    "forward-recv": "pp_recv",
-    "backward-recv": "pp_recv",
-    "forward-send-backward-recv": "pp_recv",
-    "backward-send-forward-recv": "pp_recv",
-    "forward-send-forward-recv": "pp_recv",
-    "backward-send-backward-recv": "pp_recv",
-    "forward-backward-send-forward-backward-recv": "pp_recv",
-    "forward-send": "pp_send",
-    "backward-send": "pp_send",
-    **dict.fromkeys(GRAD_SYNC_TIMERS, "dp_grad_sync"),
-    "params-all-gather": "dp_param_gather",
-    "optimizer-copy-to-main-grad": "optim",
-    "optimizer-unscale-and-check-inf": "optim",
-    "optimizer-clip-main-grad": "optim",
-    "optimizer-count-zeros": "optim",
-    "optimizer-inner-step": "optim",
-    "optimizer-copy-main-to-model-params": "optim",
-}
-
-# Megatron timer name -> PP_PHASE_FIELDS entry, training phase only. In the
-# non-interleaved 1F1B schedules (Megatron's and Relax's streaming one) the
-# warmup only calls recv_forward, the steady state only the two combined
-# send / recv calls and the cooldown only recv_backward, so the name gives the
-# phase and the neighbour waited for: ``up`` waits for the previous stage's
-# activations, ``down`` for the next stage's gradients. A balanced pipeline does
-# not idle in the steady state, so ``up + down`` beyond the transfer time is
-# extra bubble. The interleaved schedule's names count in ``pp_recv`` only.
-PP_PHASE_TIMERS: Mapping[str, str] = {
-    "forward-recv": "pp_wait_fill",
-    "backward-send-forward-recv": "pp_wait_up",
-    "forward-send-backward-recv": "pp_wait_down",
-    "backward-recv": "pp_wait_drain",
-}
-
-# Megatron timer name -> phase slot of its brackets, training phase only: the
-# PP_PHASE_FIELDS index of a PP wait, or a gradient sync's position in
-# GRAD_SYNC_TIMERS. Other brackets carry -1.
-TIMER_PHASES: Mapping[str, int] = {
-    **{name: FIELD_INDEX[phase] for name, phase in PP_PHASE_TIMERS.items()},
-    **{name: position for position, name in enumerate(GRAD_SYNC_TIMERS)},
-}
-
-# Same call sites during ``forward_only`` land in their own buckets so a slow
-# log-prob pass does not pollute the training-step numbers.
-FORWARD_ONLY_TIMER_SEGMENTS: Mapping[str, str] = {
-    name: {"fwd": "lp_fwd", "pp_recv": "lp_pp_recv", "pp_send": "lp_pp_send"}.get(segment, segment)
-    for name, segment in MEGATRON_TIMER_SEGMENTS.items()
-    if segment in ("fwd", "pp_recv", "pp_send")
-}
+# The phase slot of a ``dp_grad_sync`` bracket says which gradient sync it is:
+# its position among the sync names the adapter gives the trace. The
+# data-parallel reduction, the only one that ends at the same time on DP peers,
+# is 0.
+DP_REDUCTION_PHASE = 0
 
 
 class WindowStats:

@@ -1,10 +1,13 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Bindings to torch / Megatron, and the process-wide profiler the Megatron
-actor holds.
+"""The profiler inside Relax: its settings (``RELAX_STRAGGLER_*`` in ``Envs``),
+the process-wide profiler the Megatron actor holds, and what it needs from
+Relax and torch: device events, the Gloo gathers, the metrics service, the CPU
+timeline and the rollout step numbers.
 
-Everything that touches the accelerator (through ``relax.utils.device``, so
-CUDA and NPU alike), the process groups or Megatron's parallel state is here,
-so the rest of the package runs (and is tested) on CPU with fakes.
+The training code calls only the functions in ``__init__``; everything that
+touches the accelerator (through ``relax.utils.device``, so CUDA and NPU alike)
+or the process groups is here, so the core runs (and is tested) on CPU with
+fakes.
 """
 
 from __future__ import annotations
@@ -23,14 +26,15 @@ import torch.distributed as dist
 from relax.utils import device
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
-from relax.utils.straggler.collector import StragglerCollector
-from relax.utils.straggler.control import LEVELS, LevelPoller
-from relax.utils.straggler.detector import DetectorConfig, RankMeta, WindowReport
-from relax.utils.straggler.modules import ModuleTimers
-from relax.utils.straggler.reporter import log_straggler_window, report_straggler_window
-from relax.utils.straggler.timers import StragglerTimers
-from relax.utils.straggler.trace import write_window_trace
-from relax.utils.timer import Timer
+from relax.utils.metrics.metric_utils import compute_rollout_step
+from relax.utils.straggler import megatron_adapter
+from relax.utils.straggler.core.collector import StragglerCollector
+from relax.utils.straggler.core.control import LEVELS, LevelPoller
+from relax.utils.straggler.core.detector import DetectorConfig, RankMeta, WindowReport
+from relax.utils.straggler.core.report import log_window, reported_scalars, switched_off, timeline_bars
+from relax.utils.straggler.core.timers import StragglerTimers
+from relax.utils.straggler.core.trace import write_window_trace
+from relax.utils.timer import TimelineEvent, Timer
 
 
 logger = get_logger(__name__)
@@ -182,39 +186,21 @@ def gloo_gather_objects_to(obj: Any, dst: int) -> list[Any] | None:
     return [pickle.loads(item) for item in gathered] if gathered is not None else None
 
 
-def is_metrics_primary_rank() -> bool:
-    """The rank whose ``log_perf_data`` logs the perf metrics, the same rule as
-    ``relax.backends.megatron.data.log_perf_data``: TP 0, last PP stage, DP
-    (with CP) 0."""
-    from megatron.core import mpu
-
-    return (
-        mpu.get_tensor_model_parallel_rank() == 0
-        and mpu.is_pipeline_last_stage()
-        and mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-    )
-
-
 def local_rank_meta() -> RankMeta:
-    from megatron.core import mpu
-
     from relax.utils.distributed_utils import get_gloo_group
 
     return RankMeta(
         # Rank within the Gloo group == global rank; it indexes the gathered table.
         rank=dist.get_rank(get_gloo_group()),
-        dp=mpu.get_data_parallel_rank(with_context_parallel=True),
-        tp=mpu.get_tensor_model_parallel_rank(),
-        pp=mpu.get_pipeline_model_parallel_rank(),
-        cp=mpu.get_context_parallel_rank(),
-        ep=mpu.get_expert_model_parallel_rank(),
+        **megatron_adapter.parallel_ranks(),
         host=socket.gethostname(),
         device=device.device_module.current_device() if device.is_available() else -1,
     )
 
 
 class StragglerProfiler:
-    """One collector plus the per-step reporting around ``log_perf_data``.
+    """One collector, the ``config.timers`` of each phase that feed it, and the
+    per-step reporting around ``log_perf_data``.
 
     ``rollout_end`` never raises: a failing reporter is counted by the
     collector's health like any other profiler failure.
@@ -222,6 +208,7 @@ class StragglerProfiler:
 
     def __init__(self, collector: StragglerCollector, args: Any) -> None:
         self.collector = collector
+        self.timers = megatron_adapter.phase_timers(collector)
         self._args = args
         self._model_seen = False
 
@@ -235,7 +222,7 @@ class StragglerProfiler:
         collector = self.collector
         collector.model_chunks = max(len(model_chunks), 1)
         try:
-            timers = ModuleTimers(model_chunks, collector)
+            timers = megatron_adapter.module_timers(model_chunks, collector)
         except Exception as exc:
             collector.on_error("modules", exc)
             return
@@ -292,6 +279,23 @@ class StragglerProfiler:
         return metrics
 
 
+def report_straggler_window(args: Any, report: WindowReport) -> dict[str, float]:
+    """Put one window's bars on the timeline and return its scalars for the
+    step's ``log_perf_data`` (primary rank, training thread), which also
+    flushes the bars and stamps them with the step."""
+    if getattr(args, "timeline_dump_dir", None) and not switched_off(report):
+        Timer().records.extend(
+            TimelineEvent(bar.name, bar.start, bar.end, pid=bar.pid, tid=bar.tid) for bar in timeline_bars(report)
+        )
+    return reported_scalars(report)
+
+
+def log_straggler_window(args: Any, report: WindowReport) -> None:
+    """Log one window at the step of its last rollout; the analysis thread runs
+    it as soon as the analysis ends."""
+    log_window(report, compute_rollout_step(args, report.last_rollout))
+
+
 def _cpu_events(start: float, end: float) -> list[dict[str, Any]]:
     """This process's finished ``Timer`` events that overlap the wall-clock
     span ``[start, end]``, without their call stacks; timers still running when
@@ -339,7 +343,7 @@ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None
 
     # The window scalars are logged through ``log_perf_data``, which drops them
     # on every other rank.
-    is_primary = is_metrics_primary_rank()
+    is_primary = megatron_adapter.is_metrics_primary_rank()
     traces_to = trace_dir(args)
     # Only a tracing run gathers samples; every rank takes this branch alike, so the all-reduce is collective.
     primary_rank = gloo_primary_rank(is_primary) if traces_to else None
@@ -363,7 +367,15 @@ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None
         synchronize=device_synchronize(),
         gather_to=gloo_gather_objects_to,
         primary_rank=primary_rank,
-        trace_sink=partial(write_window_trace, traces_to, Envs.RELAX_STRAGGLER_TRACE_KEEP) if traces_to else None,
+        trace_sink=partial(
+            write_window_trace,
+            traces_to,
+            Envs.RELAX_STRAGGLER_TRACE_KEEP,
+            sync_names=megatron_adapter.GRAD_SYNC_TIMERS,
+            module_names=megatron_adapter.MODULE_NAMES,
+        )
+        if traces_to
+        else None,
         cpu_events=_cpu_events,
         level=initial_level(bool(traces_to)),
         # Read at window closes; the poller is created below, once there is a collector to report.
@@ -397,12 +409,11 @@ def initial_level(trace_on: bool) -> int:
     return level if level >= 0 else (2 if trace_on else 1)
 
 
-def _timers_for(collector: StragglerCollector, phase: str) -> StragglerTimers:
-    if phase == "train":
-        return collector.train_timers
-    if phase == "forward_only":
-        return collector.forward_only_timers
-    raise ValueError(f"unknown straggler phase {phase!r}; expected 'train' or 'forward_only'")
+def _timers_for(profiler: StragglerProfiler, phase: str) -> StragglerTimers:
+    timers = profiler.timers.get(phase)
+    if timers is None:
+        raise ValueError(f"unknown straggler phase {phase!r}; expected one of {sorted(profiler.timers)}")
+    return timers
 
 
 def straggler_timers(
@@ -420,13 +431,14 @@ def straggler_timers(
     if _PROFILER is None:
         return None
     collector = _PROFILER.collector
-    timers = _timers_for(collector, phase)
+    timers = _timers_for(_PROFILER, phase)
     if model is not None:
         _PROFILER.see_model(model)
         if num_microbatches is not None:
             forward_only = phase == "forward_only"
             collector.note_schedule(
-                partial(interleaved_schedule_table, model, num_microbatches, forward_only), forward_only
+                partial(megatron_adapter.interleaved_schedule_table, model, num_microbatches, forward_only),
+                forward_only,
             )
     return timers
 
@@ -440,36 +452,6 @@ def straggler_rollout_end(rollout_id: int) -> dict[str, float] | None:
     Gloo gather every ``RELAX_STRAGGLER_REPORT_INTERVAL`` rollouts.
     """
     return _PROFILER.rollout_end(rollout_id) if _PROFILER is not None else None
-
-
-def interleaved_schedule_table(
-    model: Sequence[Any], num_microbatches: int | Sequence[int], forward_only: bool
-) -> Sequence[tuple[int, int]]:
-    """Megatron's interleaved schedule table for the forward-backward calls of
-    ``num_microbatches``, joined in call order with each call's micro-batches
-    numbered after the previous call's, from the inputs its schedule reads: the
-    model's own config and chunk count, not the launch arguments (Bridge does
-    not copy every argument into the model config).
-
-    Empty for training under combined 1F1B, which merges forward and backward
-    steps.
-    """
-    from megatron.core.pipeline_parallel.schedules import get_schedule_table
-    from megatron.core.utils import get_model_config
-
-    config = get_model_config(model[0])
-    if config.overlap_moe_expert_parallel_comm and not forward_only:
-        return ()
-    calls = [num_microbatches] if isinstance(num_microbatches, int) else list(num_microbatches)
-    table: list[tuple[int, int]] = []
-    offset = 0
-    for count in calls:
-        table += [
-            (offset + micro_batch, chunk)
-            for micro_batch, chunk in get_schedule_table(count, len(model), config.microbatch_group_size_per_vp_stage)
-        ]
-        offset += count
-    return table
 
 
 def note_microbatch_tokens(total_lengths: Any) -> None:

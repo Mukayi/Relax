@@ -2,18 +2,20 @@
 """Always-on, low-overhead straggler (slow rank) analysis for the Megatron
 backend; off unless ``RELAX_STRAGGLER_PROFILER`` is set.
 
-Data flow: ``timers`` (Megatron call sites) -> ``collector`` (per rank, one
-Gloo gather per window) -> ``worker`` thread on the primary rank ->
-``detector`` -> ``reporter``. ``runtime`` binds it to torch / Megatron.
+Three layers, each importing only the ones before it (a CPU test checks):
+
+* ``core``: timers -> collector -> analysis worker -> detector -> report /
+  trace; no torch, Megatron or other Relax imports.
+* ``megatron_adapter``: Megatron's timer names, layer blocks, parallel state
+  and schedule.
+* ``relax_integration``: settings, install, Gloo gathers, metrics, timeline;
+  ``control_routes`` is the metrics service's side.
+
+The training code calls only the functions below. They are imported on first
+use, so that importing ``core`` or ``control_routes`` does not import torch.
 """
 
-from relax.utils.straggler.runtime import (
-    StragglerProfiler,
-    install_straggler_profiler,
-    note_microbatch_tokens,
-    straggler_rollout_end,
-    straggler_timers,
-)
+from typing import Any
 
 
 __all__ = [
@@ -23,3 +25,11 @@ __all__ = [
     "straggler_rollout_end",
     "straggler_timers",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    if name in __all__:
+        from relax.utils.straggler import relax_integration
+
+        return getattr(relax_integration, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

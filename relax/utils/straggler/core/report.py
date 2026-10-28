@@ -1,26 +1,27 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Turn one analyzed straggler window into scalars, timeline events and log
+"""Turn one analyzed straggler window into scalars, timeline bars and log
 lines.
 
-* the scalars in ``REPORTED_METRICS`` -> returned for the step's ``log_perf_data``
-* per-rank segment bars -> ``Timer().records``, one Perfetto row per rank
+* the scalars in ``REPORTED_METRICS`` -> returned for the step's metrics call
+* per-rank segment bars -> one timeline row per rank
 * alerts, recoveries, uncertain ranks and the rest of the window's numbers -> logger, from the analysis thread
+
+Where they go (which metrics call, which timeline, which step number) is the
+integration's business (``relax_integration``).
 """
 
 from __future__ import annotations
 
-from typing import Any
+import logging
+from typing import NamedTuple
 
-from relax.utils.logging_utils import get_logger
-from relax.utils.metrics.metric_utils import compute_rollout_step
-from relax.utils.straggler.detector import WindowReport
-from relax.utils.straggler.health import HEALTH_DISABLE
-from relax.utils.straggler.stats import GPU_SEGMENTS
-from relax.utils.straggler.trace import TIMELINE_PID_BASE
-from relax.utils.timer import TimelineEvent, Timer
+from relax.utils.straggler.core.detector import WindowReport
+from relax.utils.straggler.core.health import HEALTH_DISABLE
+from relax.utils.straggler.core.stats import GPU_SEGMENTS
+from relax.utils.straggler.core.trace import TIMELINE_PID_BASE
 
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _TABLE_COLUMNS: tuple[str, ...] = (
     "rank",
@@ -37,7 +38,7 @@ _TABLE_COLUMNS: tuple[str, ...] = (
     "mb_fwd_max",
 )
 
-# The scalars that go out with the step's ``log_perf_data``. Every key adds training-thread time to that
+# The scalars that go out with the step's metrics call. Every key adds training-thread time to that
 # step's flush, so the analysis thread logs the rest of a window's numbers instead.
 REPORTED_METRICS: frozenset[str] = frozenset(
     {
@@ -64,13 +65,22 @@ REPORTED_METRICS: frozenset[str] = frozenset(
 )
 
 
-def _timeline_events(report: WindowReport) -> list[TimelineEvent]:
-    """Lay each rank's per-step segment averages out as consecutive bars.
+class TimelineBar(NamedTuple):
+    name: str
+    start: float
+    end: float
+    pid: int
+    tid: int
+
+
+def timeline_bars(report: WindowReport) -> list[TimelineBar]:
+    """Lay each rank's per-step segment averages out as consecutive bars, in
+    wall-clock seconds.
 
     The bars start at the window's wall-clock start so they line up with the
-    primary rank's CPU-side ``actor_train`` event in the same trace file.
+    primary rank's own CPU timeline of the same window.
     """
-    events: list[TimelineEvent] = []
+    bars: list[TimelineBar] = []
     for row in report.rows:
         cursor = report.window_start_wall
         pid = TIMELINE_PID_BASE + int(row["rank"])
@@ -78,17 +88,9 @@ def _timeline_events(report: WindowReport) -> list[TimelineEvent]:
             ms = float(row[name])
             if ms <= 0.0:
                 continue
-            events.append(
-                TimelineEvent(
-                    name=f"straggler/{name} {row['tag']}",
-                    start_ts=cursor,
-                    end_ts=cursor + ms / 1e3,
-                    pid=pid,
-                    tid=tid,
-                )
-            )
+            bars.append(TimelineBar(f"straggler/{name} {row['tag']}", cursor, cursor + ms / 1e3, pid, tid))
             cursor += ms / 1e3
-    return events
+    return bars
 
 
 def _format_table(report: WindowReport) -> str:
@@ -103,7 +105,7 @@ def _format_table(report: WindowReport) -> str:
     return "\n".join(lines)
 
 
-def _switched_off(report: WindowReport) -> bool:
+def switched_off(report: WindowReport) -> bool:
     return report.metrics.get("straggler/health/state", 0.0) >= HEALTH_DISABLE
 
 
@@ -111,33 +113,27 @@ def _ms_after_close(report: WindowReport, wall: float) -> float:
     return (wall - report.closed_wall) * 1e3
 
 
-def report_straggler_window(args: Any, report: WindowReport) -> dict[str, float]:
-    """Emit timeline events for one window and return its ``REPORTED_METRICS``
-    for the step's ``log_perf_data`` (primary rank, training thread).
-
-    That step can be later than the window, hence ``straggler/window/*``.
-    """
+def reported_scalars(report: WindowReport) -> dict[str, float]:
+    """The window's ``REPORTED_METRICS``, with the rollouts it covers (it is
+    usually picked up a step after it closed, hence ``straggler/window/*``) and
+    how long after its close the analysis ended."""
     metrics = report.metrics
     metrics["straggler/window/first_rollout"] = float(report.first_rollout)
     metrics["straggler/window/last_rollout"] = float(report.last_rollout)
     if report.closed_wall > 0.0:
         metrics["straggler/latency/analyzed_ms"] = _ms_after_close(report, report.analyzed_wall)
-    if getattr(args, "timeline_dump_dir", None) and not _switched_off(report):
-        # Flushed, and stamped with the step, by the ``log_perf_data`` that follows.
-        Timer().records.extend(_timeline_events(report))
     return {key: value for key, value in metrics.items() if key in REPORTED_METRICS}
 
 
-def log_straggler_window(args: Any, report: WindowReport) -> None:
+def log_window(report: WindowReport, step: int) -> None:
     """Log one window's alerts, recoveries, uncertain ranks, summary and the
-    numbers left out of ``REPORTED_METRICS`` at the window's own step.
+    numbers left out of ``REPORTED_METRICS`` at ``step``, the window's own.
 
     Only touches the logger, so it is safe on the analysis thread, which runs
     it as soon as the analysis ends.
     """
-    step = compute_rollout_step(args, report.last_rollout)
     metrics = report.metrics
-    if _switched_off(report):
+    if switched_off(report):
         logger.warning("[straggler] step=%d profiler switched off on every rank: %s", step, report.note)
         return
     if report.note == "paused":

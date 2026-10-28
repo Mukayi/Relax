@@ -159,7 +159,7 @@ closed; their time lands in the next window
 | --- | --- |
 | 第 1 层（PP） | `busy`：连续的计算和通信；`bubble fill` / `up` / `down` / `drain`：PP 等待，按 1F1B 阶段命名，`waits_for` 写明在等上一个还是下一个 stage；`untimed`：超过 0.5 ms 且没有计时覆盖的时间（CPU 侧停顿） |
 | 第 2 层（fwd / bwd） | `busy` 里的 `F{i}` / `B{i}`（`i` 是 micro-batch 序号，VPP 下另带模型块，记为 `F{i} chunk {c}`；前向带 token 数）、`send`、`grad sync`（DP 梯度同步，即 Megatron 的 `all-grads-sync`；其他梯度同步用 Megatron 的计时器名）、`param gather`、`optimizer`；log-prob 阶段为 `lp F{i}` 等 |
-| 第 3 层（模块） | 只在 `modules` 级别出现：`F{i}` / `B{i}` 里每个 transformer 层的 attention 和 MLP（MoE 层记为 `moe`）的前向、反向，例如 `attn fwd L3`、`moe bwd L3`，参数带 `layer`、`micro_batch`（VPP 下另带 `model_chunk`）；MoE 层内另有 `router`、`dispatch`（EP all-to-all 在这里）、`experts`、`combine` 和 `shared experts`（开启 `--moe-shared-expert-overlap` 时，Megatron 不调用 shared experts 的 forward，而是把它拆开，在另一个 CUDA stream 上与 token 交换重叠执行，所以没有 `shared experts` 切片，这部分时间也不单独计）；MTP 层记为 `attn fwd MTP L1` 等（参数带 `mtp`）；出现在 `B{i}` 里的前向是激活重计算，记为 `… (recompute)`。要计其他模型的块，在 `relax/utils/straggler/modules.py` 的 `MODULE_SPECS` 里加 spec |
+| 第 3 层（模块） | 只在 `modules` 级别出现：`F{i}` / `B{i}` 里每个 transformer 层的 attention 和 MLP（MoE 层记为 `moe`）的前向、反向，例如 `attn fwd L3`、`moe bwd L3`，参数带 `layer`、`micro_batch`（VPP 下另带 `model_chunk`）；MoE 层内另有 `router`、`dispatch`（EP all-to-all 在这里）、`experts`、`combine` 和 `shared experts`（开启 `--moe-shared-expert-overlap` 时，Megatron 不调用 shared experts 的 forward，而是把它拆开，在另一个 CUDA stream 上与 token 交换重叠执行，所以没有 `shared experts` 切片，这部分时间也不单独计）；MTP 层记为 `attn fwd MTP L1` 等（参数带 `mtp`）；出现在 `B{i}` 里的前向是激活重计算，记为 `… (recompute)`。要计其他模型的块，在 `relax/utils/straggler/megatron_adapter.py` 的 `MODULE_SPECS` 里加 spec |
 
 primary 自己的 CPU 侧计时（例如 `actor_train`、每个 micro-batch 的 `get_data_batch_*`）单独一行 `primary CPU`。
 

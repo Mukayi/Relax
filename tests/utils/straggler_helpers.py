@@ -1,9 +1,12 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Shared fakes for the CPU-only straggler profiler tests."""
 
-from relax.utils.straggler.collector import StragglerCollector
-from relax.utils.straggler.detector import DetectorConfig, RankMeta
-from relax.utils.straggler.stats import FIELD_INDEX, NUM_FIELDS
+from weakref import WeakKeyDictionary
+
+from relax.utils.straggler.core.collector import StragglerCollector
+from relax.utils.straggler.core.detector import DetectorConfig, RankMeta
+from relax.utils.straggler.core.stats import FIELD_INDEX, NUM_FIELDS
+from relax.utils.straggler.megatron_adapter import phase_timers
 
 
 class FakeEvent:
@@ -68,9 +71,20 @@ def make_collector(
     )
 
 
-def bracket(collector, name="forward-compute", timers=None):
+_TIMERS = WeakKeyDictionary()
+
+
+def timers(collector, phase="train"):
+    """The ``config.timers`` of ``phase`` feeding ``collector``, one set per
+    collector as the profiler holds them."""
+    if collector not in _TIMERS:
+        _TIMERS[collector] = phase_timers(collector)
+    return _TIMERS[collector][phase]
+
+
+def bracket(collector, name="forward-compute", phase="train"):
     """One start / stop of a Megatron timer name."""
-    timer = (timers or collector.train_timers)(name)
+    timer = timers(collector, phase)(name)
     timer.start()
     timer.stop()
 

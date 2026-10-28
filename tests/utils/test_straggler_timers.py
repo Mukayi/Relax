@@ -1,19 +1,21 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""CPU tests for the ``config.timers`` replacement and the event pool."""
+"""CPU tests for the ``config.timers`` replacement, the Megatron timer names it
+is given and the event pool."""
 
 import pytest
 
-from relax.utils.straggler import timers as timers_module
-from relax.utils.straggler.stats import (
-    FIELD_INDEX,
+from relax.utils.straggler.core import timers as timers_module
+from relax.utils.straggler.core.stats import DP_REDUCTION_PHASE, FIELD_INDEX, PP_PHASE_FIELDS
+from relax.utils.straggler.core.timers import EventPool, StragglerTimers, _NullTimer, _SegmentTimer
+from relax.utils.straggler.megatron_adapter import (
     FORWARD_ONLY_TIMER_SEGMENTS,
     GRAD_SYNC_TIMERS,
+    IGNORED_TIMER_NAMES,
     MEGATRON_TIMER_SEGMENTS,
-    PP_PHASE_FIELDS,
     PP_PHASE_TIMERS,
     TIMER_PHASES,
+    phase_timers,
 )
-from relax.utils.straggler.timers import EventPool, StragglerTimers, _NullTimer, _SegmentTimer
 from tests.utils.straggler_helpers import FakeEvent
 
 
@@ -152,6 +154,7 @@ def test_all_megatron_optimizer_and_comm_names_map_to_buckets():
     }
     assert MEGATRON_TIMER_SEGMENTS["params-all-gather"] == "dp_param_gather"
     assert MEGATRON_TIMER_SEGMENTS["all-grads-sync"] == "dp_grad_sync"
+    assert GRAD_SYNC_TIMERS[DP_REDUCTION_PHASE] == "all-grads-sync", "the trace aligns DP peers on this one"
     assert MEGATRON_TIMER_SEGMENTS["forward-send-backward-recv"] == "pp_recv"
 
 
@@ -184,10 +187,12 @@ def test_known_timer_name_produces_no_warning(captured_warnings):
     assert captured_warnings == []
 
 
-def test_ignored_timer_name_produces_no_warning(captured_warnings):
-    timers = StragglerTimers(_FakeSink(), MEGATRON_TIMER_SEGMENTS)
-    timers("forward-backward")
-    timers("forward-backward")
+@pytest.mark.parametrize("phase", ["train", "forward_only"])
+def test_ignored_timer_name_produces_no_warning(captured_warnings, phase):
+    timers = phase_timers(_FakeSink())[phase]
+    for name in IGNORED_TIMER_NAMES:
+        assert isinstance(timers(name), _NullTimer)
+        timers(name)
     assert captured_warnings == []
 
 

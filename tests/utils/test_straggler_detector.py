@@ -4,7 +4,7 @@
 import numpy as np
 import pytest
 
-from relax.utils.straggler.detector import (
+from relax.utils.straggler.core.detector import (
     REASON_CODE,
     UNCERTAIN_CODE,
     DetectorConfig,
@@ -15,7 +15,7 @@ from relax.utils.straggler.detector import (
     _relative_and_z,
     analyze_window,
 )
-from relax.utils.straggler.stats import FIELD_INDEX
+from relax.utils.straggler.core.stats import FIELD_INDEX
 from tests.utils.straggler_helpers import meta as _meta
 from tests.utils.straggler_helpers import row as _row
 

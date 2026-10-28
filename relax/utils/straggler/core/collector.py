@@ -1,8 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Per-rank event collection, lazy readout and the per-window gather.
 
-Hot path (Megatron's timer call sites): ``record_event`` / ``push`` record
-events on the current stream and append to a queue. Once per step ``end_step``
+Hot path (the framework's timer call sites, through ``timers``):
+``record_event`` / ``push`` record events on the current stream and append to
+a queue. Once per step ``end_step``
 reads completed pairs with ``event.query()`` (never ``synchronize``); every
 ``report_interval`` steps all ranks gather one small vector and the primary
 rank queues the table for the background analysis, whose reports a later
@@ -23,6 +24,7 @@ At the ``modules`` level that step also carries module brackets (see
 from __future__ import annotations
 
 import gc
+import logging
 import math
 import threading
 from array import array
@@ -31,26 +33,17 @@ from dataclasses import dataclass, field
 from time import perf_counter, time
 from typing import Any, Callable, Sequence
 
-from relax.utils.logging_utils import get_logger
-from relax.utils.straggler.control import LEVELS
-from relax.utils.straggler.detector import DetectorConfig, DetectorState, RankMeta, WindowReport, analyze_window
-from relax.utils.straggler.health import HEALTH_DISABLE, HealthConfig, ProfilerHealth
-from relax.utils.straggler.modules import ModuleTimers
-from relax.utils.straggler.stats import (
-    FIELD_INDEX,
-    FORWARD_ONLY_TIMER_SEGMENTS,
-    MEGATRON_TIMER_SEGMENTS,
-    NUM_FIELDS,
-    TIMER_PHASES,
-    WindowStats,
-    disabled_row,
-)
-from relax.utils.straggler.timers import EventPool, StragglerTimers
-from relax.utils.straggler.trace import RECORD_WIDTH, RankTrace
-from relax.utils.straggler.worker import AnalysisWorker
+from relax.utils.straggler.core.control import LEVELS
+from relax.utils.straggler.core.detector import DetectorConfig, DetectorState, RankMeta, WindowReport, analyze_window
+from relax.utils.straggler.core.health import HEALTH_DISABLE, HealthConfig, ProfilerHealth
+from relax.utils.straggler.core.modules import ModuleTimers
+from relax.utils.straggler.core.stats import FIELD_INDEX, NUM_FIELDS, WindowStats, disabled_row
+from relax.utils.straggler.core.timers import EventPool
+from relax.utils.straggler.core.trace import RECORD_WIDTH, RankTrace
+from relax.utils.straggler.core.worker import AnalysisWorker
 
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _FWD_INDEX = FIELD_INDEX["fwd"]
 _BWD_INDEX = FIELD_INDEX["bwd"]
@@ -130,8 +123,10 @@ class StragglerCollector:
     """Queue this rank's timing events, fold them lazily, and gather one window
     every ``report_interval`` steps.
 
-    Torch-free: CUDA events, stream-capture detection and the gathers are
-    injected (``runtime`` passes the real ones, tests pass fakes).
+    Torch-free: device events, stream-capture detection and the gathers are
+    injected (``relax_integration`` passes the real ones, tests pass fakes);
+    the timers that feed it are built by the adapter around it
+    (``megatron_adapter.phase_timers``).
     """
 
     def __init__(
@@ -209,13 +204,13 @@ class StragglerCollector:
         self._level_request = level_request
         self._synchronize = synchronize
         self._gather_to = gather_to
-        # Where samples go, the same on every rank (``runtime`` agrees on it at install); ``None``: no samples.
+        # Where samples go, the same on every rank (agreed on at install); ``None``: no samples.
         self._primary_rank = primary_rank
         self._sample_gather = trace and gather_to is not None and primary_rank is not None
         self._trace_sink = trace_sink
         self._max_trace_brackets = max_trace_brackets
         self._max_module_brackets = max_module_brackets
-        # Set by the runtime once the model exists; attached only during a sampled step at level 3.
+        # Set by the integration once the model exists; attached only during a sampled step at level 3.
         self.module_timers: ModuleTimers | None = None
         self.model_chunks = 1
         # The first window has no sample: its first step carries the warm-up.
@@ -255,10 +250,6 @@ class StragglerCollector:
         self._worker = AnalysisWorker(self._handle_job) if background and is_primary else None
         if register_gc_callback:
             gc.callbacks.append(self._on_gc)
-        # One timers object per phase so the same Megatron call sites land in
-        # different buckets during training vs. forward-only passes.
-        self.train_timers = StragglerTimers(self, MEGATRON_TIMER_SEGMENTS, TIMER_PHASES)
-        self.forward_only_timers = StragglerTimers(self, FORWARD_ONLY_TIMER_SEGMENTS)
 
     # ---- hot path -----------------------------------------------------------------------------------------------
 

@@ -3,7 +3,7 @@
 
 import pytest
 
-from relax.utils.straggler.control import CONTROL_PAGE, ControlState, LevelPoller
+from relax.utils.straggler.core.control import CONTROL_PAGE, ControlState, LevelPoller
 
 
 def test_requests_are_validated_and_reach_the_next_poll_with_the_primary_status():

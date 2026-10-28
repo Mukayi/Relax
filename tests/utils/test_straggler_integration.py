@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""CPU tests for the per-step reporting the Megatron actor drives, and for when
-the profiler gets installed."""
+"""CPU tests for the profiler inside Relax: when it gets installed, what the
+training code's calls hand it, and the per-step reporting."""
 
 import ast
 import itertools
@@ -11,10 +11,11 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from relax.utils.straggler import runtime
-from relax.utils.straggler.detector import WindowReport
-from relax.utils.straggler.reporter import REPORTED_METRICS
-from relax.utils.straggler.runtime import StragglerProfiler, install_straggler_profiler
+from relax.utils.straggler import megatron_adapter
+from relax.utils.straggler import relax_integration as integration
+from relax.utils.straggler.core.detector import WindowReport
+from relax.utils.straggler.core.report import REPORTED_METRICS
+from relax.utils.straggler.relax_integration import StragglerProfiler, install_straggler_profiler
 from relax.utils.timer import TimelineEvent, Timer
 from tests.utils.straggler_helpers import FakeEvent, bracket, make_collector, meta
 
@@ -44,7 +45,7 @@ def test_a_failing_reporter_is_counted_and_never_raises(monkeypatch):
     def boom(*args, **kwargs):
         raise RuntimeError("timeline broke")
 
-    monkeypatch.setattr(runtime, "report_straggler_window", boom)
+    monkeypatch.setattr(integration, "report_straggler_window", boom)
     profiler = _profiler(interval=1)
     assert _step(profiler, 0) is None
     assert profiler.collector.health.errors_total == 1
@@ -93,7 +94,7 @@ def _use_backend(monkeypatch, backend, available=True):
 def test_timing_events_come_from_the_active_accelerator(monkeypatch):
     backend = _FakeBackend()
     _use_backend(monkeypatch, backend)
-    runtime.timing_event_factory()()
+    integration.timing_event_factory()()
     assert backend.events == [{"enable_timing": True}]
 
 
@@ -104,7 +105,7 @@ def test_timing_events_on_cuda_are_device_generic_events(monkeypatch):
     built = []
     monkeypatch.setattr(device, "get_device_name", lambda: "cuda")
     monkeypatch.setattr(torch, "Event", lambda **kwargs: built.append(kwargs))
-    runtime.timing_event_factory()()
+    integration.timing_event_factory()()
     assert built == [{"device": "cuda", "enable_timing": True}]
 
 
@@ -113,18 +114,18 @@ def test_timing_events_on_cuda_are_device_generic_events(monkeypatch):
 )
 def test_capture_check_uses_the_backend_function_when_there_is_one(monkeypatch, capturing, available, expected):
     _use_backend(monkeypatch, _FakeBackend(capturing=capturing), available=available)
-    assert runtime.stream_capture_check()() is expected
+    assert integration.stream_capture_check()() is expected
 
 
 def test_capture_check_is_false_when_the_backend_has_none(monkeypatch):
     _use_backend(monkeypatch, _FakeBackend())
-    assert runtime.stream_capture_check()() is False
+    assert integration.stream_capture_check()() is False
 
 
 def test_timers_are_none_without_a_profiler():
-    assert runtime.straggler_timers("train") is None
+    assert integration.straggler_timers("train") is None
     with pytest.raises(ValueError):
-        runtime._timers_for(_profiler().collector, "eval")
+        integration._timers_for(_profiler(), "eval")
 
 
 class _DeviceLengths:
@@ -133,13 +134,13 @@ class _DeviceLengths:
 
 
 def test_micro_batch_tokens_reach_the_profiler_only_as_host_lists(monkeypatch):
-    runtime.note_microbatch_tokens([1, 2])  # no profiler: nothing happens
+    integration.note_microbatch_tokens([1, 2])  # no profiler: nothing happens
     profiler = _profiler()
     noted = []
-    monkeypatch.setattr(runtime, "_PROFILER", profiler)
+    monkeypatch.setattr(integration, "_PROFILER", profiler)
     monkeypatch.setattr(profiler.collector, "note_tokens", noted.append)
     for lengths in ([100, 250], (7,), None, _DeviceLengths()):
-        runtime.note_microbatch_tokens(lengths)
+        integration.note_microbatch_tokens(lengths)
     assert noted == [350, 7]
 
 
@@ -154,7 +155,7 @@ def test_the_start_level_comes_from_the_env_or_from_whether_traces_can_be_writte
         monkeypatch.delenv("RELAX_STRAGGLER_LEVEL", raising=False)
     else:
         monkeypatch.setenv("RELAX_STRAGGLER_LEVEL", env)
-    assert runtime.initial_level(trace_on) == expected
+    assert integration.initial_level(trace_on) == expected
 
 
 class _Chunk:
@@ -163,33 +164,33 @@ class _Chunk:
 
 
 def test_the_first_call_with_a_model_hands_it_to_the_collector(monkeypatch):
-    monkeypatch.setattr(runtime, "_PROFILER", None)
-    assert runtime.straggler_timers("train", [_Chunk()], 4) is None
+    monkeypatch.setattr(integration, "_PROFILER", None)
+    assert integration.straggler_timers("train", [_Chunk()], 4) is None
     profiler = _profiler()
-    monkeypatch.setattr(runtime, "_PROFILER", profiler)
-    assert runtime.straggler_timers("train") is profiler.collector.train_timers
+    monkeypatch.setattr(integration, "_PROFILER", profiler)
+    assert integration.straggler_timers("train") is profiler.timers["train"]
     assert profiler.collector.module_timers is None, "the optimizer config's call names no model"
-    assert runtime.straggler_timers("forward_only", [_Chunk(), _Chunk()]) is profiler.collector.forward_only_timers
+    assert integration.straggler_timers("forward_only", [_Chunk(), _Chunk()]) is profiler.timers["forward_only"]
     first = profiler.collector.module_timers
     assert not first.counts() and profiler.collector.model_chunks == 2
-    runtime.straggler_timers("train", [object()])
+    integration.straggler_timers("train", [object()])
     assert profiler.collector.module_timers is first, "only the first model is taken"
 
 
 def test_a_model_without_modules_is_a_profiler_error(monkeypatch):
     profiler = _profiler()
-    monkeypatch.setattr(runtime, "_PROFILER", profiler)
-    runtime.straggler_timers("train", [object()])
+    monkeypatch.setattr(integration, "_PROFILER", profiler)
+    integration.straggler_timers("train", [object()])
     assert profiler.collector.health.errors_total == 1
     assert profiler.collector.module_timers is None
 
 
 def test_traces_go_to_the_env_dir_or_under_the_timeline_dir(monkeypatch):
     monkeypatch.delenv("RELAX_STRAGGLER_TRACE_DIR", raising=False)
-    assert runtime.trace_dir(Namespace(timeline_dump_dir=None)) == ""
-    assert runtime.trace_dir(Namespace(timeline_dump_dir="/runs/x/timeline")) == "/runs/x/timeline/straggler"
+    assert integration.trace_dir(Namespace(timeline_dump_dir=None)) == ""
+    assert integration.trace_dir(Namespace(timeline_dump_dir="/runs/x/timeline")) == "/runs/x/timeline/straggler"
     monkeypatch.setenv("RELAX_STRAGGLER_TRACE_DIR", "/traces")
-    assert runtime.trace_dir(Namespace(timeline_dump_dir="/runs/x/timeline")) == "/traces"
+    assert integration.trace_dir(Namespace(timeline_dump_dir="/runs/x/timeline")) == "/traces"
 
 
 @pytest.fixture
@@ -208,7 +209,7 @@ def test_cpu_events_are_the_finished_timers_overlapping_the_step_without_call_st
             TimelineEvent("next_step", 21.0, 22.0, pid=1, tid=1),
         ]
     )
-    events = runtime._cpu_events(10.0, 20.0)
+    events = integration._cpu_events(10.0, 20.0)
     assert [event["name"] for event in events] == ["get_data_batch_a"]
     assert events[0]["args"] == {}
 
@@ -221,9 +222,9 @@ def test_only_the_latest_of_several_ready_windows_reaches_the_metrics(monkeypatc
 
     reported, warnings = [], []
     monkeypatch.setattr(
-        runtime, "report_straggler_window", lambda args, report: reported.append(report) or dict(report.metrics)
+        integration, "report_straggler_window", lambda args, report: reported.append(report) or dict(report.metrics)
     )
-    monkeypatch.setattr(runtime.logger, "warning", lambda msg, *a: warnings.append(msg % a))
+    monkeypatch.setattr(integration.logger, "warning", lambda msg, *a: warnings.append(msg % a))
     profiler = _profiler(interval=1)
     monkeypatch.setattr(profiler.collector, "end_step", lambda rollout_id, final=False: [window(0), window(1)])
 
@@ -249,8 +250,8 @@ def _ready_windows(monkeypatch, profiler, rollouts, failing):
         )
 
     warnings = []
-    monkeypatch.setattr(runtime, "report_straggler_window", report)
-    monkeypatch.setattr(runtime.logger, "warning", lambda msg, *a: warnings.append(msg % a))
+    monkeypatch.setattr(integration, "report_straggler_window", report)
+    monkeypatch.setattr(integration.logger, "warning", lambda msg, *a: warnings.append(msg % a))
     monkeypatch.setattr(profiler.collector, "end_step", lambda rollout_id, final=False: [window(n) for n in rollouts])
     return warnings
 
@@ -277,19 +278,19 @@ def test_install_uses_the_metrics_primary_rank_and_names_brackets_by_schedule_on
     monkeypatch, primary, vpp
 ):
     monkeypatch.setenv("RELAX_STRAGGLER_PROFILER", "1")
-    monkeypatch.setattr(runtime, "is_metrics_primary_rank", lambda: primary)
-    monkeypatch.setattr(runtime, "local_rank_meta", lambda: meta(1)[0])
-    monkeypatch.setattr(runtime, "timing_event_factory", lambda: FakeEvent)
-    monkeypatch.setattr(runtime, "stream_capture_check", lambda: runtime._never)
+    monkeypatch.setattr(megatron_adapter, "is_metrics_primary_rank", lambda: primary)
+    monkeypatch.setattr(integration, "local_rank_meta", lambda: meta(1)[0])
+    monkeypatch.setattr(integration, "timing_event_factory", lambda: FakeEvent)
+    monkeypatch.setattr(integration, "stream_capture_check", lambda: integration._never)
     # The gather group is a collective; its creation is covered separately.
-    monkeypatch.setattr(runtime, "init_straggler_gather_group", lambda timeout_s: None)
-    monkeypatch.setattr(runtime, "_PROFILER", None)
+    monkeypatch.setattr(integration, "init_straggler_gather_group", lambda timeout_s: None)
+    monkeypatch.setattr(integration, "_PROFILER", None)
     args = _args()
     args.virtual_pipeline_model_parallel_size = vpp
     profiler = install_straggler_profiler("actor", args)
     try:
         assert profiler.collector.is_primary is primary
-        assert profiler.collector._cpu_events_source is runtime._cpu_events
+        assert profiler.collector._cpu_events_source is integration._cpu_events
         assert profiler.collector._interleaved is (vpp is not None)
     finally:
         profiler.collector.close()
@@ -304,8 +305,8 @@ _TABLE_4 = [(0, 0), (1, 0), (0, 1), (1, 1), (2, 0), (3, 0), (2, 1), (3, 1)]
 )
 def test_the_schedule_table_comes_from_the_model_config(monkeypatch, forward_only, combined, expected):
     profiler = _profiler(interleaved=True)
-    monkeypatch.setattr(runtime, "_PROFILER", profiler)
-    runtime.straggler_timers("forward_only" if forward_only else "train", _vpp_model(combined), 4)
+    monkeypatch.setattr(integration, "_PROFILER", profiler)
+    integration.straggler_timers("forward_only" if forward_only else "train", _vpp_model(combined), 4)
     _, table, _ = profiler.collector._schedule
     assert list(table) == expected
 
@@ -319,16 +320,16 @@ def _vpp_model(combined=False):
 
 def test_the_calls_of_one_forward_only_number_their_micro_batches_in_order(monkeypatch):
     profiler = _profiler(interleaved=True)
-    monkeypatch.setattr(runtime, "_PROFILER", profiler)
-    runtime.straggler_timers("forward_only", _vpp_model(), [4, 2])
+    monkeypatch.setattr(integration, "_PROFILER", profiler)
+    integration.straggler_timers("forward_only", _vpp_model(), [4, 2])
     _, table, _ = profiler.collector._schedule
     assert list(table) == _TABLE_4 + [(4, 0), (5, 0), (4, 1), (5, 1)]
 
 
 def test_without_a_count_no_schedule_is_noted(monkeypatch):
     profiler = _profiler(interleaved=True)
-    monkeypatch.setattr(runtime, "_PROFILER", profiler)
-    runtime.straggler_timers("train", _vpp_model())
+    monkeypatch.setattr(integration, "_PROFILER", profiler)
+    integration.straggler_timers("train", _vpp_model())
     assert profiler.collector._schedule is None
 
 
@@ -343,7 +344,7 @@ def test_the_primary_rank_is_tp0_last_pp_stage_dp0(monkeypatch, tp, last_pp, dp)
     monkeypatch.setitem(sys.modules, "megatron", ModuleType("megatron"))
     monkeypatch.setitem(sys.modules, "megatron.core", core)
 
-    assert runtime.is_metrics_primary_rank() is (tp == 0 and last_pp and dp == 0)
+    assert megatron_adapter.is_metrics_primary_rank() is (tp == 0 and last_pp and dp == 0)
 
 
 def _function(path, name):
@@ -364,7 +365,7 @@ def test_the_primary_rank_rule_is_the_one_log_perf_data_logs_on():
     )
     (rule,) = (
         node.value
-        for node in ast.walk(_function(Path(runtime.__file__), "is_metrics_primary_rank"))
+        for node in ast.walk(_function(Path(megatron_adapter.__file__), "is_metrics_primary_rank"))
         if isinstance(node, ast.Return)
     )
     assert ast.dump(rule) == ast.dump(logged_on)

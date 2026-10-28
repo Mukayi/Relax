@@ -63,7 +63,7 @@ from typing import Callable, Hashable, Sequence
 
 import numpy as np
 
-from relax.utils.straggler.stats import (
+from relax.utils.straggler.core.stats import (
     FIELD_INDEX,
     GPU_SEGMENTS,
     PP_PHASE_FIELDS,
@@ -113,7 +113,7 @@ class RankMeta:
 @dataclass(frozen=True)
 class DetectorConfig:
     """Thresholds for ``analyze_window``; the first four are environment
-    variables in production (see ``runtime``)."""
+    variables in production (see ``relax_integration``)."""
 
     z_threshold: float = 3.0
     rel_threshold: float = 0.10

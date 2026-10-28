@@ -1,8 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Module brackets for the ``modules`` level: forward and backward of the
-blocks that ``MODULE_SPECS`` names inside every transformer layer (by default
-the attention, the MLP / MoE block and the parts of a MoE layer), recorded on
-the sampled step only.
+blocks that a list of ``ModuleSpec`` names inside every transformer layer
+(``megatron_adapter.MODULE_SPECS``: the attention, the MLP / MoE block and the
+parts of a MoE layer), recorded on the sampled step only.
 
 The timing is attached when a sampled step at that level starts and removed
 when it ends, so no other step pays for it. Each block's forward, or the
@@ -15,23 +15,23 @@ forward runs again inside the backward. Which micro-batch a bracket belongs
 to, and whether a forward was a recompute, is read off the trace by
 containment (see ``trace``).
 
-Timing the blocks of another model means adding specs to ``MODULE_SPECS``.
+Timing the blocks of another model means adding specs to the adapter's list.
 """
 
 from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Sequence
 
-from relax.utils.straggler.stats import NUM_FIELDS
-from relax.utils.straggler.timers import EventSink
+from relax.utils.straggler.core.stats import NUM_FIELDS
+from relax.utils.straggler.core.timers import EventSink
 
 
 @dataclass(frozen=True)
 class ModuleSpec:
     """One kind of block: the object at attribute ``path`` of a transformer
-    layer (any module with ``layer_number``), named ``name`` in the trace.
+    layer, named ``name`` in the trace.
 
     ``method`` times that method of the object instead of its forward, for a
     part that is not a module; ``when`` requires the object's class name to
@@ -55,33 +55,24 @@ class ModuleSpec:
     all_tensors: bool = False
 
 
-MODULE_SPECS: tuple[ModuleSpec, ...] = (
-    ModuleSpec("self_attention", "attn"),
-    ModuleSpec("mlp", "moe", when="MoE"),
-    ModuleSpec("mlp", "mlp"),
-    # Inside a MoE layer: routing, the token exchange around the experts (the EP all-to-all) and the experts.
-    ModuleSpec("mlp.router", "router"),
-    ModuleSpec("mlp.token_dispatcher", "dispatch", method="token_dispatch", all_tensors=True),
-    ModuleSpec("mlp.experts", "experts", all_tensors=True),
-    ModuleSpec("mlp.token_dispatcher", "combine", method="token_combine"),
-    ModuleSpec("mlp.shared_experts", "shared experts"),
-)
-# Block names; a block's forward and backward brackets are record segments NUM_FIELDS + 2 * index (+ 1).
-MODULE_NAMES: tuple[str, ...] = tuple(dict.fromkeys(spec.name for spec in MODULE_SPECS))
+def module_names(specs: Sequence[ModuleSpec]) -> tuple[str, ...]:
+    """Block names of ``specs`` in order.
 
-# Megatron's placeholders for blocks a layer does not have.
-PLACEHOLDERS = frozenset({"IdentityOp", "IdentityFuncOp"})
+    The forward and backward brackets of block ``index`` are record segments
+    ``NUM_FIELDS + 2 * index`` and ``NUM_FIELDS + 2 * index + 1``.
+    """
+    return tuple(dict.fromkeys(spec.name for spec in specs))
 
 
-def module_segment(name: str, backward: bool) -> int:
+def module_segment(names: Sequence[str], name: str, backward: bool) -> int:
     """The record segment of a block's forward or backward bracket."""
-    return NUM_FIELDS + 2 * MODULE_NAMES.index(name) + backward
+    return NUM_FIELDS + 2 * names.index(name) + backward
 
 
-def module_block(segment: int) -> tuple[str, bool]:
+def module_block(names: Sequence[str], segment: int) -> tuple[str, bool]:
     """Block name of a module record segment and whether it is a backward."""
-    offset = segment - NUM_FIELDS
-    return MODULE_NAMES[offset // 2], bool(offset % 2)
+    index, backward = divmod(segment - NUM_FIELDS, 2)
+    return (names[index] if index < len(names) else f"block {index}"), bool(backward)
 
 
 def _resolve(obj: Any, path: str) -> Any:
@@ -93,28 +84,37 @@ def _resolve(obj: Any, path: str) -> Any:
 
 
 class ModuleTimers:
-    """The ``MODULE_SPECS`` blocks of the transformer layers found in
+    """The ``specs`` blocks of the transformer layers found in
     ``model_chunks``, bracketed into ``sink`` (the collector) while attached.
 
-    The layers inside an MTP layer number from 1 again and are recorded
-    negated; identity placeholders are skipped.
+    ``layer_of`` gives a module's layer number, ``None`` for a module that is
+    not a transformer layer (the adapter negates the layers inside an MTP
+    layer, which number from 1 again); blocks whose class is in
+    ``placeholders`` are skipped.
     """
 
-    def __init__(self, model_chunks: Iterable[Any], sink: EventSink) -> None:
+    def __init__(
+        self,
+        model_chunks: Iterable[Any],
+        sink: EventSink,
+        specs: Sequence[ModuleSpec],
+        layer_of: Callable[[Any], int | None],
+        placeholders: frozenset[str] = frozenset(),
+    ) -> None:
         self._sink = sink
+        self.names = module_names(specs)
         # (object, method, block name, layer, all_tensors)
         self._blocks: list[tuple[Any, str, str, int, bool]] = []
         for chunk in model_chunks:
             for module in chunk.modules():
-                layer = getattr(module, "layer_number", None)
+                layer = layer_of(module)
                 if layer is None:
                     continue
-                layer = -int(layer) if getattr(module, "is_mtp_layer", False) else int(layer)
                 taken = set()
-                for spec in MODULE_SPECS:
+                for spec in specs:
                     key = (spec.path, spec.method)
                     block = None if key in taken else _resolve(module, spec.path)
-                    if block is None or type(block).__name__ in PLACEHOLDERS:
+                    if block is None or type(block).__name__ in placeholders:
                         continue
                     if spec.method is not None and not callable(getattr(block, spec.method, None)):
                         continue
@@ -131,7 +131,8 @@ class ModuleTimers:
         if self._wrappers:
             return
         for block, method, name, layer, all_tensors in self._blocks:
-            self._wrappers.append(_Wrapper(block, method, self._sink, name, layer, all_tensors))
+            segments = module_segment(self.names, name, False), module_segment(self.names, name, True)
+            self._wrappers.append(_Wrapper(block, method, self._sink, segments, layer, all_tensors))
 
     def detach(self) -> None:
         wrappers, self._wrappers = self._wrappers, []
@@ -151,12 +152,14 @@ class _Wrapper:
 
     __slots__ = ("_owner", "_method", "_saved")
 
-    def __init__(self, owner: Any, method: str, sink: EventSink, name: str, layer: int, all_tensors: bool) -> None:
+    def __init__(
+        self, owner: Any, method: str, sink: EventSink, segments: tuple[int, int], layer: int, all_tensors: bool
+    ) -> None:
         self._owner = owner
         self._method = method
         self._saved = owner.__dict__.get(method)
         original = getattr(owner, method)
-        fwd, bwd = module_segment(name, False), module_segment(name, True)
+        fwd, bwd = segments
 
         def timed(*args: Any, **kwargs: Any) -> Any:
             start = _open(sink)

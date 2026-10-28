@@ -8,15 +8,16 @@ from dataclasses import replace
 
 import pytest
 
-from relax.utils.straggler import collector as collector_module
-from relax.utils.straggler.health import HEALTH_DISABLE
-from relax.utils.straggler.modules import module_segment
-from relax.utils.straggler.stats import FIELD_INDEX, GPU_SEGMENTS, GRAD_SYNC_TIMERS, PP_PHASE_FIELDS
-from relax.utils.straggler.trace import RECORD_WIDTH
-from tests.utils.straggler_helpers import FakeEvent, bracket, make_collector, meta
+from relax.utils.straggler.core import collector as collector_module
+from relax.utils.straggler.core.health import HEALTH_DISABLE
+from relax.utils.straggler.core.modules import module_segment
+from relax.utils.straggler.core.stats import FIELD_INDEX, GPU_SEGMENTS, PP_PHASE_FIELDS
+from relax.utils.straggler.core.trace import RECORD_WIDTH
+from relax.utils.straggler.megatron_adapter import GRAD_SYNC_TIMERS, MODULE_NAMES
+from tests.utils.straggler_helpers import FakeEvent, bracket, make_collector, meta, timers
 
 
-_ATTN_FWD = module_segment("attn", False)
+_ATTN_FWD = module_segment(MODULE_NAMES, "attn", False)
 
 
 class _FakeCapture:
@@ -130,9 +131,9 @@ def test_no_events_are_recorded_while_the_stream_is_being_captured():
     assert collector.pending_events == 0 and len(collector._pool) == 4
     # Capture begins between start and stop: the started event is recycled.
     capture.active = False
-    collector.train_timers("forward-compute").start()
+    timers(collector)("forward-compute").start()
     capture.active = True
-    collector.train_timers("forward-compute").stop()
+    timers(collector)("forward-compute").stop()
     assert collector.pending_events == 0 and len(collector._pool) == 4
     capture.active = False
     bracket(collector)
@@ -239,8 +240,8 @@ def test_gc_is_attributed_only_while_a_step_is_open():
 
 def test_forward_only_timers_land_in_lp_buckets():
     collector = _collector(world=1)
-    collector.forward_only_timers("forward-compute", log_level=2).start()
-    collector.forward_only_timers("forward-compute").stop()
+    timers(collector, "forward_only")("forward-compute", log_level=2).start()
+    timers(collector, "forward_only")("forward-compute").stop()
     collector.drain()
     assert collector.window.get("lp_fwd") == 1.0
     assert collector.window.get("fwd") == 0.0
@@ -260,7 +261,7 @@ def test_the_window_counts_a_micro_batch_once_whatever_its_model_chunks():
 def _timed(collector, name, ms, tokens=None):
     """One bracket lasting ``ms`` fake milliseconds; ``tokens`` is reported
     while it is open, as the training forward_step does."""
-    timer = collector.train_timers(name)
+    timer = timers(collector)(name)
     timer.start()
     if tokens is not None:
         collector.note_tokens(tokens)
@@ -307,7 +308,7 @@ def test_under_interleaved_pp_brackets_take_the_micro_batch_and_model_chunk_of_t
     collector.note_schedule(lambda: [(0, 0), (0, 1)], forward_only=False)
     for _ in range(3):
         bracket(collector)
-    bracket(collector, timers=collector.forward_only_timers)
+    bracket(collector, phase="forward_only")
     collector.end_step(rollout_id=2)
     collector.end_step(rollout_id=3)
     sample, _ = calls["gathered"][-1]
@@ -338,7 +339,7 @@ def test_training_pp_waits_are_also_split_by_1f1b_phase():
     for name in ("forward-recv", "backward-send-forward-recv", "forward-send-backward-recv", "backward-recv"):
         bracket(collector, name)
     bracket(collector, "forward-send-forward-recv")  # interleaved schedule: total only
-    bracket(collector, "forward-recv", timers=collector.forward_only_timers)
+    bracket(collector, "forward-recv", phase="forward_only")
     collector.drain()
     assert collector.window.get("pp_recv") == 5.0
     assert [collector.window.get(name) for name in PP_PHASE_FIELDS] == [1.0, 1.0, 1.0, 1.0]

@@ -1,30 +1,26 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Non-synchronizing replacement for Megatron's ``config.timers``.
+"""Non-synchronizing stand-in for a framework's named timers.
 
 Megatron's ``megatron.core.timers.Timer.start/stop`` call
 ``torch.cuda.synchronize()`` on every bracket, which is why Relax sets
 ``config.timers = None`` everywhere. ``StragglerTimers`` speaks the same
 protocol (``timers(name, log_level).start(barrier) / .stop(barrier)``) but only
-records a pair of CUDA timing events plus a CPU timestamp and hands them to a
+records a pair of device timing events plus a CPU timestamp and hands them to a
 sink. Nothing here blocks on the device, so DP grad-reduce overlap and PP
-communication overlap are untouched.
+communication overlap are untouched. Which names exist and what they measure is
+the adapter's business (``megatron_adapter``).
 """
 
 from __future__ import annotations
 
+import logging
 from time import perf_counter
 from typing import Any, Callable, Mapping, Protocol
 
-from relax.utils.logging_utils import get_logger
-from relax.utils.straggler.stats import FIELD_INDEX
+from relax.utils.straggler.core.stats import FIELD_INDEX
 
 
-logger = get_logger(__name__)
-
-# Megatron timer names that wrap a whole schedule step and duplicate individual
-# segment timers; they are deliberately absent from MEGATRON_TIMER_SEGMENTS and
-# must not trigger the unknown-timer warning.
-_IGNORED_TIMER_NAMES: frozenset[str] = frozenset({"forward-backward"})
+logger = logging.getLogger(__name__)
 
 
 class EventSink(Protocol):
@@ -37,9 +33,9 @@ class EventSink(Protocol):
 
     def push(self, segment_index: int, phase_index: int, start_event: Any, end_event: Any, cpu_ms: float) -> None:
         """Hand over one completed bracket for later, lazy readout;
-        ``phase_index`` is a PP phase field, a gradient sync's position in
-        ``GRAD_SYNC_TIMERS``, -1, or a module bracket's layer number (negated
-        for an MTP layer)."""
+        ``phase_index`` is a PP phase field, a gradient sync's phase slot (see
+        ``stats.DP_REDUCTION_PHASE``), -1, or a module bracket's layer number
+        (negated for an MTP layer)."""
 
     def discard_event(self, event: Any) -> None:
         """Return an event whose bracket could not be completed."""
@@ -90,8 +86,8 @@ class _NullTimer:
 
 
 class _SegmentTimer:
-    """One Megatron timer name bound to one straggler segment and to the phase
-    slot of its brackets (see ``TIMER_PHASES``; -1 if it has none).
+    """One timer name bound to one straggler segment and to the phase slot of
+    its brackets (-1 if it has none).
 
     ``barrier`` is accepted for protocol compatibility and ignored: a barrier
     here would reintroduce exactly the synchronization we are avoiding. A
@@ -147,7 +143,9 @@ class _SegmentTimer:
 
 class StragglerTimers:
     """Stand in for Megatron's ``Timers`` on ``ModelParallelConfig`` /
-    ``OptimizerConfig``.
+    ``OptimizerConfig``: timer name -> segment (``name_to_segment``) and
+    phase slot (``name_to_phase``); ``ignored`` names are left untimed without
+    a warning.
 
     Only the subset of the ``megatron.core.timers.Timers`` protocol that
     megatron.core itself uses is implemented (``__call__`` returning an object
@@ -156,11 +154,16 @@ class StragglerTimers:
     """
 
     def __init__(
-        self, sink: EventSink, name_to_segment: Mapping[str, str], name_to_phase: Mapping[str, int] | None = None
+        self,
+        sink: EventSink,
+        name_to_segment: Mapping[str, str],
+        name_to_phase: Mapping[str, int] | None = None,
+        ignored: frozenset[str] = frozenset(),
     ) -> None:
         self._sink = sink
         self._name_to_segment = dict(name_to_segment)
         self._name_to_phase = dict(name_to_phase or {})
+        self._ignored = ignored
         self._timers: dict[str, _SegmentTimer | _NullTimer] = {}
         self._null = _NullTimer()
 
@@ -168,9 +171,9 @@ class StragglerTimers:
         """Return the timer bound to ``name``; untracked names share a no-op
         timer and ``log_level`` is ignored.
 
-        A name that is neither mapped nor in ``_IGNORED_TIMER_NAMES`` triggers
-        a WARNING the first time it is seen so stale or misspelled names are
-        not silently swallowed.
+        A name that is neither mapped nor ignored triggers a WARNING the first
+        time it is seen so stale or misspelled names are not silently
+        swallowed.
         """
         timer = self._timers.get(name)
         if timer is None:
@@ -179,13 +182,13 @@ class StragglerTimers:
                 timer = _SegmentTimer(FIELD_INDEX[segment], self._name_to_phase.get(name, -1), self._sink)
             else:
                 timer = self._null
-                if name not in _IGNORED_TIMER_NAMES:
+                if name not in self._ignored:
                     # _timers caches this entry after the first lookup, so the
                     # warning fires at most once per name per instance.
                     logger.warning(
                         "[straggler] unknown Megatron timer %r: not mapped to a segment, so its time is not "
-                        "recorded. Add it to MEGATRON_TIMER_SEGMENTS, or to the ignored names if it should stay "
-                        "unmapped.",
+                        "recorded. Add it to MEGATRON_TIMER_SEGMENTS in megatron_adapter.py, or to "
+                        "IGNORED_TIMER_NAMES if it should stay unmapped.",
                         name,
                     )
             self._timers[name] = timer

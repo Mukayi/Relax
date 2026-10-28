@@ -6,14 +6,14 @@ import gc
 
 import pytest
 
-from relax.utils.straggler.health import (
+from relax.utils.straggler.core.health import (
     HEALTH_ACTIVE,
     HEALTH_DEGRADED,
     HEALTH_DISABLE,
     HealthConfig,
     ProfilerHealth,
 )
-from relax.utils.straggler.stats import FIELD_INDEX
+from relax.utils.straggler.core.stats import FIELD_INDEX
 from tests.utils.straggler_helpers import bracket, make_collector
 
 

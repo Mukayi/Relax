@@ -3,19 +3,21 @@
 
 import json
 from array import array
+from functools import partial
 
 import pytest
 
-from relax.utils.straggler.modules import module_segment
-from relax.utils.straggler.stats import FIELD_INDEX, GRAD_SYNC_TIMERS
-from relax.utils.straggler.trace import (
-    FILE_PREFIX,
-    TIMELINE_PID_BASE,
-    RankTrace,
-    build_trace,
-    write_window_trace,
-)
+from relax.utils.straggler.core import trace as trace_module
+from relax.utils.straggler.core.modules import module_segment
+from relax.utils.straggler.core.stats import FIELD_INDEX
+from relax.utils.straggler.core.trace import FILE_PREFIX, TIMELINE_PID_BASE, RankTrace
+from relax.utils.straggler.megatron_adapter import GRAD_SYNC_TIMERS, MODULE_NAMES
 from tests.utils.straggler_helpers import meta as _meta
+
+
+# The names the profiler passes in.
+build_trace = partial(trace_module.build_trace, sync_names=GRAD_SYNC_TIMERS, module_names=MODULE_NAMES)
+write_window_trace = partial(trace_module.write_window_trace, sync_names=GRAD_SYNC_TIMERS, module_names=MODULE_NAMES)
 
 
 def _bracket(segment, start, end, phase=None, micro_batch=-1, tokens=-1):
@@ -153,6 +155,18 @@ def test_ranks_align_on_the_dp_gradient_sync_and_the_other_syncs_keep_their_time
     assert (dp_sync["dur"], embedding_sync["dur"]) == (5000, 4000)
 
 
+def test_syncs_and_blocks_the_adapter_did_not_name_get_numbered_names():
+    brackets = [
+        *_FIRST_STAGE[:-2],
+        _sync(90, 95),
+        _sync(95, 96, "embedding-grads-all-reduce"),
+        _module("attn_fwd", 1, 1, 4),
+    ]
+    trace, _ = trace_module.build_trace([_trace(brackets)], _meta(1))
+    names = {e["name"] for e in _slices(trace, 0)}
+    assert {"grad sync", "grad sync 3", "block 0 fwd L1"} <= names
+
+
 def test_missing_samples_are_skipped_and_cpu_events_get_their_own_row():
     traces, meta = _two_stages()
     cpu_event = {"name": "get_data_batch_1", "ph": "X", "ts": 1000.0 * 1e6, "dur": 5e3, "pid": 4242, "tid": 7}
@@ -169,7 +183,7 @@ def test_missing_samples_are_skipped_and_cpu_events_get_their_own_row():
 
 def _module(name, layer, start, end):
     block, direction = name.rsplit("_", 1)
-    return (module_segment(block, direction == "bwd"), layer, -1, -1, start, end)
+    return (module_segment(MODULE_NAMES, block, direction == "bwd"), layer, -1, -1, start, end)
 
 
 def test_module_brackets_nest_in_their_micro_batch_and_mark_recompute_and_log_prob_forwards():

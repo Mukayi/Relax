@@ -15,13 +15,12 @@ evidence that are worse than the profiler simply being off.
 
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass
 
-from relax.utils.logging_utils import get_logger
 
-
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # Order is part of the metric contract (``straggler/health/state``).
 HEALTH_ACTIVE, HEALTH_DEGRADED, HEALTH_DISABLE = 0, 1, 2

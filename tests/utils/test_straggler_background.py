@@ -3,9 +3,9 @@
 
 import threading
 
-from relax.utils.straggler import collector as collector_module
-from relax.utils.straggler.health import HealthConfig
-from relax.utils.straggler.stats import FIELD_INDEX
+from relax.utils.straggler.core import collector as collector_module
+from relax.utils.straggler.core.health import HealthConfig
+from relax.utils.straggler.core.stats import FIELD_INDEX
 from tests.utils.straggler_helpers import bracket, make_collector
 
 
