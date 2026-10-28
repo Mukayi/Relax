@@ -57,8 +57,9 @@ class ClosedWindow:
     rank's row and metadata, the sampled step's traces (``None`` below the
     detail level) and the level it ran at.
 
-    A paused window (level 0) and the switch-off notice (``switch_off`` says
-    why) take the same queue, so reports stay in window order.
+    A paused window (level 0, without a table: its report needs none) and the
+    switch-off notice (``switch_off`` says why) take the same queue, so reports
+    stay in window order.
     """
 
     table: list[list[float]]
@@ -237,7 +238,7 @@ class StragglerCollector:
             if self.is_primary and not self._disabled:
                 self._submit(
                     self._job(
-                        table,
+                        table if level else [],
                         closed_wall=closed_wall,
                         gather_ms=(gathered - started) * 1e3,
                         traces=traces if level >= 2 else None,
@@ -402,10 +403,10 @@ class StragglerCollector:
         if self._worker is None:
             self._handle_job(job)
             return
-        # Only windows to analyse count against the backlog: a paused window
-        # and the switch-off notice cost nothing to handle, and the notice
-        # (health/state=2) has to reach end_step even when the queue is full.
-        if job.level and not job.switch_off and self._worker.backlog >= self._max_backlog:
+        # Every window counts against the backlog, a paused one too, except the
+        # switch-off notice (health/state=2), which has to reach end_step even
+        # when the queue is full.
+        if not job.switch_off and self._worker.backlog >= self._max_backlog:
             self.on_error(
                 "analyze",
                 RuntimeError(

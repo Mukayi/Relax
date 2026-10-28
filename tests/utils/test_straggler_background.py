@@ -139,6 +139,26 @@ def test_backlog_drops_ordinary_windows_and_counts_errors(monkeypatch):
         collector.close()
 
 
+def test_paused_windows_count_against_the_backlog_and_keep_no_table(monkeypatch):
+    gate, started = _gated_analysis(monkeypatch)
+    collector = _collector(max_backlog=2, health_config=HealthConfig(max_errors=100, max_degraded_windows=100))
+    queued = []
+    submit = collector._worker.submit
+    monkeypatch.setattr(collector._worker, "submit", lambda job: (queued.append(job), submit(job)))
+    try:
+        _step(collector, rollout_id=0)  # in flight, blocked on the gate
+        assert started.wait(5)
+        collector._set_level(0)
+        for rollout_id in range(1, 9):
+            _step(collector, rollout_id=rollout_id)  # the first paused window is queued, the rest dropped
+        assert collector._worker.backlog == 2
+        assert collector.health.errors_total == 7
+        assert (queued[-1].level, queued[-1].table) == (0, [])
+    finally:
+        gate.set()
+        collector.close()
+
+
 def test_switch_off_notice_is_not_dropped_when_backlog_is_full(monkeypatch):
     """The switch-off notice (health/state=2) bypasses a full backlog."""
     gate, started = _gated_analysis(monkeypatch)
