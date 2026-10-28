@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """The profiler's layers import only the layers before them: ``core`` the
-standard library, numpy and itself; ``megatron_adapter`` also Megatron;
-``relax_integration`` anything."""
+standard library, numpy, requests and itself; ``megatron_adapter`` also
+Megatron; ``relax_integration`` anything."""
 
 import ast
 import subprocess

@@ -3,11 +3,10 @@
 
 Hot path (the framework's timer call sites, through ``timers``):
 ``record_event`` / ``push`` record events on the current stream and append to
-a queue. Once per step ``end_step``
-reads completed pairs with ``event.query()`` (never ``synchronize``); every
-``report_interval`` steps all ranks gather one small vector and the primary
-rank queues the table for the background analysis, whose reports a later
-``end_step`` returns.
+a queue. Once per step ``end_step`` reads completed pairs with
+``event.query()`` (never ``synchronize``); every ``report_interval`` steps all
+ranks gather one small vector and the primary rank queues the table for the
+background analysis, whose reports a later ``end_step`` returns.
 
 A "step" in this package is one ``end_step`` call, i.e. one rollout, which may
 contain several optimizer steps.

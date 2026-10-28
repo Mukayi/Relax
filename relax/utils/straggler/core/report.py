@@ -109,10 +109,6 @@ def switched_off(report: WindowReport) -> bool:
     return report.metrics.get("straggler/health/state", 0.0) >= HEALTH_DISABLE
 
 
-def _ms_after_close(report: WindowReport, wall: float) -> float:
-    return (wall - report.closed_wall) * 1e3
-
-
 def reported_scalars(report: WindowReport) -> dict[str, float]:
     """The window's ``REPORTED_METRICS``, with the rollouts it covers (it is
     usually picked up a step after it closed, hence ``straggler/window/*``) and
@@ -121,7 +117,7 @@ def reported_scalars(report: WindowReport) -> dict[str, float]:
     metrics["straggler/window/first_rollout"] = float(report.first_rollout)
     metrics["straggler/window/last_rollout"] = float(report.last_rollout)
     if report.closed_wall > 0.0:
-        metrics["straggler/latency/analyzed_ms"] = _ms_after_close(report, report.analyzed_wall)
+        metrics["straggler/latency/analyzed_ms"] = (report.analyzed_wall - report.closed_wall) * 1e3
     return {key: value for key, value in metrics.items() if key in REPORTED_METRICS}
 
 

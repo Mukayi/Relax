@@ -73,8 +73,7 @@ class EventPool:
 
 
 class _NullTimer:
-    """Returned for timer names we do not track; Megatron only calls
-    start/stop."""
+    """The timer of every name that is not timed; takes any arguments."""
 
     __slots__ = ()
 
@@ -156,8 +155,8 @@ class StragglerTimers:
     megatron.core itself uses is implemented (``__call__`` returning an object
     with ``start``/``stop``). Whatever falls outside it (an unknown name, an
     argument it does not take, ``log``/``write``) is ignored rather than raised
-    into the training loop, and reported once to ``sink.on_degraded`` so that
-    it is noticed.
+    into the training loop, and reported to ``sink.on_degraded`` so that it is
+    noticed.
     """
 
     def __init__(
@@ -194,9 +193,8 @@ class StragglerTimers:
                 timer = self._null
                 if name not in self._ignored:
                     self._sink.on_degraded(
-                        f"unknown Megatron timer {name!r}: not mapped to a segment, so its time is not recorded. "
-                        "Add it to MEGATRON_TIMER_SEGMENTS in megatron_adapter.py, or to IGNORED_TIMER_NAMES if it "
-                        "should stay unmapped"
+                        f"unknown timer {name!r}: not mapped to a segment, so its time is not recorded; map it, or "
+                        "list it as ignored, in the adapter that builds these timers"
                     )
             self._timers[name] = timer
         return timer
@@ -206,23 +204,19 @@ class StragglerTimers:
         return frozenset(self._timers)
 
     def log(self, *args: Any, **kwargs: Any) -> None:
-        """Do nothing: per-name totals are never aggregated here."""
+        """Report the call as a gap: no per-name totals are kept here."""
         self._sink.on_degraded(_unsupported("log"))
 
     def write(self, *args: Any, **kwargs: Any) -> None:
-        """Do nothing: per-name totals are never aggregated here."""
+        """Report the call as a gap: no per-name totals are kept here."""
         self._sink.on_degraded(_unsupported("write"))
 
 
 def _unexpected_arguments(call: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
     passed = [f"{len(args)} positional"] if args else []
     passed += sorted(kwargs)
-    return f"Megatron passed {call} arguments the profiler does not take ({', '.join(passed)}); they are ignored"
+    return f"{call} got arguments the profiler does not take ({', '.join(passed)}); they are ignored"
 
 
 def _unsupported(method: str) -> str:
-    return (
-        f"Megatron called Timers.{method}(), which the profiler's stand-in does not support: it keeps no per-name "
-        "totals, so that caller gets nothing. Read the straggler/* metrics instead, or switch the profiler off to "
-        "get config.timers=None back"
-    )
+    return f"Timers.{method}() was called, but the profiler keeps no per-name totals, so that caller gets nothing"

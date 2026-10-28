@@ -102,9 +102,9 @@ REQUIRED_TIMER_NAMES: Mapping[str, frozenset[str]] = {
 
 
 def phase_timers(sink: EventSink) -> dict[str, StragglerTimers]:
-    """The ``config.timers`` of each phase, feeding ``sink`` (the collector):
+    """The ``config.timers`` of each phase, feeding ``sink`` (the collector).
 
-    one object per phase so the same call sites land in different buckets
+    One object per phase, so that the same call sites land in different buckets
     during training and forward-only passes.
     """
     return {
@@ -175,13 +175,13 @@ def interleaved_schedule_table(
     model: Sequence[Any], num_microbatches: int | Sequence[int], forward_only: bool
 ) -> Sequence[tuple[int, int]]:
     """Megatron's interleaved schedule table for the forward-backward calls of
-    ``num_microbatches``, joined in call order with each call's micro-batches
-    numbered after the previous call's, from the inputs its schedule reads: the
-    model's own config and chunk count, not the launch arguments (Bridge does
-    not copy every argument into the model config).
+    ``num_microbatches`` (one count per call), joined in call order with each
+    call's micro-batches numbered after the previous call's; empty for training
+    under combined 1F1B, which merges forward and backward steps.
 
-    Empty for training under combined 1F1B, which merges forward and backward
-    steps.
+    The chunk count and config come from the model, as the schedule reads them,
+    not from the launch arguments: Bridge does not copy every argument into the
+    model config.
     """
     from megatron.core.pipeline_parallel.schedules import get_schedule_table
     from megatron.core.utils import get_model_config
@@ -189,7 +189,7 @@ def interleaved_schedule_table(
     config = get_model_config(model[0])
     if config.overlap_moe_expert_parallel_comm and not forward_only:
         return ()
-    calls = [num_microbatches] if isinstance(num_microbatches, int) else list(num_microbatches)
+    calls = [num_microbatches] if isinstance(num_microbatches, int) else num_microbatches
     table: list[tuple[int, int]] = []
     offset = 0
     for count in calls:

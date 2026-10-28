@@ -4,8 +4,7 @@ backend; off unless ``RELAX_STRAGGLER_PROFILER`` is set.
 
 Three layers, each importing only the ones before it (a CPU test checks):
 
-* ``core``: timers -> collector -> analysis worker -> detector -> report /
-  trace; no torch, Megatron or other Relax imports.
+* ``core``: the profiler itself; no torch, Megatron or other Relax imports.
 * ``megatron_adapter``: Megatron's timer names, layer blocks, parallel state
   and schedule, pinned by contract tests.
 * ``relax_integration``: settings, install, Gloo gathers, metrics, timeline;
@@ -19,7 +18,6 @@ from typing import Any
 
 
 __all__ = [
-    "StragglerProfiler",
     "install_straggler_profiler",
     "note_microbatch_tokens",
     "straggler_rollout_end",

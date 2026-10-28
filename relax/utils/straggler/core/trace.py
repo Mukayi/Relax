@@ -9,9 +9,8 @@ pipeline sit next to each other. Within a row the slices nest by time:
   plus ``untimed`` gaps that no bracket covers (host-side time);
 * level 2 (fwd / bwd): inside a busy run, ``F{i}`` / ``B{i}`` per micro-batch
   (``F{i} chunk {c}`` under interleaved PP, with the model chunk), sends, the
-  gradient syncs and the optimizer;
-  ``grad sync`` is the DP reduction, the other syncs keep their Megatron timer
-  names;
+  gradient syncs (``grad sync`` is the DP reduction, the others keep their
+  timer names) and the optimizer;
 * level 3 (modules, only at the ``modules`` level): inside ``F{i}`` / ``B{i}``,
   the forward / backward of the blocks the adapter's module specs name in
   every layer, e.g. ``attn fwd L3``, ``dispatch bwd L3`` (``attn fwd MTP L1``

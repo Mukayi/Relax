@@ -173,8 +173,8 @@ def test_timers_log_and_write_do_nothing_and_are_reported():
     assert timers.log(["forward-compute"]) is None
     assert timers.write(["forward-compute"], None, 0) is None
     assert [reason.split(",")[0] for reason in sink.degraded] == [
-        "Megatron called Timers.log()",
-        "Megatron called Timers.write()",
+        "Timers.log() was called",
+        "Timers.write() was called",
     ]
 
 
@@ -215,9 +215,9 @@ def test_arguments_the_timers_do_not_take_are_ignored_and_reported_while_the_bra
     timer.stop(barrier=False, sync=True)
     assert len(sink.pushed) == 1
     assert sink.degraded == [
-        "Megatron passed timers() arguments the profiler does not take (1 positional, stream); they are ignored",
-        "Megatron passed a timer's start() arguments the profiler does not take (1 positional); they are ignored",
-        "Megatron passed a timer's stop() arguments the profiler does not take (sync); they are ignored",
+        "timers() got arguments the profiler does not take (1 positional, stream); they are ignored",
+        "a timer's start() got arguments the profiler does not take (1 positional); they are ignored",
+        "a timer's stop() got arguments the profiler does not take (sync); they are ignored",
     ]
 
 

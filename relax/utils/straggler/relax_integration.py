@@ -76,7 +76,7 @@ def device_synchronize() -> Callable[[], None]:
     return device.device_module.synchronize if device.is_available() else (lambda: None)
 
 
-_STALL_GATHER_GROUP: Any = None
+_GATHER_GROUP: Any = None
 
 
 def init_straggler_gather_group(timeout_s: float) -> None:
@@ -90,15 +90,15 @@ def init_straggler_gather_group(timeout_s: float) -> None:
     default group must call this in the same order, so it runs on all ranks of
     the actor group before any gather.
     """
-    global _STALL_GATHER_GROUP
-    if _STALL_GATHER_GROUP is None:
-        _STALL_GATHER_GROUP = dist.new_group(backend="gloo", timeout=timedelta(seconds=timeout_s))
+    global _GATHER_GROUP
+    if _GATHER_GROUP is None:
+        _GATHER_GROUP = dist.new_group(backend="gloo", timeout=timedelta(seconds=timeout_s))
 
 
 def get_straggler_gather_group() -> Any:
-    if _STALL_GATHER_GROUP is None:
+    if _GATHER_GROUP is None:
         raise RuntimeError("the straggler Gloo group has not been initialized; call install_straggler_profiler first")
-    return _STALL_GATHER_GROUP
+    return _GATHER_GROUP
 
 
 def gloo_all_gather(values: list[float]) -> list[list[float]]:
@@ -187,11 +187,9 @@ def gloo_gather_objects_to(obj: Any, dst: int) -> list[Any] | None:
 
 
 def local_rank_meta() -> RankMeta:
-    from relax.utils.distributed_utils import get_gloo_group
-
     return RankMeta(
-        # Rank within the Gloo group == global rank; it indexes the gathered table.
-        rank=dist.get_rank(get_gloo_group()),
+        # Indexes the gathered table: the straggler group spans every global rank.
+        rank=dist.get_rank(),
         **megatron_adapter.parallel_ranks(),
         host=socket.gethostname(),
         device=device.device_module.current_device() if device.is_available() else -1,
@@ -253,34 +251,30 @@ class StragglerProfiler:
         except Exception as exc:
             self.collector.on_error("self-check", exc)
         reports = self.collector.end_step(rollout_id, final=rollout_id + 1 == self._args.num_rollout)
-        metrics: dict[str, float] | None = None
-        returned: WindowReport | None = None
-        superseded: list[WindowReport] = []
+        reported: list[tuple[WindowReport, dict[str, float]]] = []
         for report in reports:
             try:
-                scalars = report_straggler_window(self._args, report)
+                reported.append((report, report_straggler_window(self._args, report)))
             except Exception as exc:
                 self.collector.on_error("report", exc)
-                continue
-            if returned is not None:
-                superseded.append(returned)
-            returned, metrics = report, scalars
+        if not reported:
+            return None
+        *superseded, (latest, metrics) = reported
         if superseded:
             logger.warning(
                 "[straggler] rollout %d: %d windows ready at once; only rollouts %d-%d reach the metrics",
                 rollout_id,
                 len(reports),
-                returned.first_rollout,
-                returned.last_rollout,
+                latest.first_rollout,
+                latest.last_rollout,
             )
-            for dropped in superseded:
-                self.collector.on_error(
-                    "report",
-                    RuntimeError(
-                        f"scalars of rollouts {dropped.first_rollout}-{dropped.last_rollout} superseded by a later "
-                        "window"
-                    ),
-                )
+        for dropped, _ in superseded:
+            self.collector.on_error(
+                "report",
+                RuntimeError(
+                    f"scalars of rollouts {dropped.first_rollout}-{dropped.last_rollout} superseded by a later window"
+                ),
+            )
         return metrics
 
     def _check_timer_points(self) -> None:
@@ -349,8 +343,8 @@ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None
     """Create the process-wide profiler if it is enabled and ``role`` runs
     training steps; ``None`` otherwise.
 
-    Must run after Megatron parallel state and Relax's Gloo group exist, and
-    before the optimizer is built (its config takes ``straggler_timers``).
+    Must run after Megatron's parallel state exists and before the optimizer is
+    built (its config takes ``straggler_timers``).
     """
     global _PROFILER
     if not Envs.RELAX_STRAGGLER_PROFILER or role not in PROFILED_ROLES:
@@ -358,8 +352,6 @@ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None
     if _PROFILER is not None:
         return _PROFILER
 
-    # Every rank of the actor group reaches this call in the same order, which
-    # is what ``dist.new_group`` requires.
     init_straggler_gather_group(Envs.RELAX_STRAGGLER_GATHER_TIMEOUT_S)
 
     # The window scalars are logged through ``log_perf_data``, which drops them
@@ -430,13 +422,6 @@ def initial_level(trace_on: bool) -> int:
     return level if level >= 0 else (2 if trace_on else 1)
 
 
-def _timers_for(profiler: StragglerProfiler, phase: str) -> StragglerTimers:
-    timers = profiler.timers.get(phase)
-    if timers is None:
-        raise ValueError(f"unknown straggler phase {phase!r}; expected one of {sorted(profiler.timers)}")
-    return timers
-
-
 def straggler_timers(
     phase: str, model: Sequence[Any] | None = None, num_microbatches: int | Sequence[int] | None = None
 ) -> StragglerTimers | None:
@@ -451,13 +436,14 @@ def straggler_timers(
     """
     if _PROFILER is None:
         return None
-    collector = _PROFILER.collector
-    timers = _timers_for(_PROFILER, phase)
+    timers = _PROFILER.timers.get(phase)
+    if timers is None:
+        raise ValueError(f"unknown straggler phase {phase!r}; expected one of {sorted(_PROFILER.timers)}")
     if model is not None:
         _PROFILER.see_model(model)
         if num_microbatches is not None:
             forward_only = phase == "forward_only"
-            collector.note_schedule(
+            _PROFILER.collector.note_schedule(
                 partial(megatron_adapter.interleaved_schedule_table, model, num_microbatches, forward_only),
                 forward_only,
             )

@@ -156,8 +156,12 @@ def test_capture_check_is_false_when_the_backend_has_none(monkeypatch):
 
 def test_timers_are_none_without_a_profiler():
     assert integration.straggler_timers("train") is None
-    with pytest.raises(ValueError):
-        integration._timers_for(_profiler(), "eval")
+
+
+def test_an_unknown_phase_is_refused(monkeypatch):
+    monkeypatch.setattr(integration, "_PROFILER", _profiler())
+    with pytest.raises(ValueError, match="unknown straggler phase 'eval'"):
+        integration.straggler_timers("eval")
 
 
 class _DeviceLengths:
