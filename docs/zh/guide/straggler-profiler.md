@@ -22,6 +22,8 @@ env_vars:
   RELAX_STRAGGLER_REPORT_INTERVAL: "10"
 ```
 
+所有训练 rank 看到的这些变量（以及 `--timeline-dump-dir`）必须相同：窗口长度和是否写 trace 决定每个 rank 何时参加集合通信。多机时通过 Ray 运行时环境统一设置，不要在各节点上分别设置。
+
 | 环境变量 | 类型 | 默认值 | 说明 |
 |----------|------|--------|------|
 | `RELAX_STRAGGLER_PROFILER` | bool | false | 总开关。 |

@@ -22,6 +22,8 @@ env_vars:
   RELAX_STRAGGLER_REPORT_INTERVAL: "10"
 ```
 
+Every training rank must see the same values (and the same `--timeline-dump-dir`): the window length and whether traces are written decide when each rank joins the collectives. On several machines set them through the Ray runtime environment, not per node.
+
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `RELAX_STRAGGLER_PROFILER` | bool | false | Master switch. |
