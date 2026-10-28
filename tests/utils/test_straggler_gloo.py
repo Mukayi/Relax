@@ -51,7 +51,7 @@ def _rank_worker(rank, world_size, init_file, out_dir, failure):
                 raise MemoryError("injected after the metadata collectives")
             return gathered
 
-        host = {"pickle": _Unpicklable("host"), "oversized": "h" * 2000}.get(failure, "") if rank == 0 else ""
+        host = _Unpicklable("host") if failure == "pickle" and rank == 0 else ""
         collector = StragglerCollector(
             rank_meta=RankMeta(rank=rank, dp=rank, tp=0, pp=0, host=host),
             is_primary=rank == 0,
@@ -168,7 +168,7 @@ def test_every_rank_hands_its_sample_to_the_primary_rank_in_the_same_window(tmp_
     not torch.distributed.is_available() or not torch.distributed.is_gloo_available(),
     reason="torch.distributed with Gloo is required",
 )
-@pytest.mark.parametrize("failure", ["pickle", "oversized", "decode"])
+@pytest.mark.parametrize("failure", ["pickle", "decode"])
 def test_a_metadata_failure_on_one_rank_keeps_every_rank_on_the_same_collectives(tmp_path, failure):
     import torch.multiprocessing as mp
 

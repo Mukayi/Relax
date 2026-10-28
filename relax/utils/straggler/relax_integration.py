@@ -144,53 +144,41 @@ def gloo_primary_rank(is_primary: bool) -> int | None:
     return rank if rank >= 0 else None
 
 
-# A pickled RankMeta is under 400 B even with a 253-character host name.
-_META_ROW_BYTES = 1024
+def _pickled(obj: Any) -> tuple[bytes, Exception | None]:
+    """``obj`` pickled, or ``None`` pickled and the error.
+
+    The object collectives pickle their argument before their first collective,
+    so a rank whose pickling failed there would skip the collectives its peers
+    issue; pickling first keeps every rank on them.
+    """
+    try:
+        return pickle.dumps(obj), None
+    except Exception as exc:
+        return pickle.dumps(None), exc
 
 
 def gloo_all_gather_objects(obj: Any) -> list[Any]:
-    """All-gather one small picklable object per rank as a fixed-size byte row.
-
-    ``dist.all_gather_object`` pickles before its first collective, so a rank
-    whose pickling fails would skip the collectives its peers issue. Here every
-    rank issues the same single collective whatever fails locally: a rank that
-    cannot encode its object sends an all-zero row, and every rank raises after
-    the gather.
-    """
+    """All-gather one picklable object per rank over the straggler Gloo group;
+    every rank raises when one of them could not send its object."""
     group = get_straggler_gather_group()
-    local = torch.zeros(_META_ROW_BYTES, dtype=torch.uint8)
-    gathered = [torch.empty_like(local) for _ in range(dist.get_world_size(group))]
-    error = None
-    try:
-        data = pickle.dumps(obj)
-        if len(data) > _META_ROW_BYTES:
-            raise ValueError(f"{len(data)} B of rank metadata does not fit the {_META_ROW_BYTES} B row")
-        local[: len(data)] = torch.frombuffer(bytearray(data), dtype=torch.uint8)
-    except Exception as exc:
-        error = exc
-    dist.all_gather(gathered, local, group=group)
+    data, error = _pickled(obj)
+    gathered: list[Any] = [None] * dist.get_world_size(group)
+    dist.all_gather_object(gathered, data, group=group)
     if error is not None:
         raise error
-    missing = [rank for rank, row in enumerate(gathered) if not row.any()]
+    objects = [pickle.loads(item) for item in gathered]
+    missing = [rank for rank, item in enumerate(objects) if item is None]
     if missing:
-        raise RuntimeError(f"ranks {missing} sent no metadata")
-    # pickle.loads ignores the zero padding after the pickled bytes.
-    return [pickle.loads(row.numpy().tobytes()) for row in gathered]
+        raise RuntimeError(f"ranks {missing} sent no object")
+    return objects
 
 
 def gloo_gather_objects_to(obj: Any, dst: int) -> list[Any] | None:
     """Gather one picklable object per rank on rank ``dst`` (``None``
-    elsewhere) over the straggler Gloo group.
-
-    The object is pickled before the collective so that a rank whose pickling
-    fails still joins it, with ``None``; it raises after the gather.
-    """
+    elsewhere) over the straggler Gloo group; a rank that could not send its
+    object raises after the gather."""
     group = get_straggler_gather_group()
-    error = None
-    try:
-        data = pickle.dumps(obj)
-    except Exception as exc:
-        error, data = exc, pickle.dumps(None)
+    data, error = _pickled(obj)
     gathered = [None] * dist.get_world_size(group) if dist.get_rank() == dst else None
     dist.gather_object(data, gathered, dst=dst, group=group)
     if error is not None:
