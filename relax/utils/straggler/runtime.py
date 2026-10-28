@@ -182,6 +182,19 @@ def gloo_gather_objects_to(obj: Any, dst: int) -> list[Any] | None:
     return [pickle.loads(item) for item in gathered] if gathered is not None else None
 
 
+def is_metrics_primary_rank() -> bool:
+    """The rank whose ``log_perf_data`` logs the perf metrics, the same rule as
+    ``relax.backends.megatron.data.log_perf_data``: TP 0, last PP stage, DP
+    (with CP) 0."""
+    from megatron.core import mpu
+
+    return (
+        mpu.get_tensor_model_parallel_rank() == 0
+        and mpu.is_pipeline_last_stage()
+        and mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+    )
+
+
 def local_rank_meta() -> RankMeta:
     from megatron.core import mpu
 
@@ -203,15 +216,39 @@ def local_rank_meta() -> RankMeta:
 class StragglerProfiler:
     """One collector plus the per-step reporting around ``log_perf_data``.
 
-    ``step_metrics`` never raises: a failing reporter is counted by the
+    ``rollout_end`` never raises: a failing reporter is counted by the
     collector's health like any other profiler failure.
     """
 
     def __init__(self, collector: StragglerCollector, args: Any) -> None:
         self.collector = collector
         self._args = args
+        self._model_seen = False
 
-    def step_metrics(self, rollout_id: int, tokens: int) -> dict[str, float] | None:
+    def see_model(self, model_chunks: Sequence[Any]) -> None:
+        """Take the model chunks the first time a forward-backward call names
+        them: their count, and their blocks for the ``modules`` level, which
+        are timed only while a sampled step at that level runs."""
+        if self._model_seen:
+            return
+        self._model_seen = True
+        collector = self.collector
+        collector.model_chunks = max(len(model_chunks), 1)
+        try:
+            timers = ModuleTimers(model_chunks, collector)
+        except Exception as exc:
+            collector.on_error("modules", exc)
+            return
+        collector.module_timers = timers
+        if collector.is_primary:
+            counts = timers.counts()
+            logger.info(
+                "[straggler] modules level: %d blocks on this rank (%s)",
+                counts.total(),
+                ", ".join(f"{name} {count}" for name, count in counts.items()),
+            )
+
+    def rollout_end(self, rollout_id: int) -> dict[str, float] | None:
         """Close this step (all ranks; a Gloo collective every window) and
         return the scalars of the latest window whose analysis has finished,
         for this step's ``log_perf_data``.
@@ -223,7 +260,6 @@ class StragglerProfiler:
         profiler error; a window whose reporter fails is counted once, as that
         failure.
         """
-        self.collector.add_tokens(tokens)
         reports = self.collector.end_step(rollout_id, final=rollout_id + 1 == self._args.num_rollout)
         metrics: dict[str, float] | None = None
         returned: WindowReport | None = None
@@ -296,7 +332,6 @@ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None
         return None
     if _PROFILER is not None:
         return _PROFILER
-    from relax.utils.training.train_metric_utils import is_metrics_primary_rank
 
     # Every rank of the actor group reaches this call in the same order, which
     # is what ``dist.new_group`` requires.
@@ -354,30 +389,6 @@ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None
     return _PROFILER
 
 
-def register_straggler_model(model_chunks: Sequence[Any]) -> None:
-    """Hand the model chunks to the profiler for the ``modules`` level; a no-op
-    without a profiler.
-
-    Their blocks are timed only while a sampled step at that level runs.
-    """
-    if _PROFILER is None:
-        return
-    collector = _PROFILER.collector
-    try:
-        timers = ModuleTimers(model_chunks, collector)
-    except Exception as exc:
-        collector.on_error("modules", exc)
-        return
-    collector.module_timers = timers
-    if collector.is_primary:
-        counts = timers.counts()
-        logger.info(
-            "[straggler] modules level: %d blocks on this rank (%s)",
-            counts.total(),
-            ", ".join(f"{name} {count}" for name, count in counts.items()),
-        )
-
-
 def initial_level(trace_on: bool) -> int:
     """The level a run starts at: ``RELAX_STRAGGLER_LEVEL``, else detail when
     traces have somewhere to go and coarse otherwise; never ``modules`` unless
@@ -394,19 +405,51 @@ def _timers_for(collector: StragglerCollector, phase: str) -> StragglerTimers:
     raise ValueError(f"unknown straggler phase {phase!r}; expected 'train' or 'forward_only'")
 
 
-def straggler_timers(phase: str) -> StragglerTimers | None:
+def straggler_timers(
+    phase: str, model: Sequence[Any] | None = None, num_microbatches: int | Sequence[int] | None = None
+) -> StragglerTimers | None:
     """The ``config.timers`` value for ``phase``: ``None`` without a profiler,
-    which is what Relax assigns anyway."""
-    return _timers_for(_PROFILER.collector, phase) if _PROFILER is not None else None
+    which is what Relax assigns anyway.
+
+    Set right before Megatron's forward-backward call, ``model`` and
+    ``num_microbatches`` describe that call (a list: the calls of one
+    ``forward_only``, in order): the first call hands the model to the
+    profiler, and under interleaved PP each call names the micro-batch and
+    model chunk of its brackets.
+    """
+    if _PROFILER is None:
+        return None
+    collector = _PROFILER.collector
+    timers = _timers_for(collector, phase)
+    if model is not None:
+        _PROFILER.see_model(model)
+        if num_microbatches is not None:
+            forward_only = phase == "forward_only"
+            collector.note_schedule(
+                partial(interleaved_schedule_table, model, num_microbatches, forward_only), forward_only
+            )
+    return timers
+
+
+def straggler_rollout_end(rollout_id: int) -> dict[str, float] | None:
+    """Close this rollout's step and return the scalars of a finished window
+    for its ``log_perf_data``; ``None`` without a profiler or without a
+    finished window.
+
+    Every rank of the actor group must call it once per rollout: it joins a
+    Gloo gather every ``RELAX_STRAGGLER_REPORT_INTERVAL`` rollouts.
+    """
+    return _PROFILER.rollout_end(rollout_id) if _PROFILER is not None else None
 
 
 def interleaved_schedule_table(
-    model: Sequence[Any], num_microbatches: int, forward_only: bool
+    model: Sequence[Any], num_microbatches: int | Sequence[int], forward_only: bool
 ) -> Sequence[tuple[int, int]]:
-    """Megatron's interleaved schedule table for one forward-backward call,
-    from the inputs its schedule reads: the model's own config and chunk count,
-    not the launch arguments (Bridge does not copy every argument into the
-    model config).
+    """Megatron's interleaved schedule table for the forward-backward calls of
+    ``num_microbatches``, joined in call order with each call's micro-batches
+    numbered after the previous call's, from the inputs its schedule reads: the
+    model's own config and chunk count, not the launch arguments (Bridge does
+    not copy every argument into the model config).
 
     Empty for training under combined 1F1B, which merges forward and backward
     steps.
@@ -417,17 +460,16 @@ def interleaved_schedule_table(
     config = get_model_config(model[0])
     if config.overlap_moe_expert_parallel_comm and not forward_only:
         return ()
-    return get_schedule_table(num_microbatches, len(model), config.microbatch_group_size_per_vp_stage)
-
-
-def note_schedule(model: Sequence[Any], num_microbatches: int, forward_only: bool) -> None:
-    """Report the forward-backward call about to run, so that under interleaved
-    PP each bracket takes its micro-batch and model chunk; a no-op without a
-    profiler."""
-    if _PROFILER is not None:
-        _PROFILER.collector.note_schedule(
-            partial(interleaved_schedule_table, model, num_microbatches, forward_only), forward_only
-        )
+    calls = [num_microbatches] if isinstance(num_microbatches, int) else list(num_microbatches)
+    table: list[tuple[int, int]] = []
+    offset = 0
+    for count in calls:
+        table += [
+            (offset + micro_batch, chunk)
+            for micro_batch, chunk in get_schedule_table(count, len(model), config.microbatch_group_size_per_vp_stage)
+        ]
+        offset += count
+    return table
 
 
 def note_microbatch_tokens(total_lengths: Any) -> None:

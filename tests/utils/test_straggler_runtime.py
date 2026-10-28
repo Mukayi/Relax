@@ -2,7 +2,12 @@
 """CPU tests for the per-step reporting the Megatron actor drives, and for when
 the profiler gets installed."""
 
+import ast
+import itertools
+import sys
 from argparse import Namespace
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -11,7 +16,6 @@ from relax.utils.straggler.detector import WindowReport
 from relax.utils.straggler.reporter import REPORTED_METRICS
 from relax.utils.straggler.runtime import StragglerProfiler, install_straggler_profiler
 from relax.utils.timer import TimelineEvent, Timer
-from relax.utils.training import train_metric_utils
 from tests.utils.straggler_helpers import FakeEvent, bracket, make_collector, meta
 
 
@@ -25,7 +29,7 @@ def _profiler(interval=2, num_rollout=100, **kwargs):
 
 def _step(profiler, rollout_id):
     bracket(profiler.collector)
-    return profiler.step_metrics(rollout_id, tokens=1000)
+    return profiler.rollout_end(rollout_id)
 
 
 def test_scalars_arrive_when_a_window_closes_and_carry_its_rollout_range():
@@ -153,15 +157,31 @@ def test_the_start_level_comes_from_the_env_or_from_whether_traces_can_be_writte
     assert runtime.initial_level(trace_on) == expected
 
 
-def test_the_model_reaches_the_collector_only_with_a_profiler(monkeypatch):
+class _Chunk:
+    def modules(self):
+        return []
+
+
+def test_the_first_call_with_a_model_hands_it_to_the_collector(monkeypatch):
     monkeypatch.setattr(runtime, "_PROFILER", None)
-    runtime.register_straggler_model([])
+    assert runtime.straggler_timers("train", [_Chunk()], 4) is None
     profiler = _profiler()
     monkeypatch.setattr(runtime, "_PROFILER", profiler)
-    runtime.register_straggler_model([])
-    assert not profiler.collector.module_timers.counts()
-    runtime.register_straggler_model([object()])
-    assert profiler.collector.health.errors_total == 1, "a model without modules() is a profiler error"
+    assert runtime.straggler_timers("train") is profiler.collector.train_timers
+    assert profiler.collector.module_timers is None, "the optimizer config's call names no model"
+    assert runtime.straggler_timers("forward_only", [_Chunk(), _Chunk()]) is profiler.collector.forward_only_timers
+    first = profiler.collector.module_timers
+    assert not first.counts() and profiler.collector.model_chunks == 2
+    runtime.straggler_timers("train", [object()])
+    assert profiler.collector.module_timers is first, "only the first model is taken"
+
+
+def test_a_model_without_modules_is_a_profiler_error(monkeypatch):
+    profiler = _profiler()
+    monkeypatch.setattr(runtime, "_PROFILER", profiler)
+    runtime.straggler_timers("train", [object()])
+    assert profiler.collector.health.errors_total == 1
+    assert profiler.collector.module_timers is None
 
 
 def test_traces_go_to_the_env_dir_or_under_the_timeline_dir(monkeypatch):
@@ -207,7 +227,7 @@ def test_only_the_latest_of_several_ready_windows_reaches_the_metrics(monkeypatc
     profiler = _profiler(interval=1)
     monkeypatch.setattr(profiler.collector, "end_step", lambda rollout_id, final=False: [window(0), window(1)])
 
-    metrics = profiler.step_metrics(1, tokens=0)
+    metrics = profiler.rollout_end(1)
     assert metrics == {"straggler/window/last_rollout": 1.0}
     assert [r.last_rollout for r in reported] == [0, 1], "every window still reaches the timeline"
     assert len(warnings) == 1 and "2 windows ready at once" in warnings[0]
@@ -215,8 +235,8 @@ def test_only_the_latest_of_several_ready_windows_reaches_the_metrics(monkeypatc
 
 
 def _ready_windows(monkeypatch, profiler, rollouts, failing):
-    """Make ``step_metrics`` see the windows of ``rollouts`` ready at once,
-    with the reporter failing on ``failing``; returns the WARNING lines."""
+    """Make ``rollout_end`` see the windows of ``rollouts`` ready at once, with
+    the reporter failing on ``failing``; returns the WARNING lines."""
 
     def report(args, window):
         if window.last_rollout == failing:
@@ -239,7 +259,7 @@ def test_a_failing_latest_window_falls_back_to_the_previous_one_and_counts_one_e
     profiler = _profiler(interval=1)
     warnings = _ready_windows(monkeypatch, profiler, rollouts=[1, 2], failing=2)
     for errors in (1, 2):
-        assert profiler.step_metrics(2, tokens=0) == {"straggler/window/last_rollout": 1.0}
+        assert profiler.rollout_end(2) == {"straggler/window/last_rollout": 1.0}
         assert profiler.collector.health.errors_total == errors, "only the failing window is lost"
     assert warnings == [], "the returned window superseded nothing"
 
@@ -247,17 +267,17 @@ def test_a_failing_latest_window_falls_back_to_the_previous_one_and_counts_one_e
 def test_the_superseded_warning_names_the_window_that_is_returned(monkeypatch):
     profiler = _profiler(interval=1)
     warnings = _ready_windows(monkeypatch, profiler, rollouts=[0, 1, 2], failing=2)
-    assert profiler.step_metrics(2, tokens=0) == {"straggler/window/last_rollout": 1.0}
+    assert profiler.rollout_end(2) == {"straggler/window/last_rollout": 1.0}
     assert len(warnings) == 1 and "only rollouts 1-1 reach the metrics" in warnings[0]
     assert profiler.collector.health.errors_total == 2, "window 0 superseded, window 2 failed"
 
 
 @pytest.mark.parametrize(("primary", "vpp"), [(True, None), (False, 2)])
-def test_install_uses_the_shared_metrics_primary_rank_and_names_brackets_by_schedule_only_under_vpp(
+def test_install_uses_the_metrics_primary_rank_and_names_brackets_by_schedule_only_under_vpp(
     monkeypatch, primary, vpp
 ):
     monkeypatch.setenv("RELAX_STRAGGLER_PROFILER", "1")
-    monkeypatch.setattr(train_metric_utils, "is_metrics_primary_rank", lambda: primary)
+    monkeypatch.setattr(runtime, "is_metrics_primary_rank", lambda: primary)
     monkeypatch.setattr(runtime, "local_rank_meta", lambda: meta(1)[0])
     monkeypatch.setattr(runtime, "timing_event_factory", lambda: FakeEvent)
     monkeypatch.setattr(runtime, "stream_capture_check", lambda: runtime._never)
@@ -285,9 +305,66 @@ _TABLE_4 = [(0, 0), (1, 0), (0, 1), (1, 1), (2, 0), (3, 0), (2, 1), (3, 1)]
 def test_the_schedule_table_comes_from_the_model_config(monkeypatch, forward_only, combined, expected):
     profiler = _profiler(interleaved=True)
     monkeypatch.setattr(runtime, "_PROFILER", profiler)
-    # The launch arguments may ask for groups of 3; Megatron's schedule reads the wrapped model's config.
-    config = Namespace(microbatch_group_size_per_vp_stage=2, overlap_moe_expert_parallel_comm=combined)
-    chunk = Namespace(module=Namespace(config=config))
-    runtime.note_schedule([chunk, chunk], 4, forward_only)
+    runtime.straggler_timers("forward_only" if forward_only else "train", _vpp_model(combined), 4)
     _, table, _ = profiler.collector._schedule
     assert list(table) == expected
+
+
+def _vpp_model(combined=False):
+    # The launch arguments may ask for groups of 3; Megatron's schedule reads the wrapped model's config.
+    config = Namespace(microbatch_group_size_per_vp_stage=2, overlap_moe_expert_parallel_comm=combined)
+    chunk = Namespace(module=Namespace(config=config), modules=lambda: [])
+    return [chunk, chunk]
+
+
+def test_the_calls_of_one_forward_only_number_their_micro_batches_in_order(monkeypatch):
+    profiler = _profiler(interleaved=True)
+    monkeypatch.setattr(runtime, "_PROFILER", profiler)
+    runtime.straggler_timers("forward_only", _vpp_model(), [4, 2])
+    _, table, _ = profiler.collector._schedule
+    assert list(table) == _TABLE_4 + [(4, 0), (5, 0), (4, 1), (5, 1)]
+
+
+def test_without_a_count_no_schedule_is_noted(monkeypatch):
+    profiler = _profiler(interleaved=True)
+    monkeypatch.setattr(runtime, "_PROFILER", profiler)
+    runtime.straggler_timers("train", _vpp_model())
+    assert profiler.collector._schedule is None
+
+
+@pytest.mark.parametrize(("tp", "last_pp", "dp"), list(itertools.product([0, 1], [True, False], [0, 1])))
+def test_the_primary_rank_is_tp0_last_pp_stage_dp0(monkeypatch, tp, last_pp, dp):
+    core = ModuleType("megatron.core")
+    core.mpu = SimpleNamespace(
+        get_tensor_model_parallel_rank=lambda: tp,
+        is_pipeline_last_stage=lambda: last_pp,
+        get_data_parallel_rank=lambda with_context_parallel=False: dp if with_context_parallel else 0,
+    )
+    monkeypatch.setitem(sys.modules, "megatron", ModuleType("megatron"))
+    monkeypatch.setitem(sys.modules, "megatron.core", core)
+
+    assert runtime.is_metrics_primary_rank() is (tp == 0 and last_pp and dp == 0)
+
+
+def _function(path, name):
+    tree = ast.parse(Path(path).read_text())
+    return next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == name)
+
+
+def test_the_primary_rank_rule_is_the_one_log_perf_data_logs_on():
+    # The window scalars reach the metrics only through that rank's log_perf_data.
+    repo = Path(__file__).resolve().parents[2]
+    log_perf_data = _function(repo / "relax/backends/megatron/data.py", "log_perf_data")
+    (logged_on,) = (
+        keyword.value
+        for node in ast.walk(log_perf_data)
+        if isinstance(node, ast.Call)
+        for keyword in node.keywords
+        if keyword.arg == "is_primary_rank"
+    )
+    (rule,) = (
+        node.value
+        for node in ast.walk(_function(Path(runtime.__file__), "is_metrics_primary_rank"))
+        if isinstance(node, ast.Return)
+    )
+    assert ast.dump(rule) == ast.dump(logged_on)

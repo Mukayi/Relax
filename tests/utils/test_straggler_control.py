@@ -1,9 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """CPU tests for switching the profiler's level through the metrics service."""
 
-import asyncio
-from types import SimpleNamespace
-
 import pytest
 
 from relax.utils.straggler.control import CONTROL_PAGE, ControlState, LevelPoller
@@ -56,17 +53,17 @@ def test_the_poller_reports_status_and_keeps_the_last_answer_when_a_poll_fails()
     assert calls[0] == ("http://head:8000/metrics/straggler/poll", status, 2.0)
 
 
-def test_the_metrics_service_serves_the_page_and_the_level_endpoints():
-    from fastapi import HTTPException
+def test_the_metrics_service_serves_the_page_and_the_level_endpoints(monkeypatch):
+    from fastapi.testclient import TestClient
 
-    from relax.utils.metrics.service import MetricsService, StragglerLevelRequest, StragglerPollRequest
+    from relax.utils.metrics.service import app
+    from relax.utils.straggler import control_routes
 
-    service = MetricsService.func_or_class
-    instance = SimpleNamespace(_straggler=ControlState())
-    assert asyncio.run(service.straggler_page(instance)).body.decode() == CONTROL_PAGE
-    assert asyncio.run(service.request_straggler_level(instance, StragglerLevelRequest(level=2)))["requested"] == 2
-    with pytest.raises(HTTPException):
-        asyncio.run(service.request_straggler_level(instance, StragglerLevelRequest(level=5)))
-    poll = StragglerPollRequest(level=1, rollout=9, health="active")
-    assert asyncio.run(service.poll_straggler_level(instance, poll)) == {"requested": 2, "version": 1}
-    assert asyncio.run(service.straggler_state(instance))["report"]["level"] == 1
+    monkeypatch.setattr(control_routes, "state", ControlState())
+    client = TestClient(app)
+    assert client.get("/straggler").text == CONTROL_PAGE
+    assert client.post("/straggler/control", json={"level": 2}).json()["requested"] == 2
+    assert client.post("/straggler/control", json={"level": 5}).status_code == 400
+    poll = {"level": 1, "rollout": 9, "health": "active"}
+    assert client.post("/straggler/poll", json=poll).json() == {"requested": 2, "version": 1}
+    assert client.get("/straggler/control").json()["report"]["level"] == 1

@@ -14,8 +14,8 @@ def _collector(**kwargs):
 
 
 def _step(collector, rollout_id):
+    collector.note_tokens(1000)
     bracket(collector)
-    collector.add_tokens(1000)
     return collector.end_step(rollout_id)
 
 

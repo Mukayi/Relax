@@ -47,7 +47,7 @@ from relax.utils.megatron_peft_utils import is_lora_enabled
 from relax.utils.memory_utils import available_memory, clear_memory, log_step_peak_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.replay import capture_hooks
-from relax.utils.straggler import note_microbatch_tokens, note_schedule, straggler_timers
+from relax.utils.straggler import note_microbatch_tokens, straggler_timers
 from relax.utils.timer import timer
 from relax.utils.training.packing_metrics import PackingMetrics
 from relax.utils.training.ppo_utils import (
@@ -593,7 +593,6 @@ def setup_model_and_optimizer(
     # Optimizer
     kwargs = _build_optimizer_config_kwargs(args)
     config = OptimizerConfig(**kwargs)
-    # None unless the straggler profiler is on (Megatron's own Timers synchronize the device on every bracket).
     config.timers = straggler_timers("train")
     _validate_vit_lr_trainable_params(args, model)
 
@@ -1098,12 +1097,10 @@ def forward_only(
         custom_before_log_prob_hook(args, model, store_prefix)
 
     forward_backward_func = get_forward_backward_func()
-    # Forward-only passes (log-probs / values) get their own straggler buckets; None when the profiler is off.
-    config.timers = straggler_timers("forward_only")
+    config.timers = straggler_timers("forward_only", model, num_microbatches)
     forward_data_store = []
     num_steps_per_rollout = len(num_microbatches)
     for step_id in range(num_steps_per_rollout):
-        note_schedule(model, num_microbatches[step_id], forward_only=True)
         forward_data_store += forward_backward_func(
             forward_step_func=forward_step,
             data_iterator=data_iterator,
@@ -1489,7 +1486,7 @@ def train_one_step(
             forward_backward_func = streaming_forward_backward_pipelining_without_interleaving
     else:
         forward_backward_func = get_forward_backward_func()
-    note_schedule(model, num_microbatches, forward_only=False)
+    get_model_config(model[0]).timers = straggler_timers("train", model, num_microbatches)
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step,
         data_iterator=data_iterator,
@@ -1675,7 +1672,7 @@ def train(
     # Setup some training config params.
     config = get_model_config(model[0])
     config.grad_scale_func = optimizer.scale_loss
-    config.timers = straggler_timers("train")
+    config.timers = None
     # train() is invoked once per rollout in Relax (vs. once per run upstream),
     # so guard the sync-func setup to be idempotent — re-assigning would trip
     # Megatron's "no_sync_func must be None" assert on rollout 1+.

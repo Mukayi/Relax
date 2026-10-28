@@ -143,8 +143,8 @@ def test_end_step_reports_every_interval_and_resets_window():
     collector = _collector(world=2, interval=3)
     reports = []
     for _ in range(6):
+        collector.note_tokens(1000)
         bracket(collector)
-        collector.add_tokens(1000)
         reports.append(collector.end_step())
     assert [len(ready) for ready in reports] == [0, 0, 1, 0, 0, 1]
     report = reports[2][0]
@@ -210,9 +210,9 @@ def test_gather_table_from_other_ranks_drives_detection():
         return [values, slow]
 
     collector = _collector(world=2, interval=1, gather=gather)
+    collector.note_tokens(500)
     bracket(collector)
     bracket(collector, "backward-compute")
-    collector.add_tokens(500)
     (report,) = collector.end_step()
     assert report.metrics["straggler/flagged/rank"] == 1
     assert report.alerts and report.alerts[0].reason == "slow_device"
@@ -244,6 +244,17 @@ def test_forward_only_timers_land_in_lp_buckets():
     collector.drain()
     assert collector.window.get("lp_fwd") == 1.0
     assert collector.window.get("fwd") == 0.0
+
+
+def test_the_window_counts_a_micro_batch_once_whatever_its_model_chunks():
+    collector = _collector(world=1)
+    collector.model_chunks = 2
+    for tokens in (300, 300, 500, 500):  # each model chunk's forward of micro-batches 0 and 1
+        collector.note_tokens(tokens)
+        bracket(collector)
+    collector.drain()
+    assert collector.window.get("tokens") == 800.0
+    assert collector.window.get("mb_tokens_max") == 500.0
 
 
 def _timed(collector, name, ms, tokens=None):

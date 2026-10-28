@@ -61,6 +61,7 @@ _NUMBERED = (_FWD_INDEX, _BWD_INDEX, _LP_FWD_INDEX)
 _CPU_FWD_INDEX = FIELD_INDEX["cpu_fwd"]
 _CPU_BWD_INDEX = FIELD_INDEX["cpu_bwd"]
 _NUM_FWD_INDEX = FIELD_INDEX["num_fwd"]
+_TOKENS_INDEX = FIELD_INDEX["tokens"]
 _GC_INDEX = FIELD_INDEX["gc"]
 _DROPPED_INDEX = FIELD_INDEX["dropped"]
 _ERRORS_INDEX = FIELD_INDEX["errors"]
@@ -216,6 +217,7 @@ class StragglerCollector:
         self._max_module_brackets = max_module_brackets
         # Set by the runtime once the model exists; attached only during a sampled step at level 3.
         self.module_timers: ModuleTimers | None = None
+        self.model_chunks = 1
         # The first window has no sample: its first step carries the warm-up.
         self._trace_next = False
         self._trace: _TraceCapture | None = None
@@ -398,12 +400,11 @@ class StragglerCollector:
 
     def note_tokens(self, tokens: int) -> None:
         """Take the token count of the training micro-batch whose forward
-        bracket is open; that bracket's ``push`` claims it."""
+        bracket is open; that bracket's ``push`` claims it, and the window
+        counts it once per micro-batch (each model chunk runs its own
+        forward)."""
         self._next_tokens = float(tokens)
-
-    def add_tokens(self, tokens: int) -> None:
-        """Count the tokens this rank trained on in the current step."""
-        self._window.add("tokens", float(tokens))
+        self._window.add_index(_TOKENS_INDEX, tokens / self.model_chunks)
 
     def _on_gc(self, phase: str, info: dict[str, Any]) -> None:
         if self._train_thread is not None and threading.get_ident() != self._train_thread:
