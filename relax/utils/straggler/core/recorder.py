@@ -118,9 +118,9 @@ class EventRecorder:
         interleaved: bool = False,
         register_gc_callback: bool = True,
     ) -> None:
-        self.health = health
+        self._health = health
         self.window = WindowStats()
-        # Plain attributes because ``record_event`` checks them on every bracket.
+        # Set by the collector; a plain attribute because ``record_event`` checks it on every bracket.
         self.recording = True
         self.modules_on = False
         self._pool = EventPool(pool_size, event_factory)
@@ -155,7 +155,7 @@ class EventRecorder:
         self.module_timers: ModuleTimers | None = None
         self.model_chunks = 1
         # The first window has no sample: its first step carries the warm-up.
-        self._trace_next = False
+        self._sample_next = False
         self._trace: _TraceCapture | None = None
         self._trace_done: RankTrace | None = None
         # Primary rank only: the CPU events of the step traced last, read when it ends.
@@ -187,7 +187,7 @@ class EventRecorder:
             return None
         if not self._step_open:
             self._step_open = True
-            if self._trace_next:
+            if self._sample_next:
                 self._begin_trace()
         if self._train_thread is None:
             self._train_thread = threading.get_ident()
@@ -202,12 +202,12 @@ class EventRecorder:
     def on_error(self, where: str, exc: BaseException) -> None:
         """Count an exception caught on the hot path (see
         ``ProfilerHealth``)."""
-        self.health.record_error(where, exc)
+        self._health.record_error(where, exc)
 
     def on_degraded(self, reason: str) -> None:
         """Record a lasting gap in what this rank measures (see
         ``ProfilerHealth.mark_degraded``)."""
-        self.health.mark_degraded(reason)
+        self._health.mark_degraded(reason)
 
     def push(self, segment_index: int, phase_index: int, start_event: Any, end_event: Any, cpu_ms: float) -> None:
         """Queue one bracket for ``drain``; when the queue is full drop the
@@ -268,7 +268,7 @@ class EventRecorder:
         """
         if not self._interleaved:
             return
-        table = self.health.guarded("schedule", build_table, default=())
+        table = self._health.guarded("schedule", build_table, default=())
         segments = (_LP_FWD_INDEX,) if forward_only else (_FWD_INDEX, _BWD_INDEX)
         chunks = 1 + max((chunk for _, chunk in table), default=-1)
         self._schedule = ({segment: self._step_numbers[segment] for segment in segments}, table, chunks)
@@ -292,7 +292,7 @@ class EventRecorder:
         """Anchor the sampled step: an event recorded on an idle device marks
         the wall-clock time that every bracket of the step is placed
         against."""
-        self._trace_next = False
+        self._sample_next = False
         self._synchronize()
         anchor = self._pool.acquire()
         anchor.record()
@@ -306,7 +306,7 @@ class EventRecorder:
 
     def _detach_modules(self) -> None:
         if self.module_timers is not None:
-            self.health.guarded("modules", self.module_timers.detach)
+            self._health.guarded("modules", self.module_timers.detach)
 
     def note_tokens(self, tokens: int) -> None:
         """Take the token count of the training micro-batch whose forward
@@ -409,7 +409,7 @@ class EventRecorder:
         """Close one training step: read what has completed, end a sampled step
         (its pairs still in flight are read by later steps) and keep the step's
         peaks; never raises."""
-        self.health.guarded("drain", self.drain)
+        self._health.guarded("drain", self.drain)
         self._step_open = False
         self._step_numbers = dict.fromkeys(_NUMBERED, 0)
         self._schedule = None
@@ -418,7 +418,7 @@ class EventRecorder:
             self._trace.end = self._pushed
             if self._cpu_events_source is not None:
                 # Read now, before the window can close, so the sample leaves with the events of its own step.
-                self._cpu_events = self.health.guarded(
+                self._cpu_events = self._health.guarded(
                     "trace", self._cpu_events_source, self._trace.wall, self._wall(), default=[]
                 )
             self._finish_trace()
@@ -460,7 +460,7 @@ class EventRecorder:
         step is sampled."""
         self.window.reset()
         self._step_base = [0.0] * len(_STEP_PEAK_INDICES)
-        self._trace_next = sample_next
+        self._sample_next = sample_next
 
     def stop(self) -> None:
         """Record nothing from now on and return every queued event to the

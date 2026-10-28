@@ -151,9 +151,9 @@ class StragglerCollector:
         )
         self._analyze = analyze
         self._trace_enabled = trace
+        self._disabled = False
         self.level = self._usable(level)
-        self.recorder.recording = self.level > 0
-        self.recorder.modules_on = self.level == 3
+        self._steer_recorder()
         # Primary rank: the level the operator asks for, ``None`` without a request.
         self._level_request = level_request
         self._gather_to = gather_to
@@ -167,7 +167,6 @@ class StragglerCollector:
         self._clock = clock
         self._all_meta: list[RankMeta] | None = None
         self._meta_gathered = False
-        self._disabled = False
         # Reports from ``analyze``: appended by the worker, drained by ``end_step`` (deque append / popleft are atomic).
         self._reports: deque[Any] = deque()
         self._max_backlog = max_backlog
@@ -278,8 +277,13 @@ class StragglerCollector:
                 self._window_last_rollout + 1,
             )
         self.level = level
-        self.recorder.recording = level > 0 and not self._disabled
-        self.recorder.modules_on = level == 3
+        self._steer_recorder()
+
+    def _steer_recorder(self) -> None:
+        """Record at every level but paused, and nothing once switched off;
+        time module brackets at the modules level."""
+        self.recorder.recording = self.level > 0 and not self._disabled
+        self.recorder.modules_on = self.level == 3
 
     def status(self) -> dict[str, Any]:
         """What the primary rank reports to the control page."""
