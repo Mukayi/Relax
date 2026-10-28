@@ -75,6 +75,10 @@ class ClosedWindow:
     # The first rank whose row asked to switch off.
     requested_by: int = -1
 
+    @property
+    def paused(self) -> bool:
+        return not self.level and not self.switch_off
+
 
 # (closed window, guard) -> its report, which ``end_step`` hands back; ``guard(where, call, *args, default=None)``
 # runs ``call`` and counts its exception under ``where``.
@@ -171,6 +175,9 @@ class StragglerCollector:
         # Reports from ``analyze``: appended by the worker, drained by ``end_step`` (deque append / popleft are atomic).
         self._reports: deque[Any] = deque()
         self._max_backlog = max_backlog
+        # A paused window waits in the analysis queue: set on the training thread, cleared by the worker once its
+        # report is out. A race can only add one more paused window or skip one.
+        self._paused_queued = False
         self._window_first_rollout: int | None = None
         self._window_last_rollout = -1
         self._worker = AnalysisWorker(self._handle_job) if background and is_primary else None
@@ -403,10 +410,16 @@ class StragglerCollector:
         if self._worker is None:
             self._handle_job(job)
             return
-        # Every window counts against the backlog, a paused one too, except the
-        # switch-off notice (health/state=2), which has to reach end_step even
-        # when the queue is full.
-        if not job.switch_off and self._worker.backlog >= self._max_backlog:
+        # A paused window costs nothing to report and may arrive while the
+        # analysis is behind, which is when an operator pauses: it does not
+        # count against the backlog, and one waiting in the queue stands for
+        # the paused windows after it. The switch-off notice (health/state=2)
+        # has to reach end_step even when the queue is full.
+        if job.paused:
+            if self._paused_queued:
+                return
+            self._paused_queued = True
+        elif not job.switch_off and self._worker.backlog >= self._max_backlog:
             self.on_error(
                 "analyze",
                 RuntimeError(
@@ -426,6 +439,8 @@ class StragglerCollector:
         report = self.health.guarded("analyze", self._analyze, job, self.health.guarded)
         if report is not None:
             self._reports.append(report)
+        if job.paused:
+            self._paused_queued = False
 
     def _take_reports(self) -> list[Any]:
         reports: list[Any] = []

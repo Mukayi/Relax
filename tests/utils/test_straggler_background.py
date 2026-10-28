@@ -139,21 +139,26 @@ def test_backlog_drops_ordinary_windows_and_counts_errors(monkeypatch):
         collector.close()
 
 
-def test_paused_windows_count_against_the_backlog_and_keep_no_table(monkeypatch):
+def test_pausing_while_the_analysis_is_behind_queues_one_paused_window_without_a_table(monkeypatch):
     gate, started = _gated_analysis(monkeypatch)
-    collector = _collector(max_backlog=2, health_config=HealthConfig(max_errors=100, max_degraded_windows=100))
+    collector = _collector(max_backlog=2, health_config=HealthConfig(max_errors=3))
     queued = []
     submit = collector._worker.submit
     monkeypatch.setattr(collector._worker, "submit", lambda job: (queued.append(job), submit(job)))
     try:
         _step(collector, rollout_id=0)  # in flight, blocked on the gate
         assert started.wait(5)
+        _step(collector, rollout_id=1)  # queued: the backlog is full
         collector._set_level(0)
-        for rollout_id in range(1, 9):
-            _step(collector, rollout_id=rollout_id)  # the first paused window is queued, the rest dropped
-        assert collector._worker.backlog == 2
-        assert collector.health.errors_total == 7
-        assert (queued[-1].level, queued[-1].table) == (0, [])
+        for rollout_id in range(2, 10):
+            _step(collector, rollout_id=rollout_id)  # one paused window waits for all of them
+        assert collector._worker.backlog == 3
+        assert collector.health.errors_total == 0 and not collector.disabled
+        assert [(job.level, job.table) for job in queued[2:]] == [(0, [])]
+        gate.set()
+        assert collector.flush(timeout=5)
+        _step(collector, rollout_id=10)  # once that one is out, the next paused window is queued again
+        assert len(queued) == 4
     finally:
         gate.set()
         collector.close()
