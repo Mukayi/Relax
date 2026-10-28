@@ -123,7 +123,7 @@ closed; their time lands in the next window
 | `straggler/uncertain/count` | 「不确定」的 rank 数 |
 | `straggler/self/{median_ms,max_ms,max_rank}` | 自身计算时间（`fwd + bwd + optim`，ms/step）的全局中位数和最大值；`max_rank` 是相对同 PP stage 其他 rank 超出最多的 rank，不一定是最大值所在的 rank |
 | `straggler/late/max_ms` | 最晚到达 DP 梯度同步的 rank 晚了多少 |
-| `straggler/health/{state,errors,requested_by}` | 分析器自身的状态：各 rank 中最差的状态（0 active、1 degraded、2 disabled）、本窗口捕获的异常数，以及请求关闭的 rank（只在关闭时有） |
+| `straggler/health/{state,errors,requested_by}` | 分析器自身的状态：各 rank 中最差的状态（0 active、1 degraded、2 disabled；degraded 指本窗口丢了计时或捕获了异常，或者 Megatron 调用计时接口的方式分析器不认识，见「限制」）、本窗口捕获的异常数，以及请求关闭的 rank（只在关闭时有） |
 | `straggler/{dropped_events,unread_events}`、`straggler/trace/lost` | 因队列满被丢弃的计时数、窗口结束时还没读到的计时数、采样步 trace 丢失的计时数（正常都为 0） |
 | `straggler/control/level` | 本窗口的级别：0 paused、1 coarse、2 detail、3 modules |
 | `straggler/self_overhead_ms` | 分析器每步读取计时的 CPU 时间 |
@@ -203,5 +203,5 @@ primary 自己的 CPU 侧计时（例如 `actor_train`、每个 micro-batch 的 
 - PP 阶段拆分、trace 里的阶段命名和气泡推算只适用于非交错 1F1B，VPP 的收发只计入 `pp_recv`。VPP 下的 micro-batch 序号和模型块按 Megatron 的交错调度表（`get_schedule_table`，用模型自己的 config 生成）由调用顺序换算；`combined_1f1b` 的训练调用把前向和反向合并执行，不编号。
 - 跨卡对齐依赖各 rank 的墙钟，跨机器时受 NTP 精度影响，误差见日志 `other metrics` 一行里的 `trace/align_spread_ms`。窗口只有 1 个 rollout 时，采样步可能来不及读完，这个窗口就没有 trace。CUDA graph 捕获期间不计时。
 - 告警有延迟：默认参数下从开始变慢到告警约 21–30 个 rollout。调小 `REPORT_INTERVAL` 或 `PERSIST_WINDOWS` 能更早告警，但更容易被一次性抖动触发。
-- 计时依赖 Megatron 的计时接口（`config.timers`）：不认识的计时点名字会打一条警告，这一段不计时；Megatron 若调用 `Timers.log` / `write`，或给 `start` / `stop` 传入新参数，开启时会直接报错。关闭 profiler（`RELAX_STRAGGLER_PROFILER=0`）即恢复 `config.timers = None`。
+- 计时依赖 Megatron 的计时接口（`config.timers`）。Megatron 版本的调用方式变了（出现不认识的计时点名字，给 `timers()` / `start` / `stop` 传入新参数，或调用 `Timers.log` / `write`），或者第一个 rollout 没有走到每步都会调用的计时点（`forward-compute`、`backward-compute`、`all-grads-sync`、`optimizer-copy-to-main-grad`；log-prob 前向为 `forward-compute`）时，训练不会中断：这次调用被忽略，打一条警告，这个 rank 此后的 `straggler/health/state` 记为 1（degraded），但不计入自动关闭的条件，相应的时间不进统计。适配层的 CPU 契约测试会对照已安装的 Megatron 检查这些变化。关闭 profiler（`RELAX_STRAGGLER_PROFILER=0`）即恢复 `config.timers = None`。
 - 某个 rank 进程整个消失时，其余 rank 的每次 gather 都要等到 `RELAX_STRAGGLER_GATHER_TIMEOUT_S` 超时，失败多次后各自关闭分析器。

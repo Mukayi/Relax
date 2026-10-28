@@ -13,14 +13,10 @@ the adapter's business (``megatron_adapter``).
 
 from __future__ import annotations
 
-import logging
 from time import perf_counter
 from typing import Any, Callable, Mapping, Protocol
 
 from relax.utils.straggler.core.stats import FIELD_INDEX
-
-
-logger = logging.getLogger(__name__)
 
 
 class EventSink(Protocol):
@@ -43,6 +39,10 @@ class EventSink(Protocol):
     def on_error(self, where: str, exc: BaseException) -> None:
         """Count an exception caught on the hot path instead of raising it into
         Megatron's schedule."""
+
+    def on_degraded(self, reason: str) -> None:
+        """Record a lasting gap in what is measured (see
+        ``ProfilerHealth.mark_degraded``)."""
 
 
 class EventPool:
@@ -78,10 +78,10 @@ class _NullTimer:
 
     __slots__ = ()
 
-    def start(self, barrier: bool = False) -> None:
+    def start(self, *args: Any, **kwargs: Any) -> None:
         return None
 
-    def stop(self, barrier: bool = False) -> None:
+    def stop(self, *args: Any, **kwargs: Any) -> None:
         return None
 
 
@@ -90,7 +90,8 @@ class _SegmentTimer:
     its brackets (-1 if it has none).
 
     ``barrier`` is accepted for protocol compatibility and ignored: a barrier
-    here would reintroduce exactly the synchronization we are avoiding. A
+    here would reintroduce exactly the synchronization we are avoiding. Any
+    other argument is ignored too, and reported to ``sink.on_degraded``. A
     second ``start`` without ``stop`` is ignored rather than asserted, and an
     exception from the sink skips the bracket and goes to ``sink.on_error``, so
     the profiler can never take the training loop down.
@@ -105,7 +106,9 @@ class _SegmentTimer:
         self._start_event: Any = None
         self._start_cpu: float = 0.0
 
-    def start(self, barrier: bool = False) -> None:
+    def start(self, barrier: bool = False, *args: Any, **kwargs: Any) -> None:
+        if args or kwargs:
+            self._sink.on_degraded(_unexpected_arguments("a timer's start()", args, kwargs))
         if self._start_event is not None:
             return
         try:
@@ -115,7 +118,9 @@ class _SegmentTimer:
             return
         self._start_cpu = perf_counter()
 
-    def stop(self, barrier: bool = False) -> None:
+    def stop(self, barrier: bool = False, *args: Any, **kwargs: Any) -> None:
+        if args or kwargs:
+            self._sink.on_degraded(_unexpected_arguments("a timer's stop()", args, kwargs))
         start_event = self._start_event
         if start_event is None:
             return
@@ -149,8 +154,10 @@ class StragglerTimers:
 
     Only the subset of the ``megatron.core.timers.Timers`` protocol that
     megatron.core itself uses is implemented (``__call__`` returning an object
-    with ``start``/``stop``). ``log``/``write`` raise so any new caller is
-    noticed immediately instead of silently doing nothing.
+    with ``start``/``stop``). Whatever falls outside it (an unknown name, an
+    argument it does not take, ``log``/``write``) is ignored rather than raised
+    into the training loop, and reported once to ``sink.on_degraded`` so that
+    it is noticed.
     """
 
     def __init__(
@@ -167,14 +174,17 @@ class StragglerTimers:
         self._timers: dict[str, _SegmentTimer | _NullTimer] = {}
         self._null = _NullTimer()
 
-    def __call__(self, name: str, log_level: int | None = None) -> _SegmentTimer | _NullTimer:
+    def __call__(
+        self, name: str, log_level: int | None = None, *args: Any, **kwargs: Any
+    ) -> _SegmentTimer | _NullTimer:
         """Return the timer bound to ``name``; untracked names share a no-op
         timer and ``log_level`` is ignored.
 
-        A name that is neither mapped nor ignored triggers a WARNING the first
-        time it is seen so stale or misspelled names are not silently
-        swallowed.
+        A name that is neither mapped nor ignored is reported the first time it
+        is seen, so stale or misspelled names are not silently swallowed.
         """
+        if args or kwargs:
+            self._sink.on_degraded(_unexpected_arguments("timers()", args, kwargs))
         timer = self._timers.get(name)
         if timer is None:
             segment = self._name_to_segment.get(name)
@@ -183,29 +193,36 @@ class StragglerTimers:
             else:
                 timer = self._null
                 if name not in self._ignored:
-                    # _timers caches this entry after the first lookup, so the
-                    # warning fires at most once per name per instance.
-                    logger.warning(
-                        "[straggler] unknown Megatron timer %r: not mapped to a segment, so its time is not "
-                        "recorded. Add it to MEGATRON_TIMER_SEGMENTS in megatron_adapter.py, or to "
-                        "IGNORED_TIMER_NAMES if it should stay unmapped.",
-                        name,
+                    self._sink.on_degraded(
+                        f"unknown Megatron timer {name!r}: not mapped to a segment, so its time is not recorded. "
+                        "Add it to MEGATRON_TIMER_SEGMENTS in megatron_adapter.py, or to IGNORED_TIMER_NAMES if it "
+                        "should stay unmapped"
                     )
             self._timers[name] = timer
         return timer
 
+    def names_seen(self) -> frozenset[str]:
+        """Every timer name asked for so far, timed or not."""
+        return frozenset(self._timers)
+
     def log(self, *args: Any, **kwargs: Any) -> None:
-        """Refuse: per-name totals are never aggregated here."""
-        raise NotImplementedError(_unsupported("log"))
+        """Do nothing: per-name totals are never aggregated here."""
+        self._sink.on_degraded(_unsupported("log"))
 
     def write(self, *args: Any, **kwargs: Any) -> None:
-        """Refuse: per-name totals are never aggregated here."""
-        raise NotImplementedError(_unsupported("write"))
+        """Do nothing: per-name totals are never aggregated here."""
+        self._sink.on_degraded(_unsupported("write"))
+
+
+def _unexpected_arguments(call: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
+    passed = [f"{len(args)} positional"] if args else []
+    passed += sorted(kwargs)
+    return f"Megatron passed {call} arguments the profiler does not take ({', '.join(passed)}); they are ignored"
 
 
 def _unsupported(method: str) -> str:
     return (
-        f"StragglerTimers.{method} is not supported: it only records CUDA events for the straggler profiler and "
-        f"keeps no per-name totals, so a Timers.{method} caller would silently get nothing. Read the straggler/* "
-        "metrics instead, or set RELAX_STRAGGLER_PROFILER=0 to get config.timers=None back."
+        f"Megatron called Timers.{method}(), which the profiler's stand-in does not support: it keeps no per-name "
+        "totals, so that caller gets nothing. Read the straggler/* metrics instead, or switch the profiler off to "
+        "get config.timers=None back"
     )

@@ -4,8 +4,7 @@ is given and the event pool."""
 
 import pytest
 
-from relax.utils.straggler.core import timers as timers_module
-from relax.utils.straggler.core.stats import DP_REDUCTION_PHASE, FIELD_INDEX, PP_PHASE_FIELDS
+from relax.utils.straggler.core.stats import FIELD_INDEX, PP_PHASE_FIELDS
 from relax.utils.straggler.core.timers import EventPool, StragglerTimers, _NullTimer, _SegmentTimer
 from relax.utils.straggler.megatron_adapter import (
     FORWARD_ONLY_TIMER_SEGMENTS,
@@ -25,6 +24,7 @@ class _FakeSink:
         self.pushed = []
         self.discarded = []
         self.errors = []
+        self.degraded = []
         self.capturing = capturing
         self.fail = False
 
@@ -39,6 +39,9 @@ class _FakeSink:
 
     def on_error(self, where, exc):
         self.errors.append((where, exc))
+
+    def on_degraded(self, reason):
+        self.degraded.append(reason)
 
     def discard_event(self, event):
         self.discarded.append(event)
@@ -154,7 +157,6 @@ def test_all_megatron_optimizer_and_comm_names_map_to_buckets():
     }
     assert MEGATRON_TIMER_SEGMENTS["params-all-gather"] == "dp_param_gather"
     assert MEGATRON_TIMER_SEGMENTS["all-grads-sync"] == "dp_grad_sync"
-    assert GRAD_SYNC_TIMERS[DP_REDUCTION_PHASE] == "all-grads-sync", "the trace aligns DP peers on this one"
     assert MEGATRON_TIMER_SEGMENTS["forward-send-backward-recv"] == "pp_recv"
 
 
@@ -165,41 +167,63 @@ def test_forward_only_names_land_in_lp_buckets():
     assert "optimizer-inner-step" not in FORWARD_ONLY_TIMER_SEGMENTS
 
 
-def test_timers_log_and_write_are_explicitly_unsupported():
-    timers = StragglerTimers(_FakeSink(), MEGATRON_TIMER_SEGMENTS)
-    with pytest.raises(NotImplementedError):
-        timers.log(["forward-compute"])
-    with pytest.raises(NotImplementedError):
-        timers.write(["forward-compute"], None, 0)
+def test_timers_log_and_write_do_nothing_and_are_reported():
+    sink = _FakeSink()
+    timers = StragglerTimers(sink, MEGATRON_TIMER_SEGMENTS)
+    assert timers.log(["forward-compute"]) is None
+    assert timers.write(["forward-compute"], None, 0) is None
+    assert [reason.split(",")[0] for reason in sink.degraded] == [
+        "Megatron called Timers.log()",
+        "Megatron called Timers.write()",
+    ]
 
 
-@pytest.fixture()
-def captured_warnings(monkeypatch):
-    warnings = []
-    monkeypatch.setattr(timers_module.logger, "warning", lambda msg, *a, **k: warnings.append(msg % a))
-    return warnings
-
-
-def test_known_timer_name_produces_no_warning(captured_warnings):
-    timers = StragglerTimers(_FakeSink(), MEGATRON_TIMER_SEGMENTS)
+def test_known_timer_name_is_not_reported():
+    sink = _FakeSink()
+    timers = StragglerTimers(sink, MEGATRON_TIMER_SEGMENTS)
     timers("forward-compute")
     timers("forward-compute")
-    assert captured_warnings == []
+    assert sink.degraded == []
 
 
 @pytest.mark.parametrize("phase", ["train", "forward_only"])
-def test_ignored_timer_name_produces_no_warning(captured_warnings, phase):
-    timers = phase_timers(_FakeSink())[phase]
+def test_ignored_timer_name_is_not_reported(phase):
+    sink = _FakeSink()
+    timers = phase_timers(sink)[phase]
     for name in IGNORED_TIMER_NAMES:
         assert isinstance(timers(name), _NullTimer)
         timers(name)
-    assert captured_warnings == []
+    assert sink.degraded == []
 
 
-def test_unknown_timer_name_warns_exactly_once(captured_warnings):
-    timers = StragglerTimers(_FakeSink(), MEGATRON_TIMER_SEGMENTS)
+def test_unknown_timer_name_is_reported_exactly_once():
+    sink = _FakeSink()
+    timers = StragglerTimers(sink, MEGATRON_TIMER_SEGMENTS)
     timers("totally-new-timer")
     timers("totally-new-timer")
     timers("totally-new-timer")
-    assert len(captured_warnings) == 1
-    assert "totally-new-timer" in captured_warnings[0]
+    assert len(sink.degraded) == 1
+    assert "totally-new-timer" in sink.degraded[0]
+    assert timers.names_seen() == {"totally-new-timer"}
+
+
+def test_arguments_the_timers_do_not_take_are_ignored_and_reported_while_the_bracket_still_counts():
+    sink = _FakeSink()
+    timers = StragglerTimers(sink, MEGATRON_TIMER_SEGMENTS)
+    timer = timers("forward-compute", 2, "extra", stream=None)
+    timer.start(True, "now")
+    timer.stop(barrier=False, sync=True)
+    assert len(sink.pushed) == 1
+    assert sink.degraded == [
+        "Megatron passed timers() arguments the profiler does not take (1 positional, stream); they are ignored",
+        "Megatron passed a timer's start() arguments the profiler does not take (1 positional); they are ignored",
+        "Megatron passed a timer's stop() arguments the profiler does not take (sync); they are ignored",
+    ]
+
+
+def test_an_untimed_name_accepts_any_arguments():
+    sink = _FakeSink()
+    timer = phase_timers(sink)["train"]("forward-backward")
+    timer.start(True, "now", stream=None)
+    timer.stop(sync=True)
+    assert sink.pushed == [] and sink.degraded == []

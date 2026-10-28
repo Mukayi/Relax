@@ -7,7 +7,7 @@ Three layers, each importing only the ones before it (a CPU test checks):
 * ``core``: timers -> collector -> analysis worker -> detector -> report /
   trace; no torch, Megatron or other Relax imports.
 * ``megatron_adapter``: Megatron's timer names, layer blocks, parallel state
-  and schedule.
+  and schedule, pinned by contract tests.
 * ``relax_integration``: settings, install, Gloo gathers, metrics, timeline;
   ``control_routes`` is the metrics service's side.
 

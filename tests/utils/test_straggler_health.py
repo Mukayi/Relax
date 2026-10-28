@@ -6,6 +6,7 @@ import gc
 
 import pytest
 
+from relax.utils.straggler.core import health as health_module
 from relax.utils.straggler.core.health import (
     HEALTH_ACTIVE,
     HEALTH_DEGRADED,
@@ -42,6 +43,26 @@ def test_health_requests_disable_after_max_errors_even_across_windows():
     errors, code = health.close_window(dropped=0.0)
     assert errors == 2.0 and code == HEALTH_DISABLE
     assert "3 errors" in health.request_reason()
+
+
+def test_a_gap_keeps_the_rank_degraded_without_ever_switching_it_off(monkeypatch):
+    warnings = []
+    monkeypatch.setattr(health_module.logger, "warning", lambda msg, *a: warnings.append(msg % a))
+    health = ProfilerHealth(HealthConfig(max_errors=3, max_degraded_windows=3))
+    for _ in range(3):
+        health.mark_degraded("timer x is not called")
+    codes = [health.close_window(dropped=0.0) for _ in range(5)]
+    assert codes == [(0.0, float(HEALTH_DEGRADED))] * 5 and health.state == "degraded"
+    assert health.gaps == {"timer x is not called"} and health.errors_total == 0
+    assert len(warnings) == 1 and "timer x is not called" in warnings[0]
+
+
+def test_a_gap_reaches_the_window_through_the_collector():
+    collector = _collector()
+    collector.on_degraded("timer x is not called")
+    collector.end_step(rollout_id=0)
+    sent = collector.gather_calls[-1]
+    assert sent[FIELD_INDEX["health"]] == HEALTH_DEGRADED and sent[FIELD_INDEX["errors"]] == 0.0
 
 
 def test_disabled_is_terminal():

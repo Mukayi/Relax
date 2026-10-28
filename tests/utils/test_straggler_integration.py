@@ -51,6 +51,38 @@ def test_a_failing_reporter_is_counted_and_never_raises(monkeypatch):
     assert profiler.collector.health.errors_total == 1
 
 
+def _call_timers(profiler, phase, names):
+    for name in names:
+        timer = profiler.timers[phase](name)
+        timer.start()
+        timer.stop()
+
+
+def test_a_rollout_that_calls_every_core_timer_leaves_the_rank_active():
+    profiler = _profiler(interval=1)
+    for phase, names in megatron_adapter.REQUIRED_TIMER_NAMES.items():
+        _call_timers(profiler, phase, names)
+    profiler.rollout_end(0)
+    assert profiler.collector.health.gaps == frozenset() and profiler.collector.health.state == "active"
+
+
+def test_core_timers_missing_from_the_first_rollout_of_a_phase_degrade_the_rank_for_good():
+    profiler = _profiler(interval=1)
+    profiler.rollout_end(0)
+    assert profiler.collector.health.gaps == frozenset(), "no phase ran yet, so nothing is checked"
+    _call_timers(profiler, "train", ["forward-compute", "backward-compute"])
+    profiler.rollout_end(1)
+    (gap,) = profiler.collector.health.gaps
+    assert gap.startswith(
+        "the first rollout with train steps never called the Megatron timers all-grads-sync, "
+        "optimizer-copy-to-main-grad"
+    )
+    _call_timers(profiler, "train", megatron_adapter.REQUIRED_TIMER_NAMES["train"])
+    _call_timers(profiler, "forward_only", ["forward-compute"])
+    profiler.rollout_end(2)
+    assert profiler.collector.health.gaps == {gap} and profiler.collector.health.state == "degraded"
+
+
 def test_last_rollout_of_the_run_waits_for_its_own_window():
     profiler = _profiler(interval=1, num_rollout=5, background=True)
     try:

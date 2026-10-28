@@ -282,6 +282,11 @@ class StragglerCollector:
         ``ProfilerHealth``)."""
         self.health.record_error(where, exc)
 
+    def on_degraded(self, reason: str) -> None:
+        """Record a lasting gap in what this rank measures (see
+        ``ProfilerHealth.mark_degraded``)."""
+        self.health.mark_degraded(reason)
+
     def push(self, segment_index: int, phase_index: int, start_event: Any, end_event: Any, cpu_ms: float) -> None:
         """Queue one bracket for ``drain``; when the queue is full drop the
         oldest pair, so a rank that stops draining cannot grow without bound.

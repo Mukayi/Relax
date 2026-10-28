@@ -9,6 +9,11 @@ failing asks for the profiler to be switched off; the request travels as the
 gathered table and turns off at the same window. Deciding locally would leave
 the other ranks blocked in the next window's gather.
 
+A lasting gap in what a rank measures (the framework calls the timers in a way
+the profiler does not know, or never calls one it relies on) keeps the rank
+``degraded`` from then on without counting towards a switch-off: the rest of
+what it measures is still right.
+
 ``disabled`` is terminal: a profiler that flaps on and off leaves holes in the
 evidence that are worse than the profiler simply being off.
 """
@@ -52,11 +57,28 @@ class ProfilerHealth:
         self._errors_window = 0
         self._degraded_streak = 0
         self._logged: set[str] = set()
+        self._gaps: set[str] = set()
         self._lock = threading.Lock()
 
     @property
     def disabled(self) -> bool:
         return self.state == "disabled"
+
+    @property
+    def gaps(self) -> frozenset[str]:
+        return frozenset(self._gaps)
+
+    def mark_degraded(self, reason: str) -> None:
+        """Record a lasting gap in what this rank measures; the first report of
+        each ``reason`` is logged."""
+        with self._lock:
+            first = reason not in self._gaps
+            self._gaps.add(reason)
+        if first:
+            logger.warning(
+                "[straggler] %s; training continues, the rest is still measured and this rank reports health degraded",
+                reason,
+            )
 
     def record_error(self, where: str, exc: BaseException) -> None:
         """Count one caught exception; the first one per ``where`` is logged
@@ -85,12 +107,13 @@ class ProfilerHealth:
             errors_total = self.errors_total
         bad = errors > 0 or dropped > 0
         self._degraded_streak = self._degraded_streak + 1 if bad else 0
+        degraded = bad or bool(self._gaps)
         if errors_total >= self.config.max_errors or self._degraded_streak >= self.config.max_degraded_windows:
             code = HEALTH_DISABLE
         else:
-            code = HEALTH_DEGRADED if bad else HEALTH_ACTIVE
+            code = HEALTH_DEGRADED if degraded else HEALTH_ACTIVE
         if not self.disabled:
-            self.state = "degraded" if bad else "active"
+            self.state = "degraded" if degraded else "active"
         return float(errors), float(code)
 
     def request_reason(self) -> str:

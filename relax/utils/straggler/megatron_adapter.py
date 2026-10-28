@@ -92,6 +92,15 @@ FORWARD_ONLY_TIMER_SEGMENTS: Mapping[str, str] = {
 }
 
 
+# The timers every step of a phase calls, whatever the parallel layout; the
+# profiler reports any that its first rollout did not reach. The optimizer's is
+# the one before the inf / nan check, which can skip the rest of its step.
+REQUIRED_TIMER_NAMES: Mapping[str, frozenset[str]] = {
+    "train": frozenset({"forward-compute", "backward-compute", "all-grads-sync", "optimizer-copy-to-main-grad"}),
+    "forward_only": frozenset({"forward-compute"}),
+}
+
+
 def phase_timers(sink: EventSink) -> dict[str, StragglerTimers]:
     """The ``config.timers`` of each phase, feeding ``sink`` (the collector):
 

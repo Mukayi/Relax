@@ -211,6 +211,7 @@ class StragglerProfiler:
         self.timers = megatron_adapter.phase_timers(collector)
         self._args = args
         self._model_seen = False
+        self._unchecked_phases = set(megatron_adapter.REQUIRED_TIMER_NAMES)
 
     def see_model(self, model_chunks: Sequence[Any]) -> None:
         """Take the model chunks the first time a forward-backward call names
@@ -247,6 +248,10 @@ class StragglerProfiler:
         profiler error; a window whose reporter fails is counted once, as that
         failure.
         """
+        try:
+            self._check_timer_points()
+        except Exception as exc:
+            self.collector.on_error("self-check", exc)
         reports = self.collector.end_step(rollout_id, final=rollout_id + 1 == self._args.num_rollout)
         metrics: dict[str, float] | None = None
         returned: WindowReport | None = None
@@ -277,6 +282,22 @@ class StragglerProfiler:
                     ),
                 )
         return metrics
+
+    def _check_timer_points(self) -> None:
+        """At the end of the first rollout that ran a phase, report each timer
+        that phase always calls but Megatron did not: its time would be missing
+        from every window."""
+        for phase in sorted(self._unchecked_phases):
+            seen = self.timers[phase].names_seen()
+            if not seen:
+                continue
+            self._unchecked_phases.discard(phase)
+            missing = sorted(megatron_adapter.REQUIRED_TIMER_NAMES[phase] - seen)
+            if missing:
+                self.collector.on_degraded(
+                    f"the first rollout with {phase} steps never called the Megatron timers {', '.join(missing)}, "
+                    "so their time is not measured"
+                )
 
 
 def report_straggler_window(args: Any, report: WindowReport) -> dict[str, float]:
