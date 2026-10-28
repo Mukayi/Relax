@@ -133,6 +133,7 @@ def test_backlog_drops_ordinary_windows_and_counts_errors(monkeypatch):
             _step(collector, rollout_id=rollout_id)  # dropped
         assert collector.health.errors_total == 3
         assert collector._worker.backlog == 2
+        assert collector.window.get("num_steps") == 0.0, "a dropped window is still consumed"
     finally:
         gate.set()
         collector.close()

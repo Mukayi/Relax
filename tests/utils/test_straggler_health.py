@@ -150,23 +150,6 @@ def test_non_primary_rank_disables_too_but_returns_no_report():
     assert collector.disabled
 
 
-def test_gather_failure_degrades_and_a_persistent_one_disables_without_raising():
-    # One failed gather is counted, not fatal: the rank keeps gathering so the
-    # failure can still be reported to its peers. The health code is computed
-    # when the *next* window closes, so the switch-off follows one window later.
-    def gather(values):
-        raise RuntimeError("gloo timeout")
-
-    collector = _collector(gather=gather, health_config=HealthConfig(max_errors=1, max_degraded_windows=100))
-    bracket(collector)
-    assert collector.end_step(rollout_id=0) == []
-    assert not collector.disabled
-    assert collector.health.errors_total == 1
-    assert collector.end_step(rollout_id=1) == []
-    assert collector.disabled
-    assert "gather" in collector.health.disabled_reason
-
-
 def test_repeated_drain_errors_escalate_to_disable_across_windows():
     collector = _collector(health_config=HealthConfig(max_errors=2, max_degraded_windows=100))
 

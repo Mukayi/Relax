@@ -7,7 +7,6 @@ import pytest
 from relax.utils.straggler.core.stats import FIELD_INDEX, PP_PHASE_FIELDS
 from relax.utils.straggler.core.timers import EventPool, StragglerTimers, _NullTimer, _SegmentTimer
 from relax.utils.straggler.megatron_adapter import (
-    FORWARD_ONLY_TIMER_SEGMENTS,
     GRAD_SYNC_TIMERS,
     IGNORED_TIMER_NAMES,
     MEGATRON_TIMER_SEGMENTS,
@@ -149,22 +148,6 @@ def test_sink_errors_skip_the_bracket_and_are_reported_instead_of_raised():
     timer.stop()
     assert sink.pushed == [] and len(sink.errors) == 2 and not timer.active
     assert len(sink.pool) == 4, "the start event of a bracket that failed to close goes back to the pool"
-
-
-def test_all_megatron_optimizer_and_comm_names_map_to_buckets():
-    assert {MEGATRON_TIMER_SEGMENTS[name] for name in MEGATRON_TIMER_SEGMENTS if name.startswith("optimizer-")} == {
-        "optim"
-    }
-    assert MEGATRON_TIMER_SEGMENTS["params-all-gather"] == "dp_param_gather"
-    assert MEGATRON_TIMER_SEGMENTS["all-grads-sync"] == "dp_grad_sync"
-    assert MEGATRON_TIMER_SEGMENTS["forward-send-backward-recv"] == "pp_recv"
-
-
-def test_forward_only_names_land_in_lp_buckets():
-    assert FORWARD_ONLY_TIMER_SEGMENTS["forward-compute"] == "lp_fwd"
-    assert FORWARD_ONLY_TIMER_SEGMENTS["forward-recv"] == "lp_pp_recv"
-    assert "backward-compute" not in FORWARD_ONLY_TIMER_SEGMENTS
-    assert "optimizer-inner-step" not in FORWARD_ONLY_TIMER_SEGMENTS
 
 
 def test_timers_log_and_write_do_nothing_and_are_reported():

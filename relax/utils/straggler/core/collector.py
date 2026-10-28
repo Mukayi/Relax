@@ -286,6 +286,15 @@ class StragglerCollector:
         ``ProfilerHealth.mark_degraded``)."""
         self.health.mark_degraded(reason)
 
+    def _guarded(self, where: str, call: Callable[..., Any], *args: Any, default: Any = None) -> Any:
+        """``call(*args)``, or ``default`` once its exception is counted under
+        ``where``."""
+        try:
+            return call(*args)
+        except Exception as exc:
+            self.on_error(where, exc)
+            return default
+
     def push(self, segment_index: int, phase_index: int, start_event: Any, end_event: Any, cpu_ms: float) -> None:
         """Queue one bracket for ``drain``; when the queue is full drop the
         oldest pair, so a rank that stops draining cannot grow without bound.
@@ -345,11 +354,7 @@ class StragglerCollector:
         """
         if not self._interleaved:
             return
-        try:
-            table = build_table()
-        except Exception as exc:
-            table = ()
-            self.on_error("schedule", exc)
+        table = self._guarded("schedule", build_table, default=())
         segments = (_LP_FWD_INDEX,) if forward_only else (_FWD_INDEX, _BWD_INDEX)
         chunks = 1 + max((chunk for _, chunk in table), default=-1)
         self._schedule = ({segment: self._step_numbers[segment] for segment in segments}, table, chunks)
@@ -386,12 +391,8 @@ class StragglerCollector:
                 self.on_error("modules", exc)
 
     def _detach_modules(self) -> None:
-        if self.module_timers is None:
-            return
-        try:
-            self.module_timers.detach()
-        except Exception as exc:
-            self.on_error("modules", exc)
+        if self.module_timers is not None:
+            self._guarded("modules", self.module_timers.detach)
 
     def note_tokens(self, tokens: int) -> None:
         """Take the token count of the training micro-batch whose forward
@@ -528,10 +529,7 @@ class StragglerCollector:
         windows). On the ``final`` step of a run it waits (bounded) for the
         pending analyses, since no later call would pick them up.
         """
-        try:
-            self.drain()
-        except Exception as exc:
-            self.on_error("drain", exc)
+        self._guarded("drain", self.drain)
         self._step_open = False
         self._step_numbers = dict.fromkeys(_NUMBERED, 0)
         self._schedule = None
@@ -540,10 +538,9 @@ class StragglerCollector:
             self._trace.end = self._pushed
             if self.is_primary and self._cpu_events_source is not None:
                 # Read before this call can close the window, so the sample leaves with the events of its own step.
-                try:
-                    self._cpu_events = self._cpu_events_source(self._trace.wall, self._wall())
-                except Exception as exc:
-                    self.on_error("trace", exc)
+                self._cpu_events = self._guarded(
+                    "trace", self._cpu_events_source, self._trace.wall, self._wall(), default=[]
+                )
             self._finish_trace()
         self._window.add("num_steps", 1.0)
         if self._window_first_rollout is None:
@@ -598,11 +595,7 @@ class StragglerCollector:
         request."""
         if not self.is_primary:
             return 0.0
-        try:
-            requested = self._level_request()
-        except Exception as exc:
-            self.on_error("control", exc)
-            return 0.0
+        requested = self._guarded("control", self._level_request)
         return 0.0 if requested is None else float(requested + 1)
 
     def _usable(self, level: int) -> int:
@@ -646,11 +639,7 @@ class StragglerCollector:
         if sample is not None:
             sample.cpu_events = self._cpu_events
         self._cpu_events = []
-        try:
-            return self._gather_to(None if self._disabled else sample, self._primary_rank)
-        except Exception as exc:
-            self.on_error("trace", exc)
-            return None
+        return self._guarded("trace", self._gather_to, None if self._disabled else sample, self._primary_rank)
 
     def _health_code(self, code: float) -> float:
         """Return this window's ``health`` code, logging a new local switch-off
@@ -787,29 +776,25 @@ class StragglerCollector:
         report = job.ready
         if report is None:
             started = self._clock()
-            try:
-                report = analyze_window(job.table, job.meta, self.detector_config, self.detector_state)
-            except Exception as exc:
-                self.on_error("analyze", exc)
+            report = self._guarded(
+                "analyze", analyze_window, job.table, job.meta, self.detector_config, self.detector_state
+            )
+            if report is None:
                 return
             report.metrics["straggler/gather_ms"] = job.gather_ms
             report.metrics["straggler/analyze_ms"] = (self._clock() - started) * 1e3
             report.metrics["straggler/control/level"] = float(job.level)
             report.window_start_wall = job.window_start_wall
             if job.traces is not None and self._trace_sink is not None:
-                try:
-                    report.metrics.update(self._trace_sink(job.traces, job.meta, job.first_rollout))
-                except Exception as exc:
-                    self.on_error("trace", exc)
+                report.metrics.update(
+                    self._guarded("trace", self._trace_sink, job.traces, job.meta, job.first_rollout, default={})
+                )
         report.first_rollout = job.first_rollout
         report.last_rollout = job.last_rollout
         report.closed_wall = job.closed_wall
         report.analyzed_wall = self._wall()
         if self._on_report is not None:
-            try:
-                self._on_report(report)
-            except Exception as exc:
-                self.on_error("report", exc)
+            self._guarded("report", self._on_report, report)
         self._reports.append(report)
 
     def _take_reports(self) -> list[WindowReport]:

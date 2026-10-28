@@ -242,9 +242,8 @@ class StragglerProfiler:
         If several windows are ready at once, each still reaches the timeline
         and logs, but only the scalars of the latest one whose reporter
         succeeded are returned (one metrics call per step carries one value per
-        key). Each window it supersedes is logged as a WARNING and counted as a
-        profiler error; a window whose reporter fails is counted once, as that
-        failure.
+        key). Each window it supersedes is counted as a profiler error; a
+        window whose reporter fails is counted once, as that failure.
         """
         try:
             self._check_timer_points()
@@ -260,19 +259,12 @@ class StragglerProfiler:
         if not reported:
             return None
         *superseded, (latest, metrics) = reported
-        if superseded:
-            logger.warning(
-                "[straggler] rollout %d: %d windows ready at once; only rollouts %d-%d reach the metrics",
-                rollout_id,
-                len(reports),
-                latest.first_rollout,
-                latest.last_rollout,
-            )
         for dropped, _ in superseded:
             self.collector.on_error(
                 "report",
                 RuntimeError(
-                    f"scalars of rollouts {dropped.first_rollout}-{dropped.last_rollout} superseded by a later window"
+                    f"scalars of rollouts {dropped.first_rollout}-{dropped.last_rollout} superseded by those of "
+                    f"rollouts {latest.first_rollout}-{latest.last_rollout}, ready at the same step"
                 ),
             )
         return metrics

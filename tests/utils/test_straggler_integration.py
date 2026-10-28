@@ -256,24 +256,22 @@ def test_only_the_latest_of_several_ready_windows_reaches_the_metrics(monkeypatc
             metrics={"straggler/window/last_rollout": float(n)}, alerts=[], rows=[], first_rollout=n, last_rollout=n
         )
 
-    reported, warnings = [], []
+    reported = []
     monkeypatch.setattr(
         integration, "report_straggler_window", lambda args, report: reported.append(report) or dict(report.metrics)
     )
-    monkeypatch.setattr(integration.logger, "warning", lambda msg, *a: warnings.append(msg % a))
     profiler = _profiler(interval=1)
     monkeypatch.setattr(profiler.collector, "end_step", lambda rollout_id, final=False: [window(0), window(1)])
 
     metrics = profiler.rollout_end(1)
     assert metrics == {"straggler/window/last_rollout": 1.0}
     assert [r.last_rollout for r in reported] == [0, 1], "every window still reaches the timeline"
-    assert len(warnings) == 1 and "2 windows ready at once" in warnings[0]
     assert profiler.collector.health.errors_total == 1
 
 
 def _ready_windows(monkeypatch, profiler, rollouts, failing):
     """Make ``rollout_end`` see the windows of ``rollouts`` ready at once, with
-    the reporter failing on ``failing``; returns the WARNING lines."""
+    the reporter failing on ``failing``."""
 
     def report(args, window):
         if window.last_rollout == failing:
@@ -285,27 +283,22 @@ def _ready_windows(monkeypatch, profiler, rollouts, failing):
             metrics={"straggler/window/last_rollout": float(n)}, alerts=[], rows=[], first_rollout=n, last_rollout=n
         )
 
-    warnings = []
     monkeypatch.setattr(integration, "report_straggler_window", report)
-    monkeypatch.setattr(integration.logger, "warning", lambda msg, *a: warnings.append(msg % a))
     monkeypatch.setattr(profiler.collector, "end_step", lambda rollout_id, final=False: [window(n) for n in rollouts])
-    return warnings
 
 
 def test_a_failing_latest_window_falls_back_to_the_previous_one_and_counts_one_error(monkeypatch):
     profiler = _profiler(interval=1)
-    warnings = _ready_windows(monkeypatch, profiler, rollouts=[1, 2], failing=2)
+    _ready_windows(monkeypatch, profiler, rollouts=[1, 2], failing=2)
     for errors in (1, 2):
         assert profiler.rollout_end(2) == {"straggler/window/last_rollout": 1.0}
         assert profiler.collector.health.errors_total == errors, "only the failing window is lost"
-    assert warnings == [], "the returned window superseded nothing"
 
 
-def test_the_superseded_warning_names_the_window_that_is_returned(monkeypatch):
+def test_a_superseded_and_a_failed_window_count_one_error_each(monkeypatch):
     profiler = _profiler(interval=1)
-    warnings = _ready_windows(monkeypatch, profiler, rollouts=[0, 1, 2], failing=2)
+    _ready_windows(monkeypatch, profiler, rollouts=[0, 1, 2], failing=2)
     assert profiler.rollout_end(2) == {"straggler/window/last_rollout": 1.0}
-    assert len(warnings) == 1 and "only rollouts 1-1 reach the metrics" in warnings[0]
     assert profiler.collector.health.errors_total == 2, "window 0 superseded, window 2 failed"
 
 
