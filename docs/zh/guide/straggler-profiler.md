@@ -33,7 +33,7 @@ env_vars:
 | `RELAX_STRAGGLER_GATHER_TIMEOUT_S` | float | 60.0 | 分析器专用 Gloo 组的超时（秒），只决定某个 rank 进程消失时其余 rank 最多等多久。 |
 | `RELAX_STRAGGLER_TRACE_DIR` | str | 空 | 采样步 trace 的输出目录；不设时用 `--timeline-dump-dir` 下的 `straggler/`，两者都没有就不写 trace。 |
 | `RELAX_STRAGGLER_TRACE_KEEP` | int | 50 | 保留最新的多少个 trace 文件。 |
-| `RELAX_STRAGGLER_LEVEL` | int | −1 | 启动级别（见「级别」）；−1 表示有 trace 目录时为 2，否则为 1。 |
+| `RELAX_STRAGGLER_LEVEL` | int | −1 | 启动级别（见「级别」）；−1 表示有 trace 目录且不超过 256 个 rank 时为 2，否则为 1。 |
 | `RELAX_STRAGGLER_CONTROL_POLL_S` | float | 5.0 | primary 向 metrics service 查询级别的间隔（秒）。 |
 
 开启后，每个 actor 进程启动时打印一行 `Straggler profiler enabled: report_interval=… primary=… level=… control=… trace_dir=… meta=RankMeta(…)`，`trace_dir=-` 表示不写 trace。critic、reference 和 `actor_fwd` 不跑训练步，不做分析。
@@ -202,6 +202,7 @@ primary 自己的 CPU 侧计时（例如 `actor_train`、每个 micro-batch 的 
 - 计时复用 Megatron 已有的计时点。窗口统计里 attention、MoE、head / logits、MTP 的内部都包含在 `fwd` / `bwd` 中，`modules` 级别只在 trace 里给出每层 attention、MLP / MoE 和 MoE 层内各部分的耗时；EP all-to-all 计入计算时间；不给真实的通信计算重叠比例，`dp_grad_sync` 变小不能理解为重叠变好。
 - 同一 TP 组的 rank 在前向 / 反向里互相等待，其中一个变慢时整组都会被报出，分不出谁先变慢；所有 rank 同时变慢时（整机降频、共享存储抖动、整组通信变慢）发现不了。
 - PP 阶段拆分、trace 里的阶段命名和气泡推算只适用于非交错 1F1B，VPP 的收发只计入 `pp_recv`。VPP 下的 micro-batch 序号和模型块按 Megatron 的交错调度表（`get_schedule_table`，用模型自己的 config 生成）由调用顺序换算；`combined_1f1b` 的训练调用把前向和反向合并执行，不编号。
+- trace 的开销随 rank 数线性增长，都落在 primary 上：每个窗口把所有 rank 的采样步拼成一个文件，CPU 基准中 2048 个 rank 时约 10 MB、构建约 0.25 s（`modules` 级别约 80 MB、2 s），构建时占用 primary 的 Python 解释器，会拖慢它的训练线程。所以超过 256 个 rank 时默认不开 trace；手动设为 2 或 3 前先估算这部分开销。
 - 跨卡对齐依赖各 rank 的墙钟，跨机器时受 NTP 精度影响，误差见日志 `other metrics` 一行里的 `trace/align_spread_ms`。窗口只有 1 个 rollout 时，采样步可能来不及读完，这个窗口就没有 trace。CUDA graph 捕获期间不计时。
 - 告警有延迟：默认参数下从开始变慢到告警约 21–30 个 rollout。延迟按 rollout 个数计，rollout 很长（例如每个几分钟）时建议把 `REPORT_INTERVAL` 设为 1–2：在 Qwen3-0.6B DP8 上设为 1 时两次运行分别在第 3、4 个 rollout 告警，40 个 rollout 的正常运行没有误报，代价是每个 rollout 一次 gather（8 卡约 1 ms）。调小 `PERSIST_WINDOWS` 也能更早告警，但更容易被一次性抖动触发。
 - 计时依赖 Megatron 的计时接口（`config.timers`）。Megatron 版本的调用方式变了（出现不认识的计时点名字，给 `timers()` / `start` / `stop` 传入新参数，或调用 `Timers.log` / `write`），或者第一个 rollout 没有走到每步都会调用的计时点（`forward-compute`、`backward-compute`、`all-grads-sync`、`optimizer-copy-to-main-grad`；log-prob 前向为 `forward-compute`）时，训练不会中断：这次调用被忽略，打一条警告，这个 rank 此后的 `straggler/health/state` 记为 1（degraded），但不计入自动关闭的条件，相应的时间不进统计。适配层的 CPU 契约测试会对照已安装的 Megatron 检查这些变化。关闭 profiler（`RELAX_STRAGGLER_PROFILER=0`）即恢复 `config.timers = None`。

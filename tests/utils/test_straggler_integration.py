@@ -181,17 +181,25 @@ def test_micro_batch_tokens_reach_the_profiler_only_as_host_lists(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("env", "trace_on", "expected"),
-    [(None, True, 2), (None, False, 1), ("0", True, 0), ("1", True, 1), ("3", True, 3)],
+    ("env", "trace_on", "world", "expected"),
+    [
+        (None, True, 256, 2),
+        (None, True, 257, 1),
+        (None, False, 8, 1),
+        ("0", True, 8, 0),
+        ("1", True, 8, 1),
+        ("2", True, 4096, 2),
+        ("3", True, 8, 3),
+    ],
 )
-def test_the_start_level_comes_from_the_env_or_from_whether_traces_can_be_written(
-    monkeypatch, env, trace_on, expected
+def test_the_start_level_comes_from_the_env_or_from_whether_traces_can_be_written_and_the_job_size(
+    monkeypatch, env, trace_on, world, expected
 ):
     if env is None:
         monkeypatch.delenv("RELAX_STRAGGLER_LEVEL", raising=False)
     else:
         monkeypatch.setenv("RELAX_STRAGGLER_LEVEL", env)
-    assert integration.initial_level(trace_on) == expected
+    assert integration.initial_level(trace_on, world) == expected
 
 
 class _Chunk:
@@ -316,6 +324,7 @@ def test_install_uses_the_metrics_primary_rank_and_names_brackets_by_schedule_on
     monkeypatch.setenv("RELAX_STRAGGLER_PROFILER", "1")
     monkeypatch.setattr(megatron_adapter, "is_metrics_primary_rank", lambda: primary)
     monkeypatch.setattr(integration, "local_rank_meta", lambda: meta(1)[0])
+    monkeypatch.setattr(integration.dist, "get_world_size", lambda group=None: 1)
     monkeypatch.setattr(integration, "timing_event_factory", lambda: FakeEvent)
     monkeypatch.setattr(integration, "stream_capture_check", lambda: integration._never)
     # The gather group is a collective; its creation is covered separately.

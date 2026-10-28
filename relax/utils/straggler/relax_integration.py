@@ -418,7 +418,7 @@ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None
         gather_to=gloo_gather_objects_to,
         primary_rank=primary_rank,
         cpu_events=_cpu_events,
-        level=initial_level(bool(traces_to)),
+        level=initial_level(bool(traces_to), dist.get_world_size()),
         # Read at window closes; the poller is created below, once there is a collector to report.
         level_request=lambda: poller.requested if poller is not None else None,
         interleaved=(getattr(args, "virtual_pipeline_model_parallel_size", None) or 1) > 1,
@@ -442,12 +442,19 @@ def install_straggler_profiler(role: str, args: Any) -> StragglerProfiler | None
     return _PROFILER
 
 
-def initial_level(trace_on: bool) -> int:
+# The primary builds one trace of every rank per window: at 2048 ranks about 10 MB and a quarter of a second
+# of CPU (level 3: 80 MB, 2 s), so a larger job starts without it unless asked.
+_TRACE_DEFAULT_MAX_RANKS = 256
+
+
+def initial_level(trace_on: bool, world_size: int) -> int:
     """The level a run starts at: ``RELAX_STRAGGLER_LEVEL``, else detail when
-    traces have somewhere to go and coarse otherwise; never ``modules`` unless
-    asked for."""
+    traces have somewhere to go and the job has at most 256 ranks, coarse
+    otherwise; never ``modules`` unless asked for."""
     level = Envs.RELAX_STRAGGLER_LEVEL
-    return level if level >= 0 else (2 if trace_on else 1)
+    if level >= 0:
+        return level
+    return 2 if trace_on and world_size <= _TRACE_DEFAULT_MAX_RANKS else 1
 
 
 def straggler_timers(
