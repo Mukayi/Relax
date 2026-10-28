@@ -330,14 +330,17 @@ class StragglerProfiler:
         If several windows are ready at once, each still reaches the timeline
         and logs, but only the scalars of the latest one whose reporter
         succeeded are returned (one metrics call per step carries one value per
-        key). Each window it supersedes is counted as a profiler error; a
-        window whose reporter fails is counted once, as that failure.
+        key). Each window it supersedes is counted as a profiler error, except
+        at the last step, whose flush makes the last window ready together with
+        the one before it (always so with one-rollout windows); a window whose
+        reporter fails is counted once, as that failure.
         """
         try:
             self._check_timer_points()
         except Exception as exc:
             self.collector.on_error("self-check", exc)
-        reports = self.collector.end_step(rollout_id, final=rollout_id + 1 == self._args.num_rollout)
+        final = rollout_id + 1 == self._args.num_rollout
+        reports = self.collector.end_step(rollout_id, final=final)
         reported: list[tuple[WindowReport, dict[str, float]]] = []
         for report in reports:
             try:
@@ -347,6 +350,8 @@ class StragglerProfiler:
         if not reported:
             return None
         *superseded, (latest, metrics) = reported
+        if final:
+            return metrics
         for dropped, _ in superseded:
             self.collector.on_error(
                 "report",

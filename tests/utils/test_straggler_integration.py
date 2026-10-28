@@ -302,6 +302,13 @@ def test_a_superseded_and_a_failed_window_count_one_error_each(monkeypatch):
     assert profiler.collector.health.errors_total == 2, "window 0 superseded, window 2 failed"
 
 
+def test_a_window_superseded_at_the_last_step_is_not_an_error(monkeypatch):
+    profiler = _profiler(interval=1, num_rollout=100)
+    _ready_windows(monkeypatch, profiler, rollouts=[98, 99], failing=-1)
+    assert profiler.rollout_end(99) == {"straggler/window/last_rollout": 99.0}
+    assert profiler.collector.health.errors_total == 0
+
+
 @pytest.mark.parametrize(("primary", "vpp"), [(True, None), (False, 2)])
 def test_install_uses_the_metrics_primary_rank_and_names_brackets_by_schedule_only_under_vpp(
     monkeypatch, primary, vpp
