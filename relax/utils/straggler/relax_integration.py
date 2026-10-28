@@ -96,7 +96,7 @@ def init_straggler_gather_group(timeout_s: float) -> None:
     than the training one.
 
     The generic Gloo group is shared with weight sync and other paths, so its
-    timeout cannot be lowered for this; a straggler gather is ``world × 272 B``
+    timeout cannot be lowered for this; a straggler gather is ``world × 312 B``
     of CPU copies (milliseconds), and a rank that vanished must not park the
     rest of the job for ``--distributed-timeout-minutes``. Every member of the
     default group must call this in the same order, so it runs on all ranks of

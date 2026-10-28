@@ -40,6 +40,8 @@ from relax.utils.straggler.core.stats import (
     LEVELS,
     NUM_FIELDS,
     RECORD_WIDTH,
+    STEP_PEAK_FIELDS,
+    STEP_PEAK_SEGMENTS,
     RankMeta,
     RankTrace,
     WindowStats,
@@ -73,6 +75,10 @@ _MB_FWD_ARGMAX_INDEX = FIELD_INDEX["mb_fwd_argmax"]
 _MB_FWD_ARGMAX_TOKENS_INDEX = FIELD_INDEX["mb_fwd_argmax_tokens"]
 _MB_TOKENS_MAX_INDEX = FIELD_INDEX["mb_tokens_max"]
 _MB_TOKENS_MIN_INDEX = FIELD_INDEX["mb_tokens_min"]
+# (window total, one-step maximum) of each segment whose slowest step the window keeps.
+_STEP_PEAK_INDICES = tuple(
+    (FIELD_INDEX[name], FIELD_INDEX[peak]) for name, peak in zip(STEP_PEAK_SEGMENTS, STEP_PEAK_FIELDS)
+)
 
 # An analysis takes milliseconds (35 ms at 2048 ranks); this only bounds a stuck worker at the end of a run.
 _FINAL_FLUSH_TIMEOUT_S = 10.0
@@ -231,6 +237,8 @@ class StragglerCollector:
         self._cpu_events_source = cpu_events
         self._cpu_events: list[dict[str, Any]] = []
         self._window = WindowStats()
+        # The window's totals of the step-peak segments at the end of its previous step.
+        self._step_base = [0.0] * len(_STEP_PEAK_INDICES)
         self._wall = wall_clock
         self.window_start_wall = wall_clock()
         self._gather = gather
@@ -552,6 +560,7 @@ class StragglerCollector:
                     "trace", self._cpu_events_source, self._trace.wall, self._wall(), default=[]
                 )
             self._finish_trace()
+        self._note_step_peaks()
         self._window.add("num_steps", 1.0)
         if self._window_first_rollout is None:
             self._window_first_rollout = rollout_id
@@ -561,6 +570,14 @@ class StragglerCollector:
         if final and not self.flush(timeout=_FINAL_FLUSH_TIMEOUT_S):
             self.on_error("analyze", TimeoutError(f"analysis still running {_FINAL_FLUSH_TIMEOUT_S} s after the run"))
         return self._take_reports()
+
+    def _note_step_peaks(self) -> None:
+        """Keep the largest one-step total of each step-peak segment; a bracket
+        still unread at ``end_step`` counts towards the step that reads it."""
+        values = self._window.values
+        for k, (total, peak) in enumerate(_STEP_PEAK_INDICES):
+            self._window.max_index(peak, values[total] - self._step_base[k])
+            self._step_base[k] = values[total]
 
     def _close_window(self) -> None:
         closed_wall = self._wall()
@@ -731,6 +748,7 @@ class StragglerCollector:
         """Start the next window; every close path has to reach this, or the
         window would close (and gather) again on every following step."""
         self._window.reset()
+        self._step_base = [0.0] * len(_STEP_PEAK_INDICES)
         self.window_start_wall = self._wall()
         self._window_first_rollout = None
         self._trace_next = self._sample_gather and self.level >= 2 and not self._disabled

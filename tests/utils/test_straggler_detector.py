@@ -681,3 +681,13 @@ def test_micro_batch_extremes_are_window_level_and_name_the_slowest_rank():
 
     metrics = _analyze_once([_healthy_row(), _healthy_row()], _meta(2)).metrics
     assert not [name for name in metrics if name.startswith("straggler/micro_batch/")]
+
+
+def test_the_slowest_single_step_of_each_segment_is_reported_with_its_rank():
+    table = _clean()
+    _with_window_fields(table[1], fwd_step_max=120.0)
+    _with_window_fields(table[2], fwd_step_max=150.0, bwd_step_max=300.0)
+    metrics = _analyze_once(table, _meta(4)).metrics
+    assert (metrics["straggler/step_max/fwd_ms"], metrics["straggler/step_max/fwd_rank"]) == (150.0, 2.0)
+    assert (metrics["straggler/step_max/bwd_ms"], metrics["straggler/step_max/bwd_rank"]) == (300.0, 2.0)
+    assert "straggler/step_max/pp_recv_ms" not in metrics

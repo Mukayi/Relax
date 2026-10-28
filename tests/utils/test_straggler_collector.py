@@ -367,6 +367,17 @@ def test_micro_batch_extremes_follow_the_slowest_forward_and_its_tokens():
     assert window.get("mb_fwd_min") == 1.0
 
 
+def test_the_window_keeps_the_slowest_single_step_of_each_peak_segment():
+    collector = _collector(world=1, interval=3)
+    for step in ((4,), (3, 5), (6,)):
+        for ms in step:
+            _timed(collector, "forward-compute", ms)
+        collector.end_step()
+    row = collector.gather_calls[-1]
+    assert (row[FIELD_INDEX["fwd"]], row[FIELD_INDEX["fwd_step_max"]]) == (18.0, 8.0)
+    assert collector.window.get("fwd_step_max") == 0.0
+
+
 def _tracing_collector(world=2, interval=2, trace=True, primary=True, level=2, **kwargs):
     """A tracing collector for rank 0 (the primary unless ``primary`` is False)
     that records its synchronizes, trace gathers and sink calls."""

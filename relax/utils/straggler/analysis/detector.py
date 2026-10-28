@@ -68,6 +68,8 @@ from relax.utils.straggler.core.stats import (
     GPU_SEGMENTS,
     PP_PHASE_FIELDS,
     SELF_SEGMENTS,
+    STEP_PEAK_FIELDS,
+    STEP_PEAK_SEGMENTS,
     WAIT_SEGMENTS,
     RankMeta,
 )
@@ -694,6 +696,7 @@ def _metrics(
     )
     _pp_wait_metrics(metrics, w, meta)
     _micro_batch_metrics(metrics, w, meta)
+    _step_peak_metrics(metrics, w, meta)
     metrics["straggler/self_overhead_ms"] = float(np.mean(w.col("overhead")))
     metrics["straggler/dropped_events"] = float(np.sum(w.dropped))
     metrics["straggler/unread_events"] = float(np.sum(w.unread))
@@ -726,6 +729,13 @@ def _pp_wait_metrics(metrics: dict[str, float], w: _Window, meta: Sequence[RankM
     metrics["straggler/pp_bubble/ratio"] = float(
         max(np.median(ratio[idx]) for idx in _group_indices(meta, lambda m: m.pp))
     )
+
+
+def _step_peak_metrics(metrics: dict[str, float], w: _Window, meta: Sequence[RankMeta]) -> None:
+    """The slowest single step of each step-peak segment over the window and
+    its rank; nothing for a segment that was never timed."""
+    for name, peak in zip(STEP_PEAK_SEGMENTS, STEP_PEAK_FIELDS):
+        _emit_max(metrics, f"straggler/step_max/{name}", w.raw_col(peak), meta)
 
 
 def _micro_batch_metrics(metrics: dict[str, float], w: _Window, meta: Sequence[RankMeta]) -> None:

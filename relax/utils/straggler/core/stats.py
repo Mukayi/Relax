@@ -60,6 +60,11 @@ MICRO_BATCH_FIELDS: tuple[str, ...] = (
     "mb_tokens_max",
     "mb_tokens_min",
 )
+# Window-level extremes over single steps, not summed: the largest one-step
+# total of each of these segments (ms), which the window's averages hide when
+# a rank slowed down for one step or only late in the window.
+STEP_PEAK_SEGMENTS: tuple[str, ...] = ("fwd", "bwd", "optim", "pp_recv", "dp_grad_sync")
+STEP_PEAK_FIELDS: tuple[str, ...] = tuple(f"{name}_step_max" for name in STEP_PEAK_SEGMENTS)
 # Window-level status, not summed per step: event pairs still unread when the
 # window closed (their time lands in the next window), exceptions the profiler
 # caught on this rank during the window, this rank's health code
@@ -68,7 +73,7 @@ MICRO_BATCH_FIELDS: tuple[str, ...] = (
 STATUS_FIELDS: tuple[str, ...] = ("unread", "errors", "health", "control")
 
 FIELDS: tuple[str, ...] = (
-    GPU_SEGMENTS + PP_PHASE_FIELDS + CPU_FIELDS + COUNT_FIELDS + MICRO_BATCH_FIELDS + STATUS_FIELDS
+    GPU_SEGMENTS + PP_PHASE_FIELDS + CPU_FIELDS + COUNT_FIELDS + MICRO_BATCH_FIELDS + STEP_PEAK_FIELDS + STATUS_FIELDS
 )
 FIELD_INDEX: Mapping[str, int] = {name: index for index, name in enumerate(FIELDS)}
 NUM_FIELDS: int = len(FIELDS)
