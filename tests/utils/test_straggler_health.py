@@ -45,6 +45,17 @@ def test_health_requests_disable_after_max_errors_even_across_windows():
     assert "3 errors" in health.request_reason()
 
 
+@pytest.mark.parametrize(("every", "switched_off"), [(4, True), (5, False)])
+def test_errors_switch_the_profiler_off_only_when_max_errors_fall_within_error_windows(every, switched_off):
+    health = ProfilerHealth(HealthConfig(max_errors=3, error_windows=10, max_degraded_windows=100))
+    codes = []
+    for window in range(40):
+        if window % every == 0:
+            health.record_error("gather", TimeoutError("a rank reached the gather late"))
+        codes.append(health.close_window(dropped=0.0)[1])
+    assert (HEALTH_DISABLE in codes) is switched_off
+
+
 def test_a_gap_keeps_the_rank_degraded_without_ever_switching_it_off(monkeypatch):
     warnings = []
     monkeypatch.setattr(health_module.logger, "warning", lambda msg, *a: warnings.append(msg % a))

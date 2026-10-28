@@ -9,7 +9,7 @@ The Megatron backend ships a low-overhead straggler profiler that can stay enabl
 - **Sampled-step trace**: every window puts one rollout's timings of all ranks on a common time axis and writes a Perfetto file: PP bubbles, each micro-batch's forward / backward (with the model chunk under VPP), sends, gradient syncs and the optimizer.
 - **Module timing**: in the sampled step, the forward and backward of every layer's attention and MLP / MoE block, with a MoE layer split into router, dispatch, experts and combine.
 - **Level switching while training**: paused, window statistics, plus trace, plus module timing, switched from a web page or an endpoint.
-- **Self-shutdown on errors**: the profiler's own errors are counted and never reach the training loop. When a rank has caught 3 errors, or has lost spans or caught errors in 3 consecutive windows, every rank switches the profiler off in the same window and training carries on. See `straggler/health/*`.
+- **Self-shutdown on errors**: the profiler's own errors are counted and never reach the training loop. When a rank has caught 3 errors within its last 10 windows, or has lost spans or caught errors in 3 consecutive windows, every rank switches the profiler off in the same window and training carries on. See `straggler/health/*`.
 
 ## Enabling
 

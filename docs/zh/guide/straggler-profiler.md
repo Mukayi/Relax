@@ -9,7 +9,7 @@ Relax 的 Megatron 后端内置一个低开销的慢 rank 分析器，可以在�
 - **采样步 trace**：每个窗口把一个 rollout 里所有 rank 的计时放到同一条时间轴上，写成 Perfetto 文件：PP 气泡、每个 micro-batch 的前向 / 反向（VPP 下带模型块）、收发、梯度同步和 optimizer。
 - **模块计时**：在采样步里给每层 attention 和 MLP / MoE 块的前向、反向计时，MoE 层内再分 router、dispatch、experts、combine。
 - **运行中切换级别**：暂停、窗口统计、加 trace、加模块计时四档，训练中通过网页或接口切换。
-- **出错自动关闭**：分析器自身的异常只计数，不抛进训练循环；某个 rank 累计 3 次异常，或连续 3 个窗口有丢失的计时或异常时，所有 rank 在同一个窗口一起关闭分析器，训练照常进行。状态见 `straggler/health/*`。
+- **出错自动关闭**：分析器自身的异常只计数，不抛进训练循环；某个 rank 在最近 10 个窗口内有 3 次异常，或连续 3 个窗口有丢失的计时或异常时，所有 rank 在同一个窗口一起关闭分析器，训练照常进行。状态见 `straggler/health/*`。
 
 ## 开启
 

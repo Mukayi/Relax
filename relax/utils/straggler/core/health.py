@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections import deque
 from dataclasses import dataclass
 
 
@@ -35,8 +36,12 @@ HEALTH_ACTIVE, HEALTH_DEGRADED, HEALTH_DISABLE = 0, 1, 2
 class HealthConfig:
     """When a rank asks for the profiler to be switched off."""
 
-    # Caught exceptions of any kind, counted over the whole run.
+    # Caught exceptions of any kind within the last ``error_windows`` windows: a rank that keeps failing is
+    # switched off within a few windows, while failures spread over a long run (a rank that now and then
+    # reaches a gather later than its timeout) are not. A switched-off rank still joins every gather, so
+    # switching off would not avoid what such a failure costs, only lose the data after it.
     max_errors: int = 3
+    error_windows: int = 10
     # Consecutive windows with dropped event pairs or caught exceptions.
     max_degraded_windows: int = 3
 
@@ -55,6 +60,7 @@ class ProfilerHealth:
         self.errors_total = 0
         self.disabled_reason = ""
         self._errors_window = 0
+        self._recent_errors: deque[int] = deque(maxlen=self.config.error_windows)
         self._degraded_streak = 0
         self._logged: set[str] = set()
         self._gaps: set[str] = set()
@@ -91,11 +97,12 @@ class ProfilerHealth:
         if first:
             logger.warning(
                 "[straggler] %s failed (%s: %s); training continues and the profiler counts the failure "
-                "(it switches itself off after %d errors)",
+                "(it switches itself off after %d errors within %d windows)",
                 where,
                 type(exc).__name__,
                 exc,
                 self.config.max_errors,
+                self.config.error_windows,
             )
 
     def close_window(self, dropped: float) -> tuple[float, float]:
@@ -104,11 +111,12 @@ class ProfilerHealth:
         with self._lock:
             errors = self._errors_window
             self._errors_window = 0
-            errors_total = self.errors_total
+        self._recent_errors.append(errors)
+        recent = sum(self._recent_errors)
         bad = errors > 0 or dropped > 0
         self._degraded_streak = self._degraded_streak + 1 if bad else 0
         degraded = bad or bool(self._gaps)
-        if errors_total >= self.config.max_errors or self._degraded_streak >= self.config.max_degraded_windows:
+        if recent >= self.config.max_errors or self._degraded_streak >= self.config.max_degraded_windows:
             code = HEALTH_DISABLE
         else:
             code = HEALTH_DEGRADED if degraded else HEALTH_ACTIVE
@@ -118,8 +126,12 @@ class ProfilerHealth:
 
     def request_reason(self) -> str:
         """Why this rank's last ``close_window`` asked for a switch-off."""
-        if self.errors_total >= self.config.max_errors:
-            return f"{self.errors_total} errors caught inside the profiler (limit {self.config.max_errors})"
+        recent = sum(self._recent_errors)
+        if recent >= self.config.max_errors:
+            return (
+                f"{recent} errors caught inside the profiler within {self.config.error_windows} windows "
+                f"(limit {self.config.max_errors})"
+            )
         return (
             f"{self._degraded_streak} consecutive windows with dropped event pairs or caught errors "
             f"(limit {self.config.max_degraded_windows})"
