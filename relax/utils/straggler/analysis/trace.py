@@ -316,7 +316,10 @@ def build_trace(
     no complete sample).
 
     Every host's ranks are shifted by its clock offset to the primary's host
-    (``_clock_offsets``), so slices on different hosts line up.
+    (``_clock_offsets``), so slices on different hosts line up. A rank that
+    lost brackets may end on a different reduction than its peers, so it takes
+    no part in the offsets or ``align_spread_ms``; hosts left without an offset
+    keep their own clock and are counted in ``unaligned_hosts``.
 
     ``sync_names`` names the gradient syncs by phase slot and ``module_names``
     the blocks by index (the adapter's ``GRAD_SYNC_TIMERS`` and
@@ -328,8 +331,9 @@ def build_trace(
     excess: dict[int, float] = {}
     module_brackets = 0
     brackets_of = {i: _brackets(trace) for i, trace in enumerate(traces) if trace is not None}
+    complete = [i for i in brackets_of if not traces[i].lost]
     reference = next((m.host for m in meta if m.primary), meta[0].host if meta else "")
-    offsets = _clock_offsets([(meta[i], traces[i].wall * 1e3, b) for i, b in brackets_of.items()], reference)
+    offsets = _clock_offsets([(meta[i], traces[i].wall * 1e3, brackets_of[i]) for i in complete], reference)
     order = sorted(range(len(meta)), key=lambda i: (meta[i].dp, meta[i].pp, meta[i].tp))
     for sort_index, i in enumerate(order):
         trace, rank_meta = traces[i], meta[i]
@@ -357,7 +361,7 @@ def build_trace(
         events += _rank_events(brackets, pid, wall_us, sync_names)
         events += _module_events(modules, brackets, pid, wall_us, module_names)
         sync_end = _dp_sync_end(brackets)
-        if sync_end is not None:
+        if sync_end is not None and not trace.lost:
             grad_sync_ends.setdefault((rank_meta.pp, rank_meta.tp), []).append(wall_ms + sync_end)
         events += trace.cpu_events
         events += [
@@ -373,6 +377,9 @@ def build_trace(
         metrics["straggler/trace/align_spread_ms"] = float(max(spreads))
     if len(offsets) > 1:
         metrics["straggler/trace/clock_offset_ms_max"] = float(max(abs(offset) for offset in offsets.values()))
+    unaligned = {meta[i].host for i in brackets_of} - offsets.keys()
+    if unaligned:
+        metrics["straggler/trace/unaligned_hosts"] = float(len(unaligned))
     if excess:
         worst = max(excess, key=excess.__getitem__)
         metrics["straggler/trace/bubble_excess_ms_max"] = float(excess[worst])

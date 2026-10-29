@@ -166,6 +166,17 @@ def test_a_dp_group_across_hosts_shifts_each_host_by_its_clock_offset_to_the_pri
     assert {_slices(trace, rank, "grad sync")[0]["ts"] for rank in (0, 8)} == {round(1000.0 * 1e6 + 90e3)}
 
 
+def test_ranks_that_lost_brackets_take_no_part_in_the_clock_offsets_or_the_alignment():
+    # As above, but every h1 rank lost brackets and kept a later reduction as its last one.
+    meta = [replace(m, primary=m.rank == 8) for m in _meta(16)]
+    later = [*_FIRST_STAGE[:-2], _sync(1090, 1095)]
+    traces = [_trace(_FIRST_STAGE, wall=1000.003) if m.host == "h0" else _trace(later, lost=1) for m in meta]
+    _, metrics = build_trace(traces, meta)
+    assert "straggler/trace/clock_offset_ms_max" not in metrics
+    assert metrics["straggler/trace/unaligned_hosts"] == 1.0
+    assert metrics["straggler/trace/align_spread_ms"] == pytest.approx(0.0, abs=1e-3)
+
+
 # A two-stage 1F1B step with 1 ms between a stage finishing a micro-batch and the next stage starting it.
 _UPSTREAM = [
     _bracket("fwd", 0, 10, micro_batch=0),
@@ -197,6 +208,7 @@ def test_hosts_nothing_links_keep_their_own_clocks():
     traces = [_trace([_bracket("optim", 0, 5)], wall=1000.0 + m.pp * 0.003) for m in meta]
     trace, metrics = build_trace(traces, meta)
     assert "straggler/trace/clock_offset_ms_max" not in metrics
+    assert metrics["straggler/trace/unaligned_hosts"] == 1.0
     assert _slices(trace, 8, "optimizer")[0]["ts"] == round(1000.003 * 1e6)
 
 
