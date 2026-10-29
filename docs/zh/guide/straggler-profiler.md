@@ -27,7 +27,7 @@ env_vars:
 | 环境变量 | 类型 | 默认值 | 说明 |
 |----------|------|--------|------|
 | `RELAX_STRAGGLER_PROFILER` | bool | false | 总开关。 |
-| `RELAX_STRAGGLER_REPORT_INTERVAL` | int | 10 | 每多少个 rollout 汇总并判定一次（一个窗口）。下文的 ms/step 都是每个 rollout 的累计值。 |
+| `RELAX_STRAGGLER_REPORT_INTERVAL` | int | 10 | 每多少个 rollout 汇总并判定一次（一个窗口），怎么选见表后。下文的 ms/step 都是每个 rollout 的累计值。 |
 | `RELAX_STRAGGLER_Z_THRESHOLD` | float | 3.0 | 判为异常的 robust z 分数门限（组内中位数和 MAD）。 |
 | `RELAX_STRAGGLER_REL_THRESHOLD` | float | 0.10 | 判为异常所需的最小超出比例（相对组内中位数）。 |
 | `RELAX_STRAGGLER_PERSIST_WINDOWS` | int | 3 | 连续多少个窗口异常才告警，用来过滤一次性抖动；必须 ≥ 1。 |
@@ -37,6 +37,13 @@ env_vars:
 | `RELAX_STRAGGLER_TRACE_KEEP` | int | 50 | 保留最新的多少个 trace 文件。 |
 | `RELAX_STRAGGLER_LEVEL` | int | −1 | 启动级别（见「级别」）；−1 表示有 trace 目录且不超过 256 个 rank 时为 2，否则为 1。 |
 | `RELAX_STRAGGLER_CONTROL_POLL_S` | float | 5.0 | primary 向 metrics service 查询级别的间隔（秒）。 |
+
+`REPORT_INTERVAL` 是告警时延和开销之间的取舍。告警要连续 `PERSIST_WINDOWS` 个窗口，默认 10 时约 21–30 个 rollout，设为 1 时 3–4 个（Qwen3-0.6B DP8 两次运行，40 个 rollout 的正常运行没有误报）。每个窗口有一笔固定开销：一次统计 gather（8 卡约 1 ms，两机 16 卡 1.3–6.5 ms），开 trace 时再加一次设备同步（约 1 ms）、采样步的 gather 和一个 trace 文件，合计约 3 ms，摊到每个 rollout 是 3 ms / `REPORT_INTERVAL`。
+
+- rollout 较长（例如 RL，每个几十秒到几分钟）：设为 1–2，额外开销不到 0.01%。
+- rollout 较短（例如小模型 SFT，约 1 s）：保持默认 10；设为 1 时每个 rollout 额外约 3 ms（约 0.3%，多机时更多），加上直接开销会接近或超过 0.5%。窗口只有 1 个 rollout 时，采样步也可能来不及读完，这个窗口就没有 trace。
+
+默认值不会按 rollout 时长自动调整，运行中也不能改：各 rank 必须在同一个 rollout 参加 gather，而各 rank 本地测到的时长可能不同。
 
 开启后，每个 actor 进程启动时打印一行 `Straggler profiler enabled: report_interval=… primary=… level=… control=… trace_dir=… meta=RankMeta(…)`，`trace_dir=-` 表示不写 trace。critic、reference 和 `actor_fwd` 不跑训练步，不做分析。
 
@@ -150,7 +157,7 @@ closed; their time lands in the next window
 | `recovered/count` | 本窗口解除告警的 rank 数 |
 | `health/degraded_ranks` | degraded 的 rank 数 |
 | `gather_ms`、`analyze_ms` | primary 上每个窗口的 gather 和判定耗时 |
-| `trace/{ranks,module_brackets,align_spread_ms,bubble_excess_ms_max,bubble_excess_rank}` | 采样步 trace 的统计，见下节 |
+| `trace/{ranks,module_brackets,align_spread_ms,clock_offset_ms_max,bubble_excess_ms_max,bubble_excess_rank}` | 采样步 trace 的统计，见下节 |
 
 ### 采样步 trace（Perfetto）
 
@@ -172,7 +179,8 @@ primary 自己的 CPU 侧计时（例如 `actor_train`、每个 micro-batch 的 
 |------|------|
 | `straggler/trace/ranks`、`straggler/trace/lost` | 提供了 trace 的 rank 数；丢失的计时数（队列满，或超出每步 4096 条普通计时、8192 条模块计时的上限；模块计时单独排队，最多占队列的一半，队列满时先被挤掉，只计在这里，不计入 `dropped_events`） |
 | `straggler/trace/module_brackets` | trace 中模块计时的条数，各 rank 求和（仅 `modules` 级别） |
-| `straggler/trace/align_spread_ms` | 同一 DP 组 `all-grads-sync` 结束时刻在各 rank 墙钟上的最大差值，即跨卡对齐误差 |
+| `straggler/trace/align_spread_ms` | 校正跨机时钟偏移后，同一 DP 组 `all-grads-sync` 结束时刻在各 rank 上的最大差值，即剩余的跨卡对齐误差；也包含 all-reduce 本身在各 rank 上结束的先后（两机 16 卡约 1 ms，单机 0.02–0.25 ms） |
+| `straggler/trace/clock_offset_ms_max` | 各机器相对 primary 所在机器的时钟偏移的最大绝对值（ms），trace 已按它平移；只在估算出至少两台机器时输出 |
 | `straggler/trace/bubble_excess_ms_max`、`straggler/trace/bubble_excess_rank` | 实测 PP 等待超出均衡 1F1B 气泡的最大值及其 rank |
 
 ### Timeline
@@ -205,7 +213,7 @@ primary 自己的 CPU 侧计时（例如 `actor_train`、每个 micro-batch 的 
 - 同一 TP 组的 rank 在前向 / 反向里互相等待，其中一个变慢时整组都会被报出，分不出谁先变慢；所有 rank 同时变慢时（整机降频、共享存储抖动、整组通信变慢）发现不了。
 - PP 阶段拆分、trace 里的阶段命名和气泡推算只适用于非交错 1F1B，VPP 的收发只计入 `pp_recv`。VPP 下的 micro-batch 序号和模型块按 Megatron 的交错调度表（`get_schedule_table`，用模型自己的 config 生成）由调用顺序换算；`combined_1f1b` 的训练调用把前向和反向合并执行，不编号。
 - trace 的开销随 rank 数线性增长，都落在 primary 上：每个窗口把所有 rank 的采样步拼成一个文件，CPU 基准中 2048 个 rank 时约 10 MB、构建约 0.25 s（`modules` 级别约 80 MB、2 s），构建时占用 primary 的 Python 解释器，会拖慢它的训练线程。所以超过 256 个 rank 时默认不开 trace；手动设为 2 或 3 前先估算这部分开销。
-- 跨卡对齐依赖各 rank 的墙钟，不做跨机校正：跨机器的事件会错开两台机器的墙钟偏差（两机实测 1–3 ms）。`trace/align_spread_ms` 只在 DP 组跨机时反映这个偏差，PP 跨机而 DP 组都在机内时看不出。窗口只有 1 个 rollout 时，采样步可能来不及读完，这个窗口就没有 trace。CUDA graph 捕获期间不计时。
-- 告警有延迟：默认参数下从开始变慢到告警约 21–30 个 rollout。延迟按 rollout 个数计，rollout 很长（例如每个几分钟）时建议把 `REPORT_INTERVAL` 设为 1–2：在 Qwen3-0.6B DP8 上设为 1 时两次运行分别在第 3、4 个 rollout 告警，40 个 rollout 的正常运行没有误报，代价是每个 rollout 一次 gather（8 卡约 1 ms）；开启 trace 时每个 rollout 都是采样步，还多一次设备同步（约 1 ms）和一个 trace 文件。调小 `PERSIST_WINDOWS` 也能更早告警，但更容易被一次性抖动触发。
+- 跨卡对齐依赖各 rank 的墙钟，跨机时按机器估算时钟偏移后平移：有跨机的 DP 组时用 DP 梯度同步的结束时刻（DP 组内同时结束）；只有 PP 跨机时用跨机那一跳前向、反向的先后关系，假设两个方向的传输时间相同；两种都联系不上的机器不平移。两机实测与 ssh 测得的时钟偏差相比，前一种相差 0.3 ms 以内，后一种 0.2–0.6 ms。CUDA graph 捕获期间不计时。
+- 告警有延迟：默认参数下从开始变慢到告警约 21–30 个 rollout，rollout 很长时调小 `REPORT_INTERVAL`（见「开启」）。调小 `PERSIST_WINDOWS` 也能更早告警，但更容易被一次性抖动触发。
 - 计时依赖 Megatron 的计时接口（`config.timers`）。Megatron 版本的调用方式变了（出现不认识的计时点名字，给 `timers()` / `start` / `stop` 传入新参数，或调用 `Timers.log` / `write`），或者第一个 rollout 没有走到每步都会调用的计时点（`forward-compute`、`backward-compute`、`all-grads-sync`、`optimizer-copy-to-main-grad`；log-prob 前向为 `forward-compute`）时，训练不会中断：这次调用被忽略，打一条警告，这个 rank 此后的 `straggler/health/state` 记为 1（degraded），但不计入自动关闭的条件，相应的时间不进统计。适配层的 CPU 契约测试会对照已安装的 Megatron 检查这些变化。关闭 profiler（`RELAX_STRAGGLER_PROFILER=0`）即恢复 `config.timers = None`。
 - 某个 rank 进程整个消失时，其余 rank 的每次 gather 都要等到 `RELAX_STRAGGLER_GATHER_TIMEOUT_S` 超时，失败多次后各自关闭分析器。

@@ -27,7 +27,7 @@ Every training rank must see the same values (and the same `--timeline-dump-dir`
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `RELAX_STRAGGLER_PROFILER` | bool | false | Master switch. |
-| `RELAX_STRAGGLER_REPORT_INTERVAL` | int | 10 | Rollouts per gather and analysis (a window). ms/step values below are per rollout. |
+| `RELAX_STRAGGLER_REPORT_INTERVAL` | int | 10 | Rollouts per gather and analysis (a window); how to choose it is below the table. ms/step values below are per rollout. |
 | `RELAX_STRAGGLER_Z_THRESHOLD` | float | 3.0 | Robust z-score (median / MAD within the peer group) a rank must exceed to count as abnormal. |
 | `RELAX_STRAGGLER_REL_THRESHOLD` | float | 0.10 | Minimum relative excess over the peer median. |
 | `RELAX_STRAGGLER_PERSIST_WINDOWS` | int | 3 | Consecutive abnormal windows before a rank is flagged; filters one-off spikes. Must be at least 1. |
@@ -37,6 +37,13 @@ Every training rank must see the same values (and the same `--timeline-dump-dir`
 | `RELAX_STRAGGLER_TRACE_KEEP` | int | 50 | Number of newest trace files to keep. |
 | `RELAX_STRAGGLER_LEVEL` | int | −1 | Start level (see *Levels*); −1 means 2 with a trace directory and at most 256 ranks, 1 otherwise. |
 | `RELAX_STRAGGLER_CONTROL_POLL_S` | float | 5.0 | How often, in seconds, the primary rank asks the metrics service for a level. |
+
+`REPORT_INTERVAL` trades alert lag against overhead. An alert needs `PERSIST_WINDOWS` windows in a row: about 21–30 rollouts at the default 10, 3–4 at 1 (two Qwen3-0.6B DP8 runs; a 40-rollout clean run raised no alert). Each window has a fixed cost: one statistics gather (about 1 ms on 8 GPUs, 1.3–6.5 ms on two 8-GPU nodes), plus with the trace on a device synchronize (about 1 ms), the sampled-step gather and a trace file, about 3 ms in all, so 3 ms / `REPORT_INTERVAL` per rollout.
+
+- Long rollouts (RL, for example, tens of seconds to minutes each): set 1–2; the extra cost stays under 0.01%.
+- Short rollouts (small-model SFT, for example, about 1 s): keep the default 10. At 1 every rollout costs about 3 ms more (about 0.3%, more across machines), which with the direct cost comes close to or above 0.5%. A one-rollout window may also close before its sampled step is read, and then has no trace.
+
+The default does not follow the rollout length and the value cannot change while training runs: every rank must join the gather at the same rollout, and the lengths the ranks measure may differ.
 
 Each actor process logs `Straggler profiler enabled: report_interval=… primary=… level=… control=… trace_dir=… meta=RankMeta(…)` at start-up; `trace_dir=-` means no trace is written. Critic, reference and `actor_fwd` actors run no training steps and are not profiled.
 
@@ -150,7 +157,7 @@ The timings reuse the 22 timer call sites Megatron already has, grouped into the
 | `recovered/count` | Ranks whose alert cleared in this window |
 | `health/degraded_ranks` | Ranks currently degraded |
 | `gather_ms`, `analyze_ms` | Gather and analysis time per window on the primary rank |
-| `trace/{ranks,module_brackets,align_spread_ms,bubble_excess_ms_max,bubble_excess_rank}` | Sampled-step trace numbers, see the next section |
+| `trace/{ranks,module_brackets,align_spread_ms,clock_offset_ms_max,bubble_excess_ms_max,bubble_excess_rank}` | Sampled-step trace numbers, see the next section |
 
 ### Sampled-step trace (Perfetto)
 
@@ -172,7 +179,8 @@ Of the numbers below only `straggler/trace/lost` is a scalar; the rest are in th
 |--------|---------|
 | `straggler/trace/ranks`, `straggler/trace/lost` | Ranks that delivered a trace; timed spans lost (from a full queue, or beyond the per-step cap of 4096 spans plus 8192 module spans; module spans queue separately, take at most half of the queue, are pushed out first when it is full, and count here only, not in `dropped_events`) |
 | `straggler/trace/module_brackets` | Module spans in the trace, summed over ranks (`modules` level only) |
-| `straggler/trace/align_spread_ms` | The largest difference between the wall-clock end of `all-grads-sync` on the ranks of a DP group, i.e. the cross-rank alignment error |
+| `straggler/trace/align_spread_ms` | After the cross-machine clock correction, the largest difference between the end of `all-grads-sync` on the ranks of a DP group, i.e. the alignment error left; it includes the order in which the all-reduce itself ends on the ranks (about 1 ms on two 8-GPU nodes, 0.02–0.25 ms on one node) |
+| `straggler/trace/clock_offset_ms_max` | The largest absolute clock offset of a machine to the primary's machine (ms), which the trace is shifted by; only when offsets were estimated for at least two machines |
 | `straggler/trace/bubble_excess_ms_max`, `straggler/trace/bubble_excess_rank` | The largest excess of measured PP wait over the balanced 1F1B bubble, and its rank |
 
 ### Timeline
@@ -205,7 +213,7 @@ With both `--timeline-dump-dir` and `--use-metrics-service` set, every window ap
 - Ranks of the same TP group wait for each other inside forward and backward, so when one of them slows down the whole group is reported, and which one slowed down first is not known; when every rank slows down at once (whole-machine clock throttling, a shared-storage stall, the whole group's communication slowing down) nothing is detected.
 - The PP phase split, the phase names in the trace and the bubble estimate assume non-interleaved 1F1B; the transfers of the interleaved (VPP) schedule count in `pp_recv` only. With VPP, the micro-batch number and model chunk come from Megatron's interleaved schedule table (`get_schedule_table`, built from the model's own config) by call order; training calls under `combined_1f1b` merge forward and backward steps and are not numbered.
 - The trace costs grow with the number of ranks, all on the primary: each window puts the sampled step of every rank into one file, which in a CPU benchmark at 2048 ranks was about 10 MB and took about 0.25 s to build (`modules` level: about 80 MB and 2 s), holding the primary's Python interpreter and slowing its training thread. Above 256 ranks the trace is therefore off by default; estimate this cost before setting level 2 or 3 by hand.
-- Ranks are aligned by their wall clocks with no cross-machine correction: events on different machines are off by the clock offset between them (1–3 ms measured on two nodes). `trace/align_spread_ms` shows this offset only when a DP group spans machines; it misses it when only the PP hop crosses machines. With one-rollout windows the sampled step may not be fully read when the window closes, and that window has no trace. Nothing is timed under CUDA graph capture.
-- Alerts lag: with the defaults an alert appears about 21–30 rollouts after a rank starts slowing down. The lag counts rollouts, so with long rollouts (minutes each) set `REPORT_INTERVAL` to 1 or 2: at 1, Qwen3-0.6B DP8 alerted after 3 and 4 rollouts in two runs, and a 40-rollout clean run raised no alert, at the cost of one gather per rollout (about 1 ms on 8 GPUs); with the trace on, every rollout is a sampled step and also adds a device synchronize (about 1 ms) and a trace file. Lowering `PERSIST_WINDOWS` also alerts sooner, at the cost of reacting to one-off spikes.
+- Ranks are aligned by their wall clocks, shifted per machine by an estimated clock offset: from the end of the DP gradient sync when a DP group spans machines (it ends together on a DP group); when only PP crosses machines, from the order of the forwards and backwards across that hop, assuming the same transfer time both ways; machines neither links are not shifted. On two nodes the first estimate was within 0.3 ms of the offset measured over ssh and the second 0.2–0.6 ms off. Nothing is timed under CUDA graph capture.
+- Alerts lag: with the defaults an alert appears about 21–30 rollouts after a rank starts slowing down; with long rollouts lower `REPORT_INTERVAL` (see "Enabling"). Lowering `PERSIST_WINDOWS` also alerts sooner, at the cost of reacting to one-off spikes.
 - Timing goes through Megatron's timer interface (`config.timers`). If a Megatron version calls it differently (a timer name the profiler does not know, a new argument to `timers()` / `start` / `stop`, a `Timers.log` / `write` call), or the first rollout never reaches one of the timers every step calls (`forward-compute`, `backward-compute`, `all-grads-sync`, `optimizer-copy-to-main-grad`; `forward-compute` for log-prob passes), training is not interrupted: the call is ignored, a warning is logged once and that rank reports `straggler/health/state` 1 (degraded) from then on, without counting towards a switch-off. That time is then missing from the statistics. The adapter's CPU contract tests check the installed Megatron for these changes. Switching the profiler off (`RELAX_STRAGGLER_PROFILER=0`) gives `config.timers = None` back.
 - When a rank process disappears entirely, every gather on the other ranks waits for the `RELAX_STRAGGLER_GATHER_TIMEOUT_S` timeout, and after repeated failures each rank switches the profiler off locally.

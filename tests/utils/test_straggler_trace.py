@@ -3,6 +3,7 @@
 
 import json
 from array import array
+from dataclasses import replace
 from functools import partial
 
 import pytest
@@ -153,6 +154,50 @@ def test_ranks_align_on_the_dp_gradient_sync_and_the_other_syncs_keep_their_time
     (dp_sync,) = _slices(trace, 1, "grad sync")
     (embedding_sync,) = _slices(trace, 1, "embedding-grads-all-reduce")
     assert (dp_sync["dur"], embedding_sync["dur"]) == (5000, 4000)
+
+
+def test_a_dp_group_across_hosts_shifts_each_host_by_its_clock_offset_to_the_primary_host():
+    # DP16 on hosts h0 (ranks 0-7) and h1 (8-15); h0's clock runs 3 ms ahead and rank 8 is the primary.
+    meta = [replace(m, primary=m.rank == 8) for m in _meta(16)]
+    traces = [_trace(_FIRST_STAGE, wall=1000.003 if m.host == "h0" else 1000.0) for m in meta]
+    trace, metrics = build_trace(traces, meta)
+    assert metrics["straggler/trace/clock_offset_ms_max"] == pytest.approx(3.0, abs=1e-3)
+    assert metrics["straggler/trace/align_spread_ms"] == pytest.approx(0.0, abs=1e-3)
+    assert {_slices(trace, rank, "grad sync")[0]["ts"] for rank in (0, 8)} == {round(1000.0 * 1e6 + 90e3)}
+
+
+# A two-stage 1F1B step with 1 ms between a stage finishing a micro-batch and the next stage starting it.
+_UPSTREAM = [
+    _bracket("fwd", 0, 10, micro_batch=0),
+    _bracket("fwd", 10, 20, micro_batch=1),
+    _bracket("bwd", 39, 59, micro_batch=0),
+    _bracket("bwd", 66, 86, micro_batch=1),
+    _sync(86, 90),
+]
+_DOWNSTREAM = [
+    _bracket("fwd", 11, 21, micro_batch=0),
+    _bracket("bwd", 21, 38, micro_batch=0),
+    _bracket("fwd", 38, 48, micro_batch=1),
+    _bracket("bwd", 48, 65, micro_batch=1),
+    _sync(66, 90),
+]
+
+
+def test_hosts_linked_only_by_a_pp_hop_are_aligned_by_the_forward_and_backward_order():
+    # Stage 0 on h0, stage 1 on h1 (each DP group on one host); h1's clock runs 3 ms ahead.
+    meta = _meta(16, pp_size=2)
+    traces = [_trace(_UPSTREAM) if m.pp == 0 else _trace(_DOWNSTREAM, wall=1000.003) for m in meta]
+    trace, metrics = build_trace(traces, meta)
+    assert metrics["straggler/trace/clock_offset_ms_max"] == pytest.approx(3.0, abs=1e-3)
+    assert _slices(trace, 8, "F0")[0]["ts"] == round(1000.0 * 1e6 + 11e3)
+
+
+def test_hosts_nothing_links_keep_their_own_clocks():
+    meta = _meta(16, pp_size=2)
+    traces = [_trace([_bracket("optim", 0, 5)], wall=1000.0 + m.pp * 0.003) for m in meta]
+    trace, metrics = build_trace(traces, meta)
+    assert "straggler/trace/clock_offset_ms_max" not in metrics
+    assert _slices(trace, 8, "optimizer")[0]["ts"] == round(1000.003 * 1e6)
 
 
 def test_syncs_and_blocks_the_adapter_did_not_name_get_numbered_names():

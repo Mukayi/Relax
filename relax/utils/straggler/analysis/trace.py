@@ -23,6 +23,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from statistics import median
 from typing import Any, Sequence
 
 from relax.utils.straggler.core.modules import module_block
@@ -230,6 +231,80 @@ def _expected_bubble(brackets: list[_Bracket], stages: int) -> float | None:
     return max(optimizer_steps, 1) * (stages - 1) * (sum(fwd) / len(fwd) + sum(bwd) / len(bwd))
 
 
+def _dp_sync_end(brackets: list[_Bracket]) -> float | None:
+    """End of the last DP reduction, the one sync that ends at the same time
+    on DP peers."""
+    ends = [b.end for b in brackets if b.segment == _GRAD_SYNC and b.phase == DP_REDUCTION_PHASE]
+    return ends[-1] if ends else None
+
+
+def _add_edge(edges: dict[tuple[str, str], list[float]], a: str, b: str, delta: float) -> None:
+    edges.setdefault((a, b), []).append(delta)
+    edges.setdefault((b, a), []).append(-delta)
+
+
+def _propagate(edges: dict[tuple[str, str], list[float]], offsets: dict[str, float]) -> None:
+    neighbours: dict[str, list[tuple[str, float]]] = {}
+    for (a, b), deltas in edges.items():
+        neighbours.setdefault(a, []).append((b, median(deltas)))
+    pending = list(offsets)
+    while pending:
+        a = pending.pop()
+        for b, delta in neighbours.get(a, ()):
+            if b not in offsets:
+                offsets[b] = offsets[a] + delta
+                pending.append(b)
+
+
+def _clock_offsets(ranks: Sequence[tuple[RankMeta, float, list[_Bracket]]], reference: str) -> dict[str, float]:
+    """Each host's wall clock minus the ``reference`` host's, in ms, from
+    ``(meta, anchor wall time in ms, brackets)`` per rank; hosts that nothing
+    links to the reference are left out.
+
+    DP peers end the DP reduction together, so in each DP group the median end
+    per host differs by the clock offset. Hosts no DP group links fall back to
+    the cross-host PP hops: stage s + 1 starts F{i} only after stage s finished
+    it, and stage s starts B{i} only after stage s + 1 finished it, so with the
+    same latency both ways the offset is (smallest forward gap - smallest
+    backward gap) / 2.
+    """
+    dp_ends: dict[tuple[int, int], dict[str, list[float]]] = {}
+    hosts: dict[tuple[int, int, int], str] = {}
+    micro_batches: dict[tuple[int, int, int], dict[tuple[int, int, int], tuple[float, float]]] = {}
+    for rank_meta, wall_ms, brackets in ranks:
+        end = _dp_sync_end(brackets)
+        if end is not None:
+            dp_ends.setdefault((rank_meta.pp, rank_meta.tp), {}).setdefault(rank_meta.host, []).append(wall_ms + end)
+        position = (rank_meta.pp, rank_meta.dp, rank_meta.tp)
+        hosts[position] = rank_meta.host
+        micro_batches[position] = {
+            (b.segment, b.micro_batch, b.phase): (wall_ms + b.start, wall_ms + b.end)
+            for b in brackets
+            if b.segment in (_FWD, _BWD) and b.micro_batch >= 0
+        }
+    dp_edges: dict[tuple[str, str], list[float]] = {}
+    for by_host in dp_ends.values():
+        first, *others = by_host
+        for host in others:
+            _add_edge(dp_edges, first, host, median(by_host[host]) - median(by_host[first]))
+    pp_edges: dict[tuple[str, str], list[float]] = {}
+    for position, up in micro_batches.items():
+        pp, dp, tp = position
+        below = (pp + 1, dp, tp)
+        if hosts.get(below, hosts[position]) == hosts[position]:
+            continue
+        down = micro_batches[below]
+        shared = up.keys() & down.keys()
+        fwd = [down[key][0] - up[key][1] for key in shared if key[0] == _FWD]
+        bwd = [up[key][0] - down[key][1] for key in shared if key[0] == _BWD]
+        if fwd and bwd:
+            _add_edge(pp_edges, hosts[position], hosts[below], (min(fwd) - min(bwd)) / 2)
+    offsets = {reference: 0.0}
+    _propagate(dp_edges, offsets)
+    _propagate({**pp_edges, **dp_edges}, offsets)
+    return offsets
+
+
 def build_trace(
     traces: Sequence[RankTrace | None],
     meta: Sequence[RankMeta],
@@ -240,6 +315,9 @@ def build_trace(
     scalars; ``traces[i]`` belongs to ``meta[i]`` (``None`` when that rank has
     no complete sample).
 
+    Every host's ranks are shifted by its clock offset to the primary's host
+    (``_clock_offsets``), so slices on different hosts line up.
+
     ``sync_names`` names the gradient syncs by phase slot and ``module_names``
     the blocks by index (the adapter's ``GRAD_SYNC_TIMERS`` and
     ``MODULE_NAMES``); a slot or index beyond them gets a numbered name.
@@ -249,14 +327,18 @@ def build_trace(
     grad_sync_ends: dict[tuple[int, int], list[float]] = {}
     excess: dict[int, float] = {}
     module_brackets = 0
+    brackets_of = {i: _brackets(trace) for i, trace in enumerate(traces) if trace is not None}
+    reference = next((m.host for m in meta if m.primary), meta[0].host if meta else "")
+    offsets = _clock_offsets([(meta[i], traces[i].wall * 1e3, b) for i, b in brackets_of.items()], reference)
     order = sorted(range(len(meta)), key=lambda i: (meta[i].dp, meta[i].pp, meta[i].tp))
     for sort_index, i in enumerate(order):
         trace, rank_meta = traces[i], meta[i]
         if trace is None:
             continue
         pid = TIMELINE_PID_BASE + rank_meta.rank
-        wall_us = trace.wall * 1e6
-        brackets = _brackets(trace)
+        wall_ms = trace.wall * 1e3 - offsets.get(rank_meta.host, 0.0)
+        wall_us = wall_ms * 1e3
+        brackets = brackets_of[i]
         modules = [b for b in brackets if b.segment >= NUM_FIELDS]
         if modules:
             brackets = [b for b in brackets if b.segment < NUM_FIELDS]
@@ -274,10 +356,9 @@ def build_trace(
         ]
         events += _rank_events(brackets, pid, wall_us, sync_names)
         events += _module_events(modules, brackets, pid, wall_us, module_names)
-        # Only the DP reduction ends at the same time on DP peers.
-        syncs = [b.end for b in brackets if b.segment == _GRAD_SYNC and b.phase == DP_REDUCTION_PHASE]
-        if syncs:
-            grad_sync_ends.setdefault((rank_meta.pp, rank_meta.tp), []).append(trace.wall * 1e3 + syncs[-1])
+        sync_end = _dp_sync_end(brackets)
+        if sync_end is not None:
+            grad_sync_ends.setdefault((rank_meta.pp, rank_meta.tp), []).append(wall_ms + sync_end)
         events += trace.cpu_events
         events += [
             {"ph": "M", "name": "process_name", "pid": pid_, "args": {"name": f"primary CPU (pid {pid_})"}}
@@ -290,6 +371,8 @@ def build_trace(
     spreads = [max(ends) - min(ends) for ends in grad_sync_ends.values() if len(ends) > 1]
     if spreads:
         metrics["straggler/trace/align_spread_ms"] = float(max(spreads))
+    if len(offsets) > 1:
+        metrics["straggler/trace/clock_offset_ms_max"] = float(max(abs(offset) for offset in offsets.values()))
     if excess:
         worst = max(excess, key=excess.__getitem__)
         metrics["straggler/trace/bubble_excess_ms_max"] = float(excess[worst])
