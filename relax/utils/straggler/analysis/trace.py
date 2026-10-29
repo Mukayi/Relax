@@ -232,8 +232,8 @@ def _expected_bubble(brackets: list[_Bracket], stages: int) -> float | None:
 
 
 def _dp_sync_end(brackets: list[_Bracket]) -> float | None:
-    """End of the last DP reduction, the one sync that ends at the same time
-    on DP peers."""
+    """End of the last DP reduction, the one sync that ends at the same time on
+    DP peers."""
     ends = [b.end for b in brackets if b.segment == _GRAD_SYNC and b.phase == DP_REDUCTION_PHASE]
     return ends[-1] if ends else None
 
