@@ -177,7 +177,7 @@ primary 自己的 CPU 侧计时（例如 `actor_train`、每个 micro-batch 的 
 
 | 统计 | 含义 |
 |------|------|
-| `straggler/trace/ranks`、`straggler/trace/lost` | 提供了 trace 的 rank 数；丢失的计时数（队列满，或超出每步 4096 条普通计时、8192 条模块计时的上限；模块计时单独排队，最多占队列的一半，队列满时先被挤掉，只计在这里，不计入 `dropped_events`） |
+| `straggler/trace/ranks`、`straggler/trace/lost` | 提供了 trace 的 rank 数；丢失的计时数（队列满，超出每步 4096 条普通计时、8192 条模块计时的上限，或计时出错被跳过；模块计时单独排队，最多占队列的一半，队列满时先被挤掉，只计在这里，不计入 `dropped_events`） |
 | `straggler/trace/module_brackets` | trace 中模块计时的条数，各 rank 求和（仅 `modules` 级别） |
 | `straggler/trace/align_spread_ms` | 校正跨机时钟偏移后，同一 DP 组 `all-grads-sync` 结束时刻在各 rank 上的最大差值，即剩余的跨卡对齐误差；也包含 all-reduce 本身在各 rank 上结束的先后（两机 16 卡约 1 ms，单机 0.02–0.25 ms）；丢过计时的 rank 不计入 |
 | `straggler/trace/clock_offset_ms_max` | 各机器相对 primary 所在机器的时钟偏移的最大绝对值（ms），trace 已按它平移；只在估算出至少两台机器时输出 |
@@ -214,7 +214,7 @@ primary 自己的 CPU 侧计时（例如 `actor_train`、每个 micro-batch 的 
 - 同一 TP 组的 rank 在前向 / 反向里互相等待，其中一个变慢时整组都会被报出，分不出谁先变慢；所有 rank 同时变慢时（整机降频、共享存储抖动、整组通信变慢）发现不了。
 - PP 阶段拆分、trace 里的阶段命名和气泡推算只适用于非交错 1F1B，VPP 的收发只计入 `pp_recv`。VPP 下的 micro-batch 序号和模型块按 Megatron 的交错调度表（`get_schedule_table`，用模型自己的 config 生成）由调用顺序换算；`combined_1f1b` 的训练调用把前向和反向合并执行，不编号。
 - trace 的开销随 rank 数线性增长，都落在 primary 上：每个窗口把所有 rank 的采样步拼成一个文件，CPU 基准中 2048 个 rank 时约 10 MB、构建约 0.25 s（`modules` 级别约 80 MB、2 s），构建时占用 primary 的 Python 解释器，会拖慢它的训练线程。所以超过 256 个 rank 时默认不开 trace；手动设为 2 或 3 前先估算这部分开销。
-- 跨卡对齐依赖各 rank 的墙钟，跨机时按机器估算时钟偏移后平移：有跨机的 DP 组时用 DP 梯度同步的结束时刻（DP 组内同时结束）；只有 PP 跨机时用跨机那一跳前向、反向的先后关系，假设两个方向的传输时间相同；丢过计时的 rank 最后一次归约可能和别人不是同一次，不参与估算；两种都联系不上的机器不平移，记在 `unaligned_hosts`。两机实测与 ssh 测得的时钟偏差相比，前一种相差 0.3 ms 以内，后一种 0.2–0.6 ms。CUDA graph 捕获期间不计时。
+- 跨卡对齐依赖各 rank 的墙钟，跨机时按机器估算时钟偏移后平移：有跨机的 DP 组时用 DP 梯度同步的结束时刻（DP 组内同时结束）；只有 PP 跨机时用跨机那一跳前向、反向的先后关系，假设两个方向的传输时间相同；丢过计时的 rank 不参与估算；两种都联系不上的机器不平移，记在 `unaligned_hosts`。两机实测与 ssh 测得的时钟偏差相比，前一种相差 0.3 ms 以内，后一种 0.2–0.6 ms。CUDA graph 捕获期间不计时。
 - 告警有延迟：默认参数下从开始变慢到告警约 21–30 个 rollout，rollout 很长时调小 `REPORT_INTERVAL`（见「开启」）。调小 `PERSIST_WINDOWS` 也能更早告警，但更容易被一次性抖动触发。
 - 计时依赖 Megatron 的计时接口（`config.timers`）。Megatron 版本的调用方式变了（出现不认识的计时点名字，给 `timers()` / `start` / `stop` 传入新参数，或调用 `Timers.log` / `write`），或者第一个 rollout 没有走到每步都会调用的计时点（`forward-compute`、`backward-compute`、`all-grads-sync`、`optimizer-copy-to-main-grad`；log-prob 前向为 `forward-compute`）时，训练不会中断：这次调用被忽略，打一条警告，这个 rank 此后的 `straggler/health/state` 记为 1（degraded），但不计入自动关闭的条件，相应的时间不进统计。适配层的 CPU 契约测试会对照已安装的 Megatron 检查这些变化。关闭 profiler（`RELAX_STRAGGLER_PROFILER=0`）即恢复 `config.timers = None`。
 - 某个 rank 进程整个消失时，其余 rank 的每次 gather 都要等到 `RELAX_STRAGGLER_GATHER_TIMEOUT_S` 超时，失败多次后各自关闭分析器。

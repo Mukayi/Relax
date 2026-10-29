@@ -460,6 +460,38 @@ def test_a_sample_is_capped_and_carries_the_cpu_events_of_its_step():
     assert sample.cpu_events == [{"name": "get_data_batch"}]
 
 
+def test_a_bracket_an_error_skips_in_the_sampled_step_counts_as_lost_and_one_after_that_step_does_not():
+    failing = []
+
+    def is_capturing():
+        if failing:
+            raise RuntimeError("record failed")
+        return False
+
+    collector, calls = _tracing_collector(is_capturing=is_capturing)
+
+    def failing_bracket():
+        timer = timers(collector)("forward-compute")
+        timer.start()
+        failing.append(True)
+        timer.stop()
+        failing.clear()
+
+    for rollout_id in range(2):
+        collector.end_step(rollout_id=rollout_id)
+    bracket(collector)
+    failing_bracket()
+    # The sampled step's bracket is still in flight when the next step's bracket fails.
+    _, _, _, end, _, _, _ = collector.recorder._pending[0]
+    end.done = False
+    collector.end_step(rollout_id=2)
+    failing_bracket()
+    end.done = True
+    collector.end_step(rollout_id=3)
+    sample, _ = calls["gathered"][-1]
+    assert (len(_rows(sample)), sample.lost, collector.health.errors_total) == (1, 1, 2)
+
+
 def test_with_one_rollout_windows_every_sample_carries_the_cpu_events_of_its_own_rollout():
     read = []
 

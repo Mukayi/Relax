@@ -200,9 +200,13 @@ class EventRecorder:
         self._pool.release(event)
 
     def on_error(self, where: str, exc: BaseException) -> None:
-        """Count an exception caught on the hot path (see
-        ``ProfilerHealth``)."""
+        """Count an exception caught on the hot path (see ``ProfilerHealth``);
+        in the sampled step it also counts in the sample's ``lost``, since the
+        bracket it skipped may be one that the other ranks kept."""
         self._health.record_error(where, exc)
+        trace = self._trace
+        if trace is not None and trace.end is None:
+            trace.lost += 1
 
     def on_degraded(self, reason: str) -> None:
         """Record a lasting gap in what this rank measures (see
