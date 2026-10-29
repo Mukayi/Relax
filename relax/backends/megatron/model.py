@@ -1486,7 +1486,9 @@ def train_one_step(
             forward_backward_func = streaming_forward_backward_pipelining_without_interleaving
     else:
         forward_backward_func = get_forward_backward_func()
-    get_model_config(model[0]).timers = straggler_timers("train", model, num_microbatches)
+    timers = straggler_timers("train", model, num_microbatches)
+    if timers is not None:
+        get_model_config(model[0]).timers = timers
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step,
         data_iterator=data_iterator,
